@@ -1,28 +1,40 @@
 //! SSPI Negotiate handshake (NTLM/Kerberos via sspi-rs).
 //!
-//! STATUS: stub. Token-exchange loop TBD until first live capture
-//! confirms the SecFilter token framing on the wire.
+//! Flow confirmed from static RE (`securityfilter.cpp` decomp):
 //!
-//! From the static RE we know (see `tools/rc-re/REBUILD-BRIEF.md` § 4):
-//!   - SPN format is `TERMSRV/<target-hostname>` (Kerberos),
-//!     with NTLM fallback when SPN lookup fails.
-//!   - SecFilterClient template wraps each SSPI token in a length-
-//!     prefixed frame; exact header layout TBD.
+//! 1. Call `InitSecurityInterfaceW()` once to get the function table.
+//! 2. `AcquireCredentialsHandleW` with package `Negotiate`.
+//! 3. Repeatedly:
+//!    a. Receive bytes from peer (raw SSPI token).
+//!    b. Build input `SecBuffer{cbBuffer=N, BufferType=SECBUFFER_TOKEN, pvBuffer=bytes}`,
+//!       wrapped in a `SecBufferDesc{ulVersion=0, cBuffers=2, pBuffers=&buf}`.
+//!       (Why 2? Microsoft passes 2 SecBuffers — first is the token, second
+//!       is empty/padding. We mirror their layout.)
+//!    c. Build empty output `SecBuffer{type=TOKEN, pvBuffer=NULL}` (SSPI allocates).
+//!    d. Call `InitializeSecurityContextW(...)`.
+//!    e. If status == `SEC_I_COMPLETE_AND_CONTINUE` (0x90314):
+//!       call `CompleteAuthToken(ctxt, &out_desc)`.
+//!    f. If status in {SEC_I_CONTINUE_NEEDED (0x90313),
+//!       SEC_I_COMPLETE_AND_CONTINUE}: send output bytes to peer, then loop.
+//!    g. If status == 0 (SEC_E_OK): handshake done.
+//!
+//! SPN: `TERMSRV/<target-hostname>` (Kerberos), with NTLM fallback.
 
 use crate::Result;
 
 /// Builds the Service Principal Name to use for Kerberos auth.
 ///
-/// Mirrors what the original viewer does in
-/// `CmRcViewer.exe!StringCbPrintf(pTarget, ..., L"%s/%s", "TERMSRV", host)`.
+/// Mirrors the original viewer's `StringCbPrintf(L"%s/%s", "TERMSRV", host)`.
 pub fn build_spn(target_host: &str) -> String {
     format!("TERMSRV/{target_host}")
 }
 
 /// Placeholder for the full SSPI exchange loop. To be implemented in
-/// Phase 2 of the roadmap, after the first pcap confirms wire format.
+/// Phase 2 once `sspi-rs` is added back to the workspace (was deferred
+/// in Phase 0 due to a transitive picky-krb version conflict — verify
+/// a newer sspi-rs first).
 pub async fn perform_handshake(_target_host: &str) -> Result<()> {
-    todo!("implement after pcap capture confirms SecFilter framing")
+    todo!("Phase 2 — re-add sspi-rs and wire the InitializeSecurityContext loop")
 }
 
 #[cfg(test)]
