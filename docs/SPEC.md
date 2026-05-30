@@ -67,24 +67,27 @@ For SSPI / data messages (type `0x00`), the body is the raw payload
 (an SSPI token during handshake; a SecurityFilter-wrapped chunk during
 data phase).
 
-### Worked example (observed)
+### Worked examples (observed against real targets)
 
-Outbound NTLMSSP Type-1 token, 132 bytes:
-
-```
-84 00 00 00   ← header: type=0x00 (data), body length = 0x000084 = 132
-60 81 81 06   ← SPNEGO DER tag
-...           ← NTLMSSP\0 + Type-1 fields + workstation name
-```
-
-Inbound `ERROR_LOGON_DENIED` reply, 44 bytes total = 4 header + 40 body:
+**Localhost (NTLM fallback — no Kerberos ticket exists for `TERMSRV/localhost`):**
 
 ```
-28 00 00 80   ← header: type=0x80 (control), body length = 0x28 = 40
-26 00         ← string byte-length = 38
-45 00 52 00 52 00 4f 00 ... 44 00   ← "ERROR_LOGON_DENIED" UTF-16LE (36 bytes)
-00 00         ← null terminator
+→ 84 00 00 00 + 132 bytes NTLMSSP Type-1 token
+← 28 00 00 80 + UTF-16LE "ERROR_LOGON_DENIED" (exampleuser not in Permitted Viewers)
 ```
+
+**TARGET-HOST via corporate VPN (Kerberos works — domain target):**
+
+```
+→ 67 0d 00 00 + 3431 bytes SPNEGO + Kerberos AP-REQ
+   embedded: realm "CORP.EXAMPLE.NET", SPN "TERMSRV/TARGET-HOST",
+             encrypted user PAC with group SIDs (3.3 KB)
+← 28 00 00 80 + UTF-16LE "ERROR_LOGON_DENIED" (identical format)
+```
+
+Both confirm the framing handles any size message, both directions.
+Server rejects on authorization-check (user not in Permitted Viewers
+on that target), not on protocol-parsing.
 
 ---
 
