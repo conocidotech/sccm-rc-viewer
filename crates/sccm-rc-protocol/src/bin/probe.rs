@@ -33,9 +33,24 @@ struct Cli {
     #[arg(long, conflicts_with_all = ["connect_only", "raw", "framed_be32"])]
     framed_le32: bool,
 
+    /// Send using the discovered SCCM framing: u32 LE where high byte is
+    /// the message-type flag and low 24 bits are the body length.
+    /// Specify the type byte (0 = data, 0x80 = control string).
+    #[arg(long, value_parser = parse_hex_u8)]
+    sccm: Option<u8>,
+
+    /// First read the server's greeting, then send our reply using --sccm framing.
+    #[arg(long)]
+    after_greeting: bool,
+
     /// Idle timeout per read (ms) — controls when we declare "server is done sending".
     #[arg(long, default_value_t = 2000)]
     idle_ms: u64,
+}
+
+fn parse_hex_u8(s: &str) -> Result<u8, String> {
+    let s = s.trim_start_matches("0x");
+    u8::from_str_radix(s, 16).map_err(|e| e.to_string())
 }
 
 #[tokio::main]
@@ -47,6 +62,15 @@ async fn main() -> anyhow::Result<()> {
 
     let mut conn = RawConnection::connect(&cli.target).await?;
     info!("TCP connected");
+
+    let idle = Duration::from_millis(cli.idle_ms);
+
+    if cli.after_greeting {
+        info!("waiting for server greeting…");
+        let greeting = conn.recv_raw_until_idle(65536, idle).await?;
+        info!(received = greeting.len(), "got greeting");
+        hexdump("← server greeting", &greeting);
+    }
 
     if !cli.connect_only {
         let mut sspi = SspiSession::new_for_target(&cli.target)?;
@@ -67,15 +91,22 @@ async fn main() -> anyhow::Result<()> {
             v.extend_from_slice(&(step.output.len() as u32).to_le_bytes());
             v.extend_from_slice(&step.output);
             v
+        } else if let Some(type_byte) = cli.sccm {
+            let mut v = Vec::with_capacity(4 + step.output.len());
+            // u32 LE: low 24 bits = body len, high byte = type
+            let header = (step.output.len() as u32) | ((type_byte as u32) << 24);
+            v.extend_from_slice(&header.to_le_bytes());
+            v.extend_from_slice(&step.output);
+            v
         } else {
-            anyhow::bail!("pick one of --raw, --framed-be32, --framed-le32, --connect-only");
+            anyhow::bail!("pick one of --raw, --framed-be32, --framed-le32, --sccm <type>, --connect-only");
         };
 
         info!(send_bytes = to_send.len(), "sending");
+        hexdump("→ raw bytes on wire", &to_send[..to_send.len().min(64)]);
         conn.send_raw(&to_send).await?;
     }
 
-    let idle = Duration::from_millis(cli.idle_ms);
     info!("reading until {}ms idle (or 65536 bytes)…", cli.idle_ms);
     let buf = conn.recv_raw_until_idle(65536, idle).await?;
     info!(received = buf.len(), "server response");

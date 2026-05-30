@@ -21,6 +21,73 @@ strings — that lets us name the architectural layers:
 
 ---
 
+## 0. Wire framing — DISCOVERED 2026-05-30 ✅
+
+Confirmed empirically by connecting to `localhost:2701` and observing
+the server's greeting + reply to our first SSPI token.
+
+Every message on the wire (both directions, both handshake and data
+phase) is framed as:
+
+```
++---------+---------+---------+---------+
+| len[0]  | len[1]  | len[2]  | type    |   header (u32, little-endian)
++---------+---------+---------+---------+
+| body... (len bytes — header excluded) |
++---------------------------------------+
+```
+
+- **`type` (high byte)**: message type / flag
+  - `0x80` = control message (body is a UTF-16 string)
+  - `0x00` = SSPI handshake or data payload (body is raw binary)
+  - Other values TBD via more probing
+- **`len` (low 24 bits)**: number of body bytes that follow
+
+For control messages (type `0x80`):
+
+```
++---------+---------+
+| u16 LE: byte-length of UTF-16 string (excluding null)
++---------+---------+
+| UTF-16LE string                                       |
++---------+---------+
+| 0x00 0x00 (null terminator)                           |
++---------+---------+
+```
+
+Known control message strings:
+
+- `START_HANDSHAKE` — server sends this immediately on connect, before
+  the viewer says anything.
+- `ERROR_LOGON_DENIED` — server's reply when our SSPI token parses
+  but the authenticated identity is not in the Permitted Viewers
+  group on the target.
+
+For SSPI / data messages (type `0x00`), the body is the raw payload
+(an SSPI token during handshake; a SecurityFilter-wrapped chunk during
+data phase).
+
+### Worked example (observed)
+
+Outbound NTLMSSP Type-1 token, 132 bytes:
+
+```
+84 00 00 00   ← header: type=0x00 (data), body length = 0x000084 = 132
+60 81 81 06   ← SPNEGO DER tag
+...           ← NTLMSSP\0 + Type-1 fields + workstation name
+```
+
+Inbound `ERROR_LOGON_DENIED` reply, 44 bytes total = 4 header + 40 body:
+
+```
+28 00 00 80   ← header: type=0x80 (control), body length = 0x28 = 40
+26 00         ← string byte-length = 38
+45 00 52 00 52 00 4f 00 ... 44 00   ← "ERROR_LOGON_DENIED" UTF-16LE (36 bytes)
+00 00         ← null terminator
+```
+
+---
+
 ## 1. Transport overview
 
 | Field | Value | Source |
