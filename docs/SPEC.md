@@ -95,13 +95,41 @@ The root cause was a **2-byte inner length prefix** — trivially fixable.
 Pure-Rust Pad B1 is viable after all; we do not strictly need to wrap
 Microsoft's DLL.
 
-### Data-phase messages (type 0x00, post-handshake)
+### Data-phase messages (type 0x00, post-handshake) — CONFIRMED working 2026-05-30
 
 Once authenticated, the body uses the `SecurityFilter::EncryptData`
-layout (see § 2): `[u16 header_len][header][u16 token_len][Kerberos wrap
-token + sealed data]`. The Kerberos wrap tokens (`05 04 06 ff …` from
-client, `05 04 07 ff …` from server) carry incrementing sequence
-numbers — standard RFC 4121 GSS-API per-message tokens.
+layout, **confirmed by sealing/unsealing live against TARGET-HOST**:
+
+```
+SecFilter body = [u16 LE data_len][encrypted data][u16 LE token_len][GSS wrap token]
+```
+
+- `data` = application payload, encrypted in place (AES-CTS, length-preserving)
+- `token` = GSS wrap token from `EncryptMessage`'s SECBUFFER_TOKEN
+  (`05 04 06 ff …` from client = initiator, `05 04 07 ff …` from server
+  = acceptor), ~60 bytes, RFC 4121, with an internal incrementing
+  sequence number.
+
+Our pure-Rust `SspiSession::seal()` / `unseal()` (via `EncryptMessage` /
+`DecryptMessage` with SECBUFFER_DATA + SECBUFFER_TOKEN) interoperate
+with the real server:
+
+```
+→ handshake (AP-REQ / AP-REP)  → context established
+→ our seal() produces a token starting 05 04 06 ff  (== real viewer)
+→ send a sealed frame
+← server replies with a sealed frame
+← our unseal() decrypts it to UTF-16LE "SUCCESS_FULL_CONTROL"
+```
+
+`SUCCESS_FULL_CONTROL` is the server granting the remote-control session
+(full-control mode). Data-phase control strings are **raw UTF-16LE**
+(no length prefix, unlike the unencrypted greeting).
+
+This proves the entire transport + auth + crypto stack works in pure
+Rust end-to-end. What remains is the application layer: the RDP stream
+(MS-RDPBCGR via IronRDP) carried inside these sealed frames, plus the
+SCCM data-phase control messages (SUCCESS_*, screen negotiation, etc.).
 
 ### Worked examples (observed against real targets)
 

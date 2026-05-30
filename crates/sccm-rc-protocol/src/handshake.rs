@@ -11,12 +11,12 @@ use tracing::{debug, trace};
 
 use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Security::Authentication::Identity::{
-    AcquireCredentialsHandleW, CompleteAuthToken, DeleteSecurityContext, FreeContextBuffer,
-    FreeCredentialsHandle, InitializeSecurityContextW, QueryContextAttributesW, SecBuffer,
-    SecBufferDesc, SecPkgContext_Sizes, ISC_REQ_ALLOCATE_MEMORY, ISC_REQ_CONFIDENTIALITY,
-    ISC_REQ_CONNECTION, ISC_REQ_INTEGRITY, ISC_REQ_MUTUAL_AUTH, ISC_REQ_REPLAY_DETECT,
-    ISC_REQ_SEQUENCE_DETECT, SECBUFFER_TOKEN, SECBUFFER_VERSION, SECPKG_ATTR_SIZES,
-    SECPKG_CRED_OUTBOUND, SECURITY_NATIVE_DREP,
+    AcquireCredentialsHandleW, CompleteAuthToken, DecryptMessage, DeleteSecurityContext,
+    EncryptMessage, FreeContextBuffer, FreeCredentialsHandle, InitializeSecurityContextW,
+    QueryContextAttributesW, SecBuffer, SecBufferDesc, SecPkgContext_Sizes, ISC_REQ_ALLOCATE_MEMORY,
+    ISC_REQ_CONFIDENTIALITY, ISC_REQ_CONNECTION, ISC_REQ_INTEGRITY, ISC_REQ_MUTUAL_AUTH,
+    ISC_REQ_REPLAY_DETECT, ISC_REQ_SEQUENCE_DETECT, SECBUFFER_DATA, SECBUFFER_TOKEN,
+    SECBUFFER_VERSION, SECPKG_ATTR_SIZES, SECPKG_CRED_OUTBOUND, SECURITY_NATIVE_DREP,
 };
 use windows::Win32::Security::Credentials::SecHandle;
 
@@ -56,6 +56,7 @@ pub struct SspiSession {
     ctxt: Box<SecHandle>,
     ctxt_initialized: bool,
     spn_wide: Vec<u16>,
+    sizes: Option<MessageSizes>,
 }
 
 impl std::fmt::Debug for SspiSession {
@@ -129,6 +130,7 @@ impl SspiSession {
             ctxt: Box::new(SecHandle { dwLower: 0, dwUpper: 0 }),
             ctxt_initialized: false,
             spn_wide: spn,
+            sizes: None,
         })
     }
 
@@ -267,12 +269,125 @@ impl SspiSession {
             )));
         }
         let s = unsafe { sizes.assume_init() };
-        Ok(MessageSizes {
+        let ms = MessageSizes {
             cb_max_token: s.cbMaxToken,
             cb_max_signature: s.cbMaxSignature,
             cb_block_size: s.cbBlockSize,
             cb_security_trailer: s.cbSecurityTrailer,
-        })
+        };
+        self.sizes = Some(ms);
+        Ok(ms)
+    }
+
+    fn ensure_sizes(&mut self) -> crate::Result<MessageSizes> {
+        if let Some(s) = self.sizes {
+            Ok(s)
+        } else {
+            self.message_sizes()
+        }
+    }
+
+    /// Seal a plaintext application message for the SCCM data phase.
+    ///
+    /// Produces the SecFilter frame body:
+    ///   `[u16 LE data_len][encrypted data][u16 LE token_len][GSS wrap token]`
+    /// matching the layout observed on the wire (see docs/SPEC.md § 2).
+    pub fn seal(&mut self, plaintext: &[u8]) -> crate::Result<Vec<u8>> {
+        let sizes = self.ensure_sizes()?;
+
+        // Working buffers: data (in-place encrypt) + token (trailer).
+        let mut data = plaintext.to_vec();
+        let mut token = vec![0u8; sizes.cb_security_trailer as usize];
+
+        let mut bufs = [
+            SecBuffer {
+                cbBuffer: token.len() as u32,
+                BufferType: SECBUFFER_TOKEN,
+                pvBuffer: token.as_mut_ptr() as *mut _,
+            },
+            SecBuffer {
+                cbBuffer: data.len() as u32,
+                BufferType: SECBUFFER_DATA,
+                pvBuffer: data.as_mut_ptr() as *mut _,
+            },
+        ];
+        let mut desc = SecBufferDesc {
+            ulVersion: SECBUFFER_VERSION,
+            cBuffers: 2,
+            pBuffers: bufs.as_mut_ptr(),
+        };
+
+        // SAFETY: ctxt established; buffers live across the call. fQOP=0 => seal.
+        let status = hr_to_status(unsafe {
+            EncryptMessage(self.ctxt.as_mut() as *const _, 0, &mut desc, 0)
+        });
+        if status != SEC_E_OK_RAW {
+            return Err(Error::Sspi(format!("EncryptMessage failed: 0x{status:08X}")));
+        }
+
+        // Token length may shrink from cb_security_trailer to the actual size.
+        let token_len = bufs[0].cbBuffer as usize;
+        let data_len = bufs[1].cbBuffer as usize;
+
+        let mut out = Vec::with_capacity(2 + data_len + 2 + token_len);
+        out.extend_from_slice(&(data_len as u16).to_le_bytes());
+        out.extend_from_slice(&data[..data_len]);
+        out.extend_from_slice(&(token_len as u16).to_le_bytes());
+        out.extend_from_slice(&token[..token_len]);
+        Ok(out)
+    }
+
+    /// Unseal an SCCM data-phase frame body back to plaintext.
+    /// Inverse of `seal`.
+    pub fn unseal(&mut self, frame_body: &[u8]) -> crate::Result<Vec<u8>> {
+        if frame_body.len() < 4 {
+            return Err(Error::Protocol("sealed frame too short".into()));
+        }
+        let data_len = u16::from_le_bytes([frame_body[0], frame_body[1]]) as usize;
+        let off_token_len = 2 + data_len;
+        if off_token_len + 2 > frame_body.len() {
+            return Err(Error::Protocol("sealed frame: bad data_len".into()));
+        }
+        let token_len =
+            u16::from_le_bytes([frame_body[off_token_len], frame_body[off_token_len + 1]]) as usize;
+        let token_off = off_token_len + 2;
+        if token_off + token_len > frame_body.len() {
+            return Err(Error::Protocol("sealed frame: bad token_len".into()));
+        }
+
+        let mut data = frame_body[2..2 + data_len].to_vec();
+        let mut token = frame_body[token_off..token_off + token_len].to_vec();
+
+        let mut bufs = [
+            SecBuffer {
+                cbBuffer: token.len() as u32,
+                BufferType: SECBUFFER_TOKEN,
+                pvBuffer: token.as_mut_ptr() as *mut _,
+            },
+            SecBuffer {
+                cbBuffer: data.len() as u32,
+                BufferType: SECBUFFER_DATA,
+                pvBuffer: data.as_mut_ptr() as *mut _,
+            },
+        ];
+        let mut desc = SecBufferDesc {
+            ulVersion: SECBUFFER_VERSION,
+            cBuffers: 2,
+            pBuffers: bufs.as_mut_ptr(),
+        };
+
+        let mut qop: u32 = 0;
+        // SAFETY: ctxt established; buffers live across the call.
+        let status = hr_to_status(unsafe {
+            DecryptMessage(self.ctxt.as_mut() as *const _, &mut desc, 0, Some(&mut qop))
+        });
+        if status != SEC_E_OK_RAW {
+            return Err(Error::Sspi(format!("DecryptMessage failed: 0x{status:08X}")));
+        }
+
+        // Plaintext is in the DATA buffer (decrypted in place).
+        let out_len = bufs[1].cbBuffer as usize;
+        Ok(data[..out_len].to_vec())
     }
 }
 

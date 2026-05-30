@@ -271,19 +271,34 @@ fn dump_framed(label: &str, stream: &[u8]) {
                 print!("  string=\"{}\"", String::from_utf16_lossy(&utf16).trim_end_matches('\u{0}'));
             }
         }
-        // Annotate SPNEGO / Kerberos structures
+        // Annotate SPNEGO / Kerberos structures + decode SecFilter sub-framing
+        let mut full_dump = false;
         if msg_type == 0x00 {
+            if body.len() >= 2 && (body[0] == 0xb9 || body[1] == 0x00 && body[0] > 0x80) {
+                // inner-len framed handshake token: [u16 len][token]
+            }
             if body.first() == Some(&0x60) {
-                print!("  [SPNEGO NegTokenInit / GSS — likely AP-REQ leg]");
-            } else if body.first() == Some(&0xa1) {
-                print!("  [SPNEGO NegTokenResp — likely AP-REP leg]");
-            } else if body.len() >= 2 {
-                // SecurityFilter-wrapped: leading u16 = some length, then payload
-                print!("  [wrapped/sealed]");
+                print!("  [SPNEGO NegTokenInit / GSS — AP-REQ]");
+            } else if body.len() >= 3 && body[1] == 0x81 && body[0] == 0xb9 {
+                print!("  [inner-framed]");
+            } else if body.len() >= 4 {
+                // SecFilter data: [u16 lenA][A][u16 lenB][B]
+                let len_a = u16::from_le_bytes([body[0], body[1]]) as usize;
+                if 2 + len_a + 2 <= body.len() {
+                    let off_b = 2 + len_a;
+                    let len_b = u16::from_le_bytes([body[off_b], body[off_b + 1]]) as usize;
+                    print!("  [SecFilter: lenA={len_a} lenB={len_b}");
+                    let b_start = off_b + 2;
+                    if b_start + 4 <= body.len() && body[b_start] == 0x05 && body[b_start + 1] == 0x04 {
+                        print!(" B=GSS-wrap-token(flags=0x{:02x})", body[b_start + 2]);
+                    }
+                    print!("]");
+                    full_dump = true;
+                }
             }
         }
         println!();
-        hexdump(body, 64);
+        hexdump(body, if full_dump { 160 } else { 64 });
         off = body_off + body_len;
         msg_idx += 1;
         if msg_idx > 12 {

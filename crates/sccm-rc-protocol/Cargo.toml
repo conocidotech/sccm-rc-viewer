@@ -31,3 +31,7 @@ path = "src/bin/probe.rs"
 [[bin]]
 name = "pcap-extract"
 path = "src/bin/pcap-extract.rs"
+
+[[bin]]
+name = "data-phase-test"
+path = "src/bin/data-phase-test.rs"
