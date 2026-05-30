@@ -35,3 +35,7 @@ path = "src/bin/pcap-extract.rs"
 [[bin]]
 name = "data-phase-test"
 path = "src/bin/data-phase-test.rs"
+
+[[bin]]
+name = "rdp-explore"
+path = "src/bin/rdp-explore.rs"
