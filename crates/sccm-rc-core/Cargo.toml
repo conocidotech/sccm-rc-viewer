@@ -7,15 +7,20 @@ license.workspace = true
 publish.workspace = true
 description = "High-level SCCM RC session: connect, render-stream, input, lifecycle"
 
+[[bin]]
+name = "rdp-connect-test"
+path = "src/bin/rdp-connect-test.rs"
+
 [dependencies]
 tokio.workspace = true
 futures.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
+clap.workspace = true
 sccm-rc-protocol.workspace = true
-# ironrdp.workspace = true            # deferred — Fase 2
-# ironrdp-pdu.workspace = true
-# ironrdp-tokio.workspace = true
-# ironrdp-graphics.workspace = true
+ironrdp-connector = "0.9"
+ironrdp-pdu = "0.8"
+ironrdp-core = "0.2"
