@@ -7,3 +7,7 @@ captures/*.pcapng
 captures/*.cap
 captures/*.pcap
 !captures/.gitkeep
+# Real session captures — contain authenticated traffic, never commit
+*.etl
+*.pcapng
+experiments/capture.*
