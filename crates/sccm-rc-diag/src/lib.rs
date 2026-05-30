@@ -10,6 +10,7 @@
 use std::time::Duration;
 
 pub mod checks;
+mod winutil;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {

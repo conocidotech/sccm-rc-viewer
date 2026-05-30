@@ -19,4 +19,4 @@ anyhow.workspace = true
 thiserror.workspace = true
 clap.workspace = true
 sccm-rc-protocol.workspace = true
-# windows.workspace = true  # deferred — see workspace Cargo.toml
+windows.workspace = true

@@ -45,14 +45,17 @@ clap = { version = "4", features = ["derive"] }
 # ironrdp-graphics = "0.5"
 # sspi = "0.16"
 
-# Windows API bindings — deferred until we actually need LSA/SCM/WMI calls
-# in sccm-rc-diag checks 2-4. Pulling windows-sys 0.61 on -windows-gnu
-# requires a full MinGW (the rustup-bundled one lacks dlltool helpers).
-# Re-add when we have MSVC build tools OR install portable MinGW.
-# windows = { version = "0.61", features = [
-#     "Win32_Foundation", "Win32_Security", "Win32_Security_Authentication_Identity",
-#     "Win32_Networking_WinSock", "Win32_System_Registry", "Win32_System_Wmi", "Win32_System_Com",
-# ] }
+# Windows API bindings — re-enabled now that WinLibs MinGW provides a
+# working dlltool (the rustup-bundled self-contained one lacked the
+# assembler helper). See `env.ps1`.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authentication_Identity",
+    "Win32_NetworkManagement_NetManagement",
+    "Win32_System_Services",
+    "Win32_System_Registry",
+] }
 
 # Cross-crate internal deps
 sccm-rc-protocol = { path = "crates/sccm-rc-protocol" }
