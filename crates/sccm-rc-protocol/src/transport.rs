@@ -1,10 +1,18 @@
 //! Low-level TCP/2701 transport — used both raw (before SSPI handshake)
 //! and as the carrier for SecurityFilter-wrapped messages once authenticated.
 
+use crate::framing::{self, MsgHeader};
 use crate::{Error, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
+
+/// A complete SCCM RC message: its type byte + body bytes (header stripped).
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub msg_type: u8,
+    pub body: Vec<u8>,
+}
 
 /// Standard SCCM Remote Control listening port on the target's CcmExec service.
 pub const SCCM_RC_PORT: u16 = 2701;
@@ -95,6 +103,41 @@ impl RawConnection {
         self.stream.write_all(bytes).await?;
         self.stream.flush().await?;
         Ok(())
+    }
+
+    // ---- SCCM-framed I/O (the real wire format) ---------------------------
+
+    /// Send an SSPI handshake token, framed as the real viewer does:
+    /// `[u32 LE header (type=0x00)][u16 LE token_len][token]`.
+    pub async fn send_handshake_token(&mut self, token: &[u8]) -> Result<()> {
+        let wire = framing::encode_handshake_token(token);
+        self.stream.write_all(&wire).await?;
+        self.stream.flush().await?;
+        debug!(token_bytes = token.len(), wire_bytes = wire.len(), "sent handshake token");
+        Ok(())
+    }
+
+    /// Read one complete SCCM frame: parse the 4-byte header, then read
+    /// exactly `body_len` bytes (handling TCP segmentation). Returns
+    /// `Ok(None)` on clean EOF before any header.
+    pub async fn recv_frame(&mut self) -> Result<Option<Frame>> {
+        let mut hdr_buf = [0u8; 4];
+        match self.stream.read_exact(&mut hdr_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(e) => return Err(Error::Io(e)),
+        }
+        let MsgHeader { msg_type, body_len } =
+            framing::parse_header(&hdr_buf).expect("4 bytes is always parseable");
+        if body_len > 8 * 1024 * 1024 {
+            return Err(Error::Protocol(format!(
+                "implausibly-large frame body: {body_len} bytes"
+            )));
+        }
+        let mut body = vec![0u8; body_len];
+        self.stream.read_exact(&mut body).await?;
+        debug!(msg_type = format!("0x{msg_type:02x}"), body_len, "recv frame");
+        Ok(Some(Frame { msg_type, body }))
     }
 
     pub fn into_stream(self) -> TcpStream {

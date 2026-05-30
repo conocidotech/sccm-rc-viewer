@@ -13,9 +13,9 @@ use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Security::Authentication::Identity::{
     AcquireCredentialsHandleW, CompleteAuthToken, DeleteSecurityContext, FreeContextBuffer,
     FreeCredentialsHandle, InitializeSecurityContextW, QueryContextAttributesW, SecBuffer,
-    SecBufferDesc, SecPkgContext_StreamSizes, ISC_REQ_ALLOCATE_MEMORY, ISC_REQ_CONFIDENTIALITY,
+    SecBufferDesc, SecPkgContext_Sizes, ISC_REQ_ALLOCATE_MEMORY, ISC_REQ_CONFIDENTIALITY,
     ISC_REQ_CONNECTION, ISC_REQ_INTEGRITY, ISC_REQ_MUTUAL_AUTH, ISC_REQ_REPLAY_DETECT,
-    ISC_REQ_SEQUENCE_DETECT, SECBUFFER_TOKEN, SECBUFFER_VERSION, SECPKG_ATTR_STREAM_SIZES,
+    ISC_REQ_SEQUENCE_DETECT, SECBUFFER_TOKEN, SECBUFFER_VERSION, SECPKG_ATTR_SIZES,
     SECPKG_CRED_OUTBOUND, SECURITY_NATIVE_DREP,
 };
 use windows::Win32::Security::Credentials::SecHandle;
@@ -31,15 +31,16 @@ pub fn build_spn(target_host: &str) -> String {
     format!("TERMSRV/{target_host}")
 }
 
-/// Stream sizes returned by SSPI after handshake — needed for sizing
-/// EncryptMessage / DecryptMessage buffers.
+/// Per-message sizes returned by SSPI after handshake (SECPKG_ATTR_SIZES) —
+/// needed for sizing EncryptMessage / DecryptMessage buffers. For Kerberos/
+/// Negotiate these are the GSS-API token/trailer sizes (RFC 4121 wrap tokens),
+/// which is what the SCCM SecurityFilter uses in the data phase.
 #[derive(Debug, Clone, Copy)]
-pub struct StreamSizes {
-    pub cb_header: u32,
-    pub cb_trailer: u32,
-    pub cb_maximum_message: u32,
-    pub c_buffers: u32,
+pub struct MessageSizes {
+    pub cb_max_token: u32,
+    pub cb_max_signature: u32,
     pub cb_block_size: u32,
+    pub cb_security_trailer: u32,
 }
 
 /// One round-trip of the SSPI handshake.
@@ -247,29 +248,30 @@ impl SspiSession {
         }
     }
 
-    /// After handshake completes, query per-message overhead sizes.
-    pub fn stream_sizes(&mut self) -> crate::Result<StreamSizes> {
-        let mut sizes = MaybeUninit::<SecPkgContext_StreamSizes>::zeroed();
-        // SAFETY: ctxt initialized post-handshake; sizes is a 20-byte stack buf.
+    /// After handshake completes, query per-message overhead sizes
+    /// (SECPKG_ATTR_SIZES). For Kerberos/Negotiate this returns the GSS
+    /// token + trailer sizes used to frame EncryptMessage output.
+    pub fn message_sizes(&mut self) -> crate::Result<MessageSizes> {
+        let mut sizes = MaybeUninit::<SecPkgContext_Sizes>::zeroed();
+        // SAFETY: ctxt initialized post-handshake; sizes is a 16-byte stack buf.
         let status = status_code(unsafe {
             QueryContextAttributesW(
                 self.ctxt.as_mut() as *const _,
-                SECPKG_ATTR_STREAM_SIZES,
+                SECPKG_ATTR_SIZES,
                 sizes.as_mut_ptr() as *mut _,
             )
         });
         if status != SEC_E_OK_RAW {
             return Err(Error::Sspi(format!(
-                "QueryContextAttributesW(STREAM_SIZES) failed: 0x{status:08X}"
+                "QueryContextAttributesW(SIZES) failed: 0x{status:08X}"
             )));
         }
         let s = unsafe { sizes.assume_init() };
-        Ok(StreamSizes {
-            cb_header: s.cbHeader,
-            cb_trailer: s.cbTrailer,
-            cb_maximum_message: s.cbMaximumMessage,
-            c_buffers: s.cBuffers,
+        Ok(MessageSizes {
+            cb_max_token: s.cbMaxToken,
+            cb_max_signature: s.cbMaxSignature,
             cb_block_size: s.cbBlockSize,
+            cb_security_trailer: s.cbSecurityTrailer,
         })
     }
 }
