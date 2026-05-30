@@ -103,40 +103,107 @@ The viewer offset constants:
 
 Error string seen on the wire-encrypted path: **"Remote Control Viewer user is member of too many security groups, use a different account which has less security group memberships."** This is the classic Negotiate-token-too-large failure — Kerberos PAC can balloon past the negotiated `cbMaxToken`.
 
-### Per-message wrap/unwrap 🟡
+### Per-message wrap/unwrap ✅ (confirmed via fn-table indirection)
 
-Not directly visible in the decomp because the calls go via the
-function-table at offset 0x68 (EncryptMessage) and 0x6C (DecryptMessage)
-on the `SecurityFunctionTableW`. The SecurityFilter does maintain the
-`CtxtHandle` post-handshake, which is only useful if EncryptMessage /
-DecryptMessage are called.
+`SecurityFilter` stores the SSPI function table inline starting at
+`this+0x04`. Each SSPI method lives at `this + 0x04 + <fn-table-offset>`.
+Two key methods we confirmed:
 
-Standard pattern for Negotiate seal:
+| Offset in `this` | SSPI function |
+|---|---|
+| `this+0x20` | `InitializeSecurityContextW` |
+| `this+0x28` | `CompleteAuthToken` |
+| `this+0x6C` | `EncryptMessage` |
+| `this+0x70` | `DecryptMessage` |
+
+Other instance fields:
+
+| Offset | Field | Source of value |
+|---|---|---|
+| `this+0x7c..0x84` | `CtxtHandle` (8 bytes) | `InitializeSecurityContextW` output |
+| `this+0x94` | state: 0=uninit, 1=initialized, 2=handshaking, 3=authenticated | `*(this+0x94) == 3` check guards encrypt/decrypt |
+| `this+0x98` | `cbMaximumMessage` | `QueryContextAttributes(SECPKG_ATTR_STREAM_SIZES)` |
+| `this+0x9c` | `cbHeader` | same query |
+| `this+0xa0` | `cbTrailer` | same query |
+| `this+0xa4` | `cBuffers` / extra | same query |
+| `this+0xa8` | `cbBlockSize` | same query |
+
+Error strings that confirm: `"GetStreamSizes failed"`, `"QueryContextAttributes failed"`, `"m_pSecFilter->GetStreamSizes failed"`.
+
+### Encrypt path (`SecurityFilter::EncryptData`, decompiled at 0x44c28c)
 
 ```c
-SecBuffer[3] = {
-    [0] = { BufferType = SECBUFFER_TOKEN, cbBuffer = max_token_size,
-            pvBuffer = scratch_buffer_at_offset_0 },
-    [1] = { BufferType = SECBUFFER_DATA,  cbBuffer = payload_size,
-            pvBuffer = payload_buffer },
-    [2] = { BufferType = SECBUFFER_PADDING, cbBuffer = block_size,
-            pvBuffer = scratch_after_payload }
-}
-EncryptMessage(ctxt, 0, &desc, sequence_number)
-// → on wire: [TOKEN bytes][DATA bytes][PADDING bytes] concatenated
+// Sanity checks
+if (this->ctxt invalid)                                  return 0xd0000008;
+if (*plain_size <= cbHeader + cbTrailer + extra)         return "buffer too small";
+if (*plain_size > cbMaximumMessage)                      return "data too large";
+
+// Set up 2 SecBuffers (NOT 3 — no SECBUFFER_PADDING used):
+SecBuffer[0] = {
+    cbBuffer   = read_u16_le(plain + cbHeader),  // data length from header field
+    BufferType = SECBUFFER_DATA (1),
+    pvBuffer   = plain + cbHeader + cbTrailer,   // skip header+trailer reservation
+};
+SecBuffer[1] = {
+    cbBuffer   = cbBlockSize,
+    BufferType = SECBUFFER_TOKEN (2),
+    pvBuffer   = plain + cbHeader + cbTrailer + data_len + extra,
+};
+SecBufferDesc = { ulVersion = 0, cBuffers = 2, pBuffers = SecBuffer };
+
+EncryptMessage(&this->ctxt, fQOP, &desc, 0);   // MessageSeqNo = 0 — relies on SSPI internal counter
+
+// After encryption, write data-length trailer + return total size
+*(uint16_t*)(plain + cbHeader + cbTrailer + data_len) = data_size_field;
+*out_total = cbHeader + cbTrailer + data_len + extra + cbBlockSize;
 ```
 
-The buffer abstraction `IRDPENCNetStreamBuffer` (with `get_PayloadOffset`/
-`get_PayloadSize`/`get_Storage`) is shaped exactly for this: the buffer
-reserves header space at offset 0 (for TOKEN) and trailer space at the
-end (for PADDING), with the payload in the middle. After `EncryptMessage`,
-WSASend is called with `len = payload_size, buf = base + payload_offset` —
-but the surrounding TOKEN and PADDING bytes are also part of the stream
-(they live in the same buffer; WSASend's offset is only the START — and
-the **actual sent length includes the trailer** based on what
-SecurityFilter writes back into PayloadSize). **This still needs pcap
-confirmation**: whether one WSASend is one SSPI message, or whether
-multiple SSPI messages get batched.
+### Decrypt path (`SecurityFilter::DecryptData`, decompiled at 0x44bc83)
+
+```c
+if (this->ctxt invalid)                       return 0xd0000008;
+
+uint16_t data_len = read_u16_le(buf + cbHeader);
+SecBuffer[0] = {
+    cbBuffer   = data_len,
+    BufferType = SECBUFFER_DATA (1),
+    pvBuffer   = buf + cbHeader + cbTrailer,
+};
+SecBuffer[1] = {
+    cbBuffer   = read_u16_le(buf + token_offset),
+    BufferType = SECBUFFER_TOKEN (2),
+    pvBuffer   = buf + extra + token_offset,
+};
+SecBufferDesc = { ulVersion = 0, cBuffers = 2, pBuffers = SecBuffer };
+
+status = DecryptMessage(&this->ctxt, &desc, 0, NULL);
+if (status == SEC_E_INCOMPLETE_MESSAGE (0x80090318)) {
+    return "need more bytes";   // standard streaming SSPI semantic
+}
+
+// On success, *out_data_size = SecBuffer[0].cbBuffer (decrypted length)
+//             *out_total_consumed = SecBuffer[1] end offset
+```
+
+### Wire layout per wrapped message ✅
+
+```text
++-------------------------------------------+
+| HEADER  (cbHeader bytes)                  |  contains 2-byte data-length field
++-------------------------------------------+
+| TRAILER reserve (cbTrailer bytes)         |
++-------------------------------------------+
+| DATA payload   (variable, ≤cbMaxMessage)  |  encrypted in-place by EncryptMessage
++-------------------------------------------+
+| EXTRA          (cBuffers bytes)           |  separator before TOKEN
++-------------------------------------------+
+| TOKEN/MIC      (cbBlockSize bytes)        |  signature
++-------------------------------------------+
+```
+
+For our Rust rebuild we **don't need to compute these sizes ourselves** —
+`sspi-rs::query_context_stream_sizes` returns the same struct, and we
+just lay out our buffers accordingly.
 
 ---
 
@@ -210,27 +277,25 @@ Hardcoded viewer settings (no UI to change):
 
 ---
 
-## 6. Action required from the user before Phase 2 (impl) can finish
+## 6. Status — what's known, what still needs a pcap
 
-A **pcap of a live `CmRcViewer.exe` → test-target session** with:
+After the deeper Ghidra-pass on 2026-05-30 we have enough to fully
+implement the viewer side WITHOUT a pcap. What a pcap would still add:
 
-- Wireshark on the viewer-side host
-- A test target where you have admin
-- Capture filter: `tcp port 2701`
-- Save as `captures/<hostname>-<date>.pcapng` in this workspace
-- Annotate timing in a sibling `.notes.md`:
-  - T+0: "Connect" clicked
-  - T+x: consent prompt appeared on target
-  - T+y: operator clicked Allow
-  - T+z: screen first rendered
+| Question | Confidence | Pcap needed? |
+|---|---|---|
+| Is per-message wrap used? | ✅ confirmed YES via `(*(this+0x70))` and `(*(this+0x6C))` callsites | no |
+| Wire layout per wrapped message? | ✅ confirmed: HEADER+TRAILER-reserve+DATA+EXTRA+TOKEN | no |
+| Exact byte values of cbHeader/cbTrailer/etc? | runtime values from `QueryContextAttributes(SECPKG_ATTR_STREAM_SIZES)` — `sspi-rs` handles this for us | no |
+| Framing above SecurityFilter (length-prefix etc.)? | ✅ confirmed NO — the buffer abstraction IS the framing, no separate length-prefix layer | no |
+| Negotiate package final winner per connection (NTLM vs Kerberos)? | ❓ environment-dependent | yes, **but** only for diagnostics — the protocol works either way |
+| Edge cases (invalid SPN, RC disabled, target offline) | ❓ | yes, for error UX polish |
+| End-to-end validation of our implementation | ❓ | yes, after we have something to validate against |
 
-With one good pcap we can:
-1. Confirm whether per-message EncryptMessage is used (compare ratio of
-   bytes-on-wire vs RDP-frame sizes after decrypt — if 1:1 plus
-   ~16 bytes overhead, no per-message wrap; if larger overhead, wrap is
-   active).
-2. Determine exact byte-layout per message (token + data + padding order).
-3. Confirm that no framing exists above SecurityFilter on the viewer side.
+A pcap is now a **validation** step, not a discovery step.
 
-Without the pcap we can still write the handshake (it's clear from decomp)
-but the per-message path will be a guess until we see real bytes.
+If/when capturing one:
+- Wireshark on the viewer-side host, capture filter `tcp port 2701`
+- Save as `captures/<hostname>-<date>.pcapng`
+- Optional `.notes.md` sibling with timing annotations (Connect / consent
+  prompt / Allow click / first frame)
