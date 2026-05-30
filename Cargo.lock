@@ -434,11 +434,14 @@ dependencies = [
  "anyhow",
  "byteorder",
  "bytes",
+ "clap",
  "futures",
  "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
+ "windows",
 ]
 
 [[package]]

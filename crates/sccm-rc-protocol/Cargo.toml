@@ -12,9 +12,18 @@ tokio.workspace = true
 tokio-util.workspace = true
 futures.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 byteorder.workspace = true
-# sspi.workspace = true     # deferred — see workspace Cargo.toml
-# windows.workspace = true  # deferred — see workspace Cargo.toml
+clap.workspace = true
+windows.workspace = true
+
+[[bin]]
+name = "handshake-test"
+path = "src/bin/handshake-test.rs"
+
+[[bin]]
+name = "probe"
+path = "src/bin/probe.rs"
