@@ -1,0 +1,20 @@
+[package]
+name = "sccm-rc-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "SCCM Remote Control 2701-wire protocol: SSPI handshake, SecFilter framing, session arbitration"
+
+[dependencies]
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+byteorder.workspace = true
+# sspi.workspace = true     # deferred — see workspace Cargo.toml
+# windows.workspace = true  # deferred — see workspace Cargo.toml

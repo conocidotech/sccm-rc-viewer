@@ -1,0 +1,21 @@
+[package]
+name = "sccm-rc-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "High-level SCCM RC session: connect, render-stream, input, lifecycle"
+
+[dependencies]
+tokio.workspace = true
+futures.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+sccm-rc-protocol.workspace = true
+# ironrdp.workspace = true            # deferred — Fase 2
+# ironrdp-pdu.workspace = true
+# ironrdp-tokio.workspace = true
+# ironrdp-graphics.workspace = true

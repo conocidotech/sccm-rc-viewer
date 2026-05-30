@@ -1,0 +1,22 @@
+[package]
+name = "sccm-rc-diag"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Pre-flight diagnostics for SCCM Remote Control targets"
+
+[[bin]]
+name = "sccm-rc-diag"
+path = "src/bin/main.rs"
+
+[dependencies]
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+sccm-rc-protocol.workspace = true
+# windows.workspace = true  # deferred — see workspace Cargo.toml

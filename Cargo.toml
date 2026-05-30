@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sccm-rc-protocol",
+    "crates/sccm-rc-core",
+    "crates/sccm-rc-diag",
+    "crates/sccm-rc-viewer",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+
+# Logging / errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+anyhow = "1"
+thiserror = "2"
+
+# Bytes / binary parsing
+bytes = "1"
+byteorder = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# SCCM RC specific — DEFERRED until Fase 2 (protocol implementation).
+# Re-add when handshake.rs / arbitration.rs / sccm-rc-core need them.
+# Note: sspi 0.16 has a transitive-dep conflict with newer picky-krb
+# (non-exhaustive patterns). Pin or upgrade when re-adding.
+#
+# ironrdp = "0.10"
+# ironrdp-blocking = "0.5"
+# ironrdp-tokio = "0.5"
+# ironrdp-pdu = "0.5"
+# ironrdp-graphics = "0.5"
+# sspi = "0.16"
+
+# Windows API bindings — deferred until we actually need LSA/SCM/WMI calls
+# in sccm-rc-diag checks 2-4. Pulling windows-sys 0.61 on -windows-gnu
+# requires a full MinGW (the rustup-bundled one lacks dlltool helpers).
+# Re-add when we have MSVC build tools OR install portable MinGW.
+# windows = { version = "0.61", features = [
+#     "Win32_Foundation", "Win32_Security", "Win32_Security_Authentication_Identity",
+#     "Win32_Networking_WinSock", "Win32_System_Registry", "Win32_System_Wmi", "Win32_System_Com",
+# ] }
+
+# Cross-crate internal deps
+sccm-rc-protocol = { path = "crates/sccm-rc-protocol" }
+sccm-rc-core = { path = "crates/sccm-rc-core" }
+sccm-rc-diag = { path = "crates/sccm-rc-diag" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
