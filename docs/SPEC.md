@@ -63,9 +63,45 @@ Known control message strings:
   but the authenticated identity is not in the Permitted Viewers
   group on the target.
 
-For SSPI / data messages (type `0x00`), the body is the raw payload
-(an SSPI token during handshake; a SecurityFilter-wrapped chunk during
-data phase).
+For SSPI / data messages (type `0x00`), the body is **NOT** the raw
+payload — it has an inner structure.
+
+### ⭐ Inner framing for SSPI handshake messages (type 0x00) — CONFIRMED via pcap 2026-05-30
+
+The body of a handshake message is:
+
+```
++---------+---------+
+| u16 LE: token length (excluding these 2 bytes)        |
++---------+---------+
+| SSPI/SPNEGO token (token_length bytes)                |
++---------------------------------------------------------+
+```
+
+So `outer_body_len = 2 + token_length`.
+
+**This was the bug in our first pure-Rust attempt.** We sent the raw
+SPNEGO token as the body; the server replied `ERROR_LOGON_DENIED`. Once
+we prepended the `u16 LE` token-length, the server accepted our AP-REQ
+and replied with a SPNEGO `NegTokenResp` (AP-REP) — byte-identical to
+what the real CmRcViewer receives:
+
+```
+→ frame [u32 type=0x00 len=3437] [u16 len=3435] [3435-byte SPNEGO NegTokenInit/AP-REQ]
+← frame [u32 type=0x00 len=187]  [u16 len=185]  [185-byte SPNEGO NegTokenResp/AP-REP]
+```
+
+The root cause was a **2-byte inner length prefix** — trivially fixable.
+Pure-Rust Pad B1 is viable after all; we do not strictly need to wrap
+Microsoft's DLL.
+
+### Data-phase messages (type 0x00, post-handshake)
+
+Once authenticated, the body uses the `SecurityFilter::EncryptData`
+layout (see § 2): `[u16 header_len][header][u16 token_len][Kerberos wrap
+token + sealed data]`. The Kerberos wrap tokens (`05 04 06 ff …` from
+client, `05 04 07 ff …` from server) carry incrementing sequence
+numbers — standard RFC 4121 GSS-API per-message tokens.
 
 ### Worked examples (observed against real targets)
 

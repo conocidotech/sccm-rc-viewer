@@ -27,3 +27,7 @@ path = "src/bin/handshake-test.rs"
 [[bin]]
 name = "probe"
 path = "src/bin/probe.rs"
+
+[[bin]]
+name = "pcap-extract"
+path = "src/bin/pcap-extract.rs"

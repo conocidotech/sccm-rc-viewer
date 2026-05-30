@@ -39,6 +39,12 @@ struct Cli {
     #[arg(long, value_parser = parse_hex_u8)]
     sccm: Option<u8>,
 
+    /// Like --sccm but also prepend a u16 LE length prefix INSIDE the body,
+    /// before the SSPI token (the inner framing we found in the real capture:
+    /// handshake body = [u16 token_len][token]).
+    #[arg(long, value_parser = parse_hex_u8)]
+    sccm_innerlen: Option<u8>,
+
     /// First read the server's greeting, then send our reply using --sccm framing.
     #[arg(long)]
     after_greeting: bool,
@@ -98,8 +104,18 @@ async fn main() -> anyhow::Result<()> {
             v.extend_from_slice(&header.to_le_bytes());
             v.extend_from_slice(&step.output);
             v
+        } else if let Some(type_byte) = cli.sccm_innerlen {
+            // body = [u16 LE token_len][token]; outer body_len = 2 + token_len
+            let token_len = step.output.len();
+            let body_len = 2 + token_len;
+            let mut v = Vec::with_capacity(4 + body_len);
+            let header = (body_len as u32) | ((type_byte as u32) << 24);
+            v.extend_from_slice(&header.to_le_bytes());
+            v.extend_from_slice(&(token_len as u16).to_le_bytes());
+            v.extend_from_slice(&step.output);
+            v
         } else {
-            anyhow::bail!("pick one of --raw, --framed-be32, --framed-le32, --sccm <type>, --connect-only");
+            anyhow::bail!("pick one of --raw, --framed-be32, --framed-le32, --sccm <type>, --sccm-innerlen <type>, --connect-only");
         };
 
         info!(send_bytes = to_send.len(), "sending");

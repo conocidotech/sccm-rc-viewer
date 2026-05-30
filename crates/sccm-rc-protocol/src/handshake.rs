@@ -134,19 +134,27 @@ impl SspiSession {
     /// Pump one round of the handshake. `input` = bytes from peer (empty
     /// for first call). Returns bytes to send and `done == true` when complete.
     pub fn step(&mut self, input: &[u8]) -> crate::Result<HandshakeStep> {
-        let mut in_buf = SecBuffer {
-            cbBuffer: input.len() as u32,
-            BufferType: SECBUFFER_TOKEN,
-            pvBuffer: if input.is_empty() {
-                ptr::null_mut()
-            } else {
-                input.as_ptr() as *mut _
+        // Mirror CmRcViewer: cBuffers=2, first TOKEN with input bytes, second EMPTY.
+        let mut in_bufs = [
+            SecBuffer {
+                cbBuffer: input.len() as u32,
+                BufferType: SECBUFFER_TOKEN,
+                pvBuffer: if input.is_empty() {
+                    ptr::null_mut()
+                } else {
+                    input.as_ptr() as *mut _
+                },
             },
-        };
+            SecBuffer {
+                cbBuffer: 0,
+                BufferType: SECBUFFER_TOKEN, // any type — empty buffer
+                pvBuffer: ptr::null_mut(),
+            },
+        ];
         let mut in_desc = SecBufferDesc {
             ulVersion: SECBUFFER_VERSION,
-            cBuffers: 1,
-            pBuffers: &mut in_buf,
+            cBuffers: 2,
+            pBuffers: in_bufs.as_mut_ptr(),
         };
 
         let mut out_buf = SecBuffer {
@@ -162,13 +170,13 @@ impl SspiSession {
 
         let mut context_attr: u32 = 0;
         let mut expiry: i64 = 0;
-        let flags = ISC_REQ_ALLOCATE_MEMORY
-            | ISC_REQ_CONFIDENTIALITY
-            | ISC_REQ_INTEGRITY
-            | ISC_REQ_REPLAY_DETECT
-            | ISC_REQ_SEQUENCE_DETECT
-            | ISC_REQ_CONNECTION
-            | ISC_REQ_MUTUAL_AUTH;
+        // Minimal flag set — dropped MUTUAL_AUTH / REPLAY_DETECT / SEQUENCE_DETECT
+        // / INTEGRITY to see if the SCCM server is strict about any of those.
+        // (Diagnostic mode after observing CmRcViewer succeeds with what we suspect
+        //  is a looser flag set.)
+        let flags = ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_CONFIDENTIALITY | ISC_REQ_CONNECTION;
+        // Suppress unused warning while diagnosing:
+        let _ = (ISC_REQ_INTEGRITY, ISC_REQ_REPLAY_DETECT, ISC_REQ_SEQUENCE_DETECT, ISC_REQ_MUTUAL_AUTH);
 
         let ctxt_in: Option<*const SecHandle> = if self.ctxt_initialized {
             Some(self.ctxt.as_mut() as *const _)
