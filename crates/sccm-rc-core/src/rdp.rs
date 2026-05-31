@@ -332,7 +332,10 @@ pub async fn run_active_session(
     }
 }
 
-/// Send a Refresh Rect PDU covering the whole desktop to force a full repaint.
+/// Tell the server to (re)send display updates, then force a full repaint.
+/// Sends a Suppress Output PDU with allowDisplayUpdates=ALLOW for the whole
+/// desktop, followed by a Refresh Rect. Some servers won't paint until the
+/// client explicitly allows output.
 async fn send_refresh_rect(
     session: &mut SccmSession,
     user_channel_id: u16,
@@ -345,20 +348,34 @@ async fn send_refresh_rect(
     use ironrdp_pdu::geometry::InclusiveRectangle;
     use ironrdp_pdu::rdp::headers::ShareDataPdu;
     use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+    use ironrdp_pdu::rdp::suppress_output::SuppressOutputPdu;
 
-    let pdu = ShareDataPdu::RefreshRectangle(RefreshRectanglePdu {
-        areas_to_refresh: vec![InclusiveRectangle {
-            left: 0,
-            top: 0,
-            right: width.saturating_sub(1),
-            bottom: height.saturating_sub(1),
-        }],
+    let full = InclusiveRectangle {
+        left: 0,
+        top: 0,
+        right: width.saturating_sub(1),
+        bottom: height.saturating_sub(1),
+    };
+
+    // 1. Allow display updates for the whole desktop.
+    let allow = ShareDataPdu::SuppressOutput(SuppressOutputPdu {
+        desktop_rect: Some(full.clone()),
     });
     let mut out = WriteBuf::new();
-    ironrdp_connector::legacy::encode_share_data(user_channel_id, io_channel_id, share_id, pdu, &mut out)
-        .map_err(|e| Error::Protocol(format!("encode refresh rect: {e}")))?;
+    ironrdp_connector::legacy::encode_share_data(user_channel_id, io_channel_id, share_id, allow, &mut out)
+        .map_err(|e| Error::Protocol(format!("encode suppress-output: {e}")))?;
     session.send_rdp(out.filled()).await?;
-    debug!(width, height, "sent refresh-rect (full desktop)");
+
+    // 2. Refresh the whole desktop.
+    let refresh = ShareDataPdu::RefreshRectangle(RefreshRectanglePdu {
+        areas_to_refresh: vec![full],
+    });
+    let mut out2 = WriteBuf::new();
+    ironrdp_connector::legacy::encode_share_data(user_channel_id, io_channel_id, share_id, refresh, &mut out2)
+        .map_err(|e| Error::Protocol(format!("encode refresh rect: {e}")))?;
+    session.send_rdp(out2.filled()).await?;
+
+    debug!(width, height, share_id, "sent allow-output + refresh-rect");
     Ok(())
 }
 

@@ -369,6 +369,10 @@ fn create_client_confirm_active(
             // in Windows 2019 and older
             flags: LargePointerSupportFlags::UP_TO_96X96_PIXELS | LargePointerSupportFlags::UP_TO_384X384_PIXELS,
         }),
+        // PATCHED for sccm-rc: the 2014-era SCCM RDP server does not paint
+        // when modern Surface Commands / RemoteFx are advertised. Omitting them
+        // forces the server to use legacy slow-path Bitmap Update PDUs, which
+        // IronRDP also decodes. (Toggle SCCM_RC_LEGACY_GFX=0 to restore modern.)
         CapabilitySet::SurfaceCommands(SurfaceCommands {
             flags: CmdFlags::SET_SURFACE_BITS | CmdFlags::STREAM_SURFACE_BITS | CmdFlags::FRAME_MARKER,
         }),
@@ -383,6 +387,18 @@ fn create_client_confirm_active(
             max_unacknowledged_frame_count: 20,
         }),
     ]);
+
+    // PATCHED for sccm-rc: when SCCM_RC_LEGACY_GFX=1, drop the modern
+    // Surface Commands + RemoteFx codec caps so the legacy SCCM RDP server
+    // falls back to slow-path Bitmap Update PDUs.
+    if std::env::var("SCCM_RC_LEGACY_GFX").as_deref() == Ok("1") {
+        server_capability_sets.retain(|c| {
+            !matches!(
+                c,
+                CapabilitySet::SurfaceCommands(_) | CapabilitySet::BitmapCodecs(_)
+            )
+        });
+    }
 
     if !server_capability_sets
         .iter()
