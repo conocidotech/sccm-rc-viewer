@@ -310,12 +310,28 @@ fn create_client_confirm_active(
             desktop_resize_flag: true,
             drawing_flags,
         }),
-        CapabilitySet::Order(Order::new(
-            OrderFlags::NEGOTIATE_ORDER_SUPPORT | OrderFlags::ZERO_BOUNDS_DELTAS_SUPPORT,
-            OrderSupportExFlags::empty(),
-            0,
-            0,
-        )),
+        // PATCHED for sccm-rc: advertise primary drawing-order support (like
+        // mstscax). The 2014 SCCM RDP server may only start sending graphics
+        // to an order-capable client. (Experiment via SCCM_RC_ORDERS=1.)
+        {
+            use ironrdp_pdu::rdp::capability_sets::OrderSupportIndex as Osi;
+            let mut order = Order::new(
+                OrderFlags::NEGOTIATE_ORDER_SUPPORT | OrderFlags::ZERO_BOUNDS_DELTAS_SUPPORT,
+                OrderSupportExFlags::empty(),
+                0,
+                0,
+            );
+            if std::env::var("SCCM_RC_ORDERS").as_deref() == Ok("1") {
+                for f in [
+                    Osi::DstBlt, Osi::PatBlt, Osi::ScrBlt, Osi::MemBlt, Osi::Mem3Blt,
+                    Osi::LineTo, Osi::SaveBitmap, Osi::MultiDstBlt, Osi::MultiPatBlt,
+                    Osi::MultiScrBlt, Osi::MultiOpaqueRect, Osi::Polyline,
+                ] {
+                    order.set_support_flag(f, true);
+                }
+            }
+            CapabilitySet::Order(order)
+        },
         CapabilitySet::BitmapCache(BitmapCache {
             caches: [CacheEntry {
                 entries: 0,
