@@ -127,9 +127,39 @@ with the real server:
 (no length prefix, unlike the unencrypted greeting).
 
 This proves the entire transport + auth + crypto stack works in pure
-Rust end-to-end. What remains is the application layer: the RDP stream
-(MS-RDPBCGR via IronRDP) carried inside these sealed frames, plus the
-SCCM data-phase control messages (SUCCESS_*, screen negotiation, etc.).
+Rust end-to-end.
+
+### RDP layer — ACTIVE SESSION reached 2026-05-31
+
+The RDP stream (MS-RDPBCGR) is carried inside the sealed frames and
+driven by IronRDP. Two facts make this work:
+
+1. **The SCCM control handshake precedes RDP**: after auth, the server
+   sends a sealed control grant (`SUCCESS_FULL_CONTROL` / `SUCCESS_VIEW_ONLY`
+   / `ERROR_ACCESS_DENIED`). Then the RDP connection sequence begins.
+2. **The inner RDP uses encryption level NONE** (confirmed from the MCS
+   Connect Response: `encryption_method=0x0`, `encryption_level=None`,
+   `server_cert=[]`). The outer SecurityFilter provides all confidentiality,
+   so the RDP layer itself does no encryption.
+
+Because of (2), IronRDP drives the *entire* connection sequence — X.224,
+MCS Connect, channel join, secure settings, licensing, capabilities
+exchange, finalization — to an **active session** (server desktop
+1920×1080, RemoteFx codec advertised). The only change required to
+IronRDP is removing its two guard clauses that reject "standard RDP
+security" (it assumes standard security means RC4; here it means
+*no* inner encryption, which is safe). See `vendor/ironrdp-connector`.
+
+Full pure-Rust flow, validated end-to-end against TARGET-HOST:
+```
+TCP/2701 → START_HANDSHAKE → Kerberos SSPI handshake (SSO)
+  → SUCCESS_FULL_CONTROL grant (sealed)
+  → IronRDP connection sequence over seal/unseal
+  → ✅ ACTIVE RDP SESSION (1920×1080)
+```
+
+What remains: the UI (decode the RDP graphics stream IronRDP yields and
+render it; forward keyboard/mouse input).
 
 ### Worked examples (observed against real targets)
 

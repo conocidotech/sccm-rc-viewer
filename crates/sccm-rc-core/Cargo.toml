@@ -21,6 +21,6 @@ thiserror.workspace = true
 bytes.workspace = true
 clap.workspace = true
 sccm-rc-protocol.workspace = true
-ironrdp-connector = "0.9"
+ironrdp-connector = { path = "../../vendor/ironrdp-connector" }
 ironrdp-pdu = "0.8"
 ironrdp-core = "0.2"
