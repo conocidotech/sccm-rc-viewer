@@ -145,8 +145,118 @@ fn main() {
         let c2s: Vec<u8> = c2s_map.values().flatten().copied().collect();
         let s2c: Vec<u8> = s2c_map.values().flatten().copied().collect();
 
-        dump_framed("CLIENT → SERVER", &c2s);
-        dump_framed("SERVER → CLIENT", &s2c);
+        if std::env::var("TIMELINE").is_ok() {
+            dump_timeline_timed(&conn_segs);
+        } else {
+            dump_framed("CLIENT → SERVER", &c2s);
+            dump_framed("SERVER → CLIENT", &s2c);
+        }
+    }
+}
+
+/// Timestamp-ordered frame timeline. Streams segments in time order,
+/// maintaining a per-direction rolling buffer, and emits each SCCM frame
+/// tagged with the timestamp at which it completed. Merges both directions.
+fn dump_timeline_timed(segs: &[&Seg]) {
+    // Dedupe: pktmon records each packet at multiple stack layers. Keep one
+    // segment per (direction, seq, len).
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered: Vec<&Seg> = segs
+        .iter()
+        .filter(|s| seen.insert((s.to_server, s.seq, s.payload.len())))
+        .copied()
+        .collect();
+    ordered.sort_by_key(|s| s.ts);
+    let t0 = ordered.first().map(|s| s.ts).unwrap_or(0);
+
+    let mut c_buf: Vec<u8> = Vec::new();
+    let mut s_buf: Vec<u8> = Vec::new();
+    // (ms, dir, type, len)
+    let mut events: Vec<(f64, char, u8, usize)> = Vec::new();
+
+    for seg in &ordered {
+        let ms = (seg.ts.saturating_sub(t0)) as f64 / 1000.0; // pktmon ts is microseconds
+        let (buf, dir) = if seg.to_server { (&mut c_buf, 'C') } else { (&mut s_buf, 'S') };
+        buf.extend_from_slice(&seg.payload);
+        loop {
+            if buf.len() < 4 {
+                break;
+            }
+            let hdr = rd_u32le(buf, 0);
+            let body_len = (hdr & 0x00ff_ffff) as usize;
+            let msg_type = (hdr >> 24) as u8;
+            if body_len == 0 || 4 + body_len > buf.len() {
+                break;
+            }
+            events.push((ms, dir, msg_type, body_len));
+            buf.drain(..4 + body_len);
+        }
+    }
+
+    // Find first large server frame (graphics).
+    let mut first_big = None;
+    for (i, (_ms, dir, _t, l)) in events.iter().enumerate() {
+        if *dir == 'S' && *l > 300 {
+            first_big = Some(i);
+            break;
+        }
+    }
+    let window_start = first_big.map(|i| i.saturating_sub(25)).unwrap_or(0);
+    let window_end = first_big.map(|i| i + 3).unwrap_or(events.len());
+    println!("\n--- timeline around graphics start (deduped) ---");
+    for (i, (ms, dir, t, l)) in events.iter().enumerate() {
+        if i >= window_start && i <= window_end {
+            let mark = if Some(i) == first_big { "  <== FIRST GRAPHICS" } else { "" };
+            println!("  [{i:3}] {ms:9.1}ms  {dir}->  type=0x{t:02x} len={l}{mark}");
+        }
+    }
+    println!("\ntotal frames: {} (first graphics at index {:?})", events.len(), first_big);
+}
+
+/// Compact per-frame timeline: walk both directions' framed streams and print
+/// one line per SCCM frame (direction, type, body_len). Encrypted bodies, so we
+/// only see sizes — enough to spot when the server starts streaming graphics
+/// (large S->C frames) and which client frames precede it.
+fn dump_timeline(c2s: &[u8], s2c: &[u8]) {
+    fn frames(stream: &[u8]) -> Vec<(u8, usize)> {
+        let mut v = Vec::new();
+        let mut off = 0;
+        while off + 4 <= stream.len() {
+            let hdr = rd_u32le(stream, off);
+            let body_len = (hdr & 0x00ff_ffff) as usize;
+            let msg_type = (hdr >> 24) as u8;
+            if body_len == 0 || off + 4 + body_len > stream.len() {
+                break;
+            }
+            v.push((msg_type, body_len));
+            off += 4 + body_len;
+        }
+        v
+    }
+    let c = frames(c2s);
+    let s = frames(s2c);
+    println!("\n--- CLIENT→SERVER frames ({}) ---", c.len());
+    for (i, (t, l)) in c.iter().enumerate() {
+        println!("  c[{i:3}] type=0x{t:02x} len={l}");
+        if i > 60 {
+            println!("  … (+{} more)", c.len() - i - 1);
+            break;
+        }
+    }
+    println!("\n--- SERVER→CLIENT frames ({}) ---", s.len());
+    let mut big_first = None;
+    for (i, (t, l)) in s.iter().enumerate() {
+        let big = *l > 300;
+        if big && big_first.is_none() {
+            big_first = Some(i);
+        }
+        if i <= 60 || big {
+            println!("  s[{i:3}] type=0x{t:02x} len={l}{}", if big { "   <== large (graphics?)" } else { "" });
+        }
+        if i > 60 && big_first.is_some() && i > big_first.unwrap() + 3 {
+            println!("  … (server streaming; stop)");
+            break;
+        }
     }
 }
 
