@@ -126,10 +126,10 @@ async fn run_session(
 ) -> anyhow::Result<()> {
     let mut session = SccmSession::connect(target).await?;
     info!(grant = ?session.grant(), "session established");
-    let result = rdp::connect_rdp(&mut session, w, h).await?;
+    let (result, initial_buf) = rdp::connect_rdp(&mut session, w, h).await?;
     info!("RDP active — streaming");
     let mut sink = FrameSink { shared, proxy };
-    rdp::run_active_session(&mut session, result, &mut sink, &mut input_rx).await?;
+    rdp::run_active_session(&mut session, result, initial_buf, &mut sink, &mut input_rx).await?;
     Ok(())
 }
 

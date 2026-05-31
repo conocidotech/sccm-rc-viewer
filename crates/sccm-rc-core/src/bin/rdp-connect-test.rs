@@ -26,13 +26,13 @@ async fn main() -> anyhow::Result<()> {
     let mut session = SccmSession::connect(&cli.target).await?;
     info!(grant = ?session.grant(), "session established");
 
-    let result = match rdp::connect_rdp(&mut session, cli.width, cli.height).await {
-        Ok(result) => {
+    let (result, initial_buf) = match rdp::connect_rdp(&mut session, cli.width, cli.height).await {
+        Ok(r) => {
             info!(
-                desktop = format!("{}x{}", result.desktop_size.width, result.desktop_size.height),
+                desktop = format!("{}x{}", r.0.desktop_size.width, r.0.desktop_size.height),
                 "✅✅ RDP ACTIVE SESSION — full connection sequence completed over SCCM transport"
             );
-            result
+            r
         }
         Err(e) => {
             error!(error = %e, "RDP connection sequence failed");
@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
-    if let Err(e) = rdp::run_active_session(&mut session, result, &mut sink, &mut input_rx).await {
+    if let Err(e) = rdp::run_active_session(&mut session, result, initial_buf, &mut sink, &mut input_rx).await {
         error!(error = %e, updates = sink.updates, "active session ended with error");
     }
     info!(updates = sink.updates, total_pixels = sink.total_pixels, "active session ended");

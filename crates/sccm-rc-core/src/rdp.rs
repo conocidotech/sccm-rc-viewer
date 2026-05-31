@@ -78,7 +78,11 @@ fn map_err(e: ConnectorError) -> Error {
 
 /// Run the full RDP connection sequence over the established SCCM session.
 /// Returns the negotiated connection result on success.
-pub async fn connect_rdp(session: &mut SccmSession, width: u16, height: u16) -> Result<ConnectionResult> {
+pub async fn connect_rdp(
+    session: &mut SccmSession,
+    width: u16,
+    height: u16,
+) -> Result<(ConnectionResult, Vec<u8>)> {
     if session.grant() == Grant::ViewOnly {
         debug!("session is view-only — input will be rejected by the server");
     }
@@ -132,9 +136,13 @@ pub async fn connect_rdp(session: &mut SccmSession, width: u16, height: u16) -> 
             height = result.desktop_size.height,
             io_channel = result.io_channel_id,
             user_channel = result.user_channel_id,
+            leftover = input_buf.len(),
             "✅ RDP connection sequence complete — active session"
         );
-        Ok(result)
+        // Any bytes still buffered are the server's first post-activation PDUs
+        // (often the initial screen paint). They must be carried into the
+        // active session, not dropped.
+        Ok((result, input_buf))
     } else {
         Err(Error::Protocol(format!(
             "RDP connector ended in non-connected state: {}",
@@ -168,6 +176,7 @@ pub trait SessionSink: Send {
 pub async fn run_active_session(
     session: &mut SccmSession,
     connection_result: ConnectionResult,
+    initial_buf: Vec<u8>,
     sink: &mut dyn SessionSink,
     input_rx: &mut InputReceiver,
 ) -> Result<()> {
@@ -178,7 +187,8 @@ pub async fn run_active_session(
     let mut image = DecodedImage::new(PixelFormat::RgbA32, width, height);
     let mut stage = ActiveStage::new(connection_result);
 
-    let mut buf: Vec<u8> = Vec::new();
+    // Seed with any PDUs left over from the connection sequence (initial paint).
+    let mut buf: Vec<u8> = initial_buf;
     let mut frames = 0u64;
     let mut pdus = 0u64;
 
@@ -200,16 +210,22 @@ pub async fn run_active_session(
                     let outs = stage
                         .process_fastpath_input(&mut image, &events)
                         .map_err(|e| Error::Protocol(format!("input: {e}")))?;
+                    let mut sent = 0usize;
                     for out in outs {
                         if let ActiveStageOutput::ResponseFrame(bytes) = out {
+                            sent += bytes.len();
                             session.send_rdp(&bytes).await?;
                         }
                     }
+                    debug!(events = events.len(), sent_bytes = sent, "forwarded input");
                     continue;
                 }
                 more = session.recv_rdp() => {
                     match more? {
-                        Some(b) => buf.extend_from_slice(&b),
+                        Some(b) => {
+                            debug!(bytes = b.len(), "recv during active session");
+                            buf.extend_from_slice(&b);
+                        }
                         None => return Ok(()),
                     }
                     // fall through to try to parse a PDU
