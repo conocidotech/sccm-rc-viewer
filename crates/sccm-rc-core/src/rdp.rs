@@ -171,14 +171,20 @@ pub async fn run_active_session(
     sink: &mut dyn SessionSink,
     input_rx: &mut InputReceiver,
 ) -> Result<()> {
-    let width = connection_result.desktop_size.width;
-    let height = connection_result.desktop_size.height;
+    let mut width = connection_result.desktop_size.width;
+    let mut height = connection_result.desktop_size.height;
+    let mut io_channel_id = connection_result.io_channel_id;
+    let mut user_channel_id = connection_result.user_channel_id;
     let mut image = DecodedImage::new(PixelFormat::RgbA32, width, height);
     let mut stage = ActiveStage::new(connection_result);
 
     let mut buf: Vec<u8> = Vec::new();
     let mut frames = 0u64;
     let mut pdus = 0u64;
+
+    // Force an initial full-screen repaint. Without this, a static remote
+    // desktop (e.g. no user logged in) sends nothing and the window stays blank.
+    send_refresh_rect(session, user_channel_id, io_channel_id, width, height).await?;
 
     loop {
         // Either a network PDU arrives, or the UI sends input.
@@ -230,6 +236,23 @@ pub async fn run_active_session(
             .process(&mut image, pdu_info.action, &frame)
             .map_err(|e| Error::Protocol(format!("active-stage: {e}")))?;
 
+        if !outputs.is_empty() {
+            let kinds: Vec<&str> = outputs
+                .iter()
+                .map(|o| match o {
+                    ActiveStageOutput::ResponseFrame(_) => "Response",
+                    ActiveStageOutput::GraphicsUpdate(_) => "Graphics",
+                    ActiveStageOutput::Terminate(_) => "Terminate",
+                    ActiveStageOutput::DeactivateAll(_) => "DeactivateAll",
+                    ActiveStageOutput::PointerDefault => "PtrDefault",
+                    ActiveStageOutput::PointerHidden => "PtrHidden",
+                    ActiveStageOutput::PointerPosition { .. } => "PtrPos",
+                    ActiveStageOutput::PointerBitmap(_) => "PtrBitmap",
+                })
+                .collect();
+            debug!(action = ?pdu_info.action, ?kinds, "stage outputs");
+        }
+
         for out in outputs {
             match out {
                 ActiveStageOutput::ResponseFrame(bytes) => {
@@ -265,11 +288,15 @@ pub async fn run_active_session(
                         buf.splice(0..0, frame.iter().copied());
                     }
                     let new_result = drive_reactivation(session, *activation, &mut buf).await?;
-                    let w = new_result.desktop_size.width;
-                    let h = new_result.desktop_size.height;
-                    image = DecodedImage::new(PixelFormat::RgbA32, w, h);
+                    width = new_result.desktop_size.width;
+                    height = new_result.desktop_size.height;
+                    io_channel_id = new_result.io_channel_id;
+                    user_channel_id = new_result.user_channel_id;
+                    image = DecodedImage::new(PixelFormat::RgbA32, width, height);
                     stage = ActiveStage::new(new_result);
-                    info!(width = w, height = h, "reactivation complete — active session resumed");
+                    info!(width, height, "reactivation complete — active session resumed");
+                    // Repaint after reactivation too.
+                    send_refresh_rect(session, user_channel_id, io_channel_id, width, height).await?;
                     break; // restart the outer read loop with the new stage
                 }
                 // Pointer updates — handled by the UI layer later.
@@ -280,6 +307,35 @@ pub async fn run_active_session(
             }
         }
     }
+}
+
+/// Send a Refresh Rect PDU covering the whole desktop to force a full repaint.
+async fn send_refresh_rect(
+    session: &mut SccmSession,
+    user_channel_id: u16,
+    io_channel_id: u16,
+    width: u16,
+    height: u16,
+) -> Result<()> {
+    use ironrdp_core::WriteBuf;
+    use ironrdp_pdu::geometry::InclusiveRectangle;
+    use ironrdp_pdu::rdp::headers::ShareDataPdu;
+    use ironrdp_pdu::rdp::refresh_rectangle::RefreshRectanglePdu;
+
+    let pdu = ShareDataPdu::RefreshRectangle(RefreshRectanglePdu {
+        areas_to_refresh: vec![InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: width.saturating_sub(1),
+            bottom: height.saturating_sub(1),
+        }],
+    });
+    let mut out = WriteBuf::new();
+    ironrdp_connector::legacy::encode_share_data(user_channel_id, io_channel_id, 0, pdu, &mut out)
+        .map_err(|e| Error::Protocol(format!("encode refresh rect: {e}")))?;
+    session.send_rdp(out.filled()).await?;
+    debug!(width, height, "sent refresh-rect (full desktop)");
+    Ok(())
 }
 
 /// Drive a `ConnectionActivationSequence` (capability exchange + finalization)

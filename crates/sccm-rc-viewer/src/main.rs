@@ -7,15 +7,16 @@ use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use sccm_rc_core::rdp::{
-    self, DecodedImage, FastPathInputEvent, InputSender, MousePdu, PointerFlags, SessionSink,
-    UpdateRegion,
+    self, DecodedImage, FastPathInputEvent, InputSender, KeyboardFlags, MousePdu, PointerFlags,
+    SessionSink, UpdateRegion,
 };
 use sccm_rc_core::SccmSession;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{Window, WindowId};
 
 #[derive(Parser)]
@@ -31,32 +32,41 @@ struct Cli {
     height: u16,
 }
 
+/// Wake-ups delivered from the RDP task to the winit event loop.
+#[derive(Debug, Clone)]
+enum UserEvent {
+    Frame,
+    Closed(String),
+}
+
 /// Shared framebuffer written by the RDP task, read by the renderer.
 #[derive(Default)]
 struct SharedFrame {
     rgba: Vec<u8>,
     width: u32,
     height: u32,
-    dirty: bool,
-    closed: Option<String>,
 }
 
-/// Sink that copies decoded frames into the shared framebuffer.
+/// Sink that copies decoded frames into the shared framebuffer and wakes
+/// the UI thread.
 struct FrameSink {
     shared: Arc<Mutex<SharedFrame>>,
+    proxy: EventLoopProxy<UserEvent>,
 }
 
 impl SessionSink for FrameSink {
     fn on_graphics_update(&mut self, image: &DecodedImage, _region: UpdateRegion) {
-        let mut f = self.shared.lock().unwrap();
-        f.width = image.width() as u32;
-        f.height = image.height() as u32;
-        f.rgba.clear();
-        f.rgba.extend_from_slice(image.data());
-        f.dirty = true;
+        {
+            let mut f = self.shared.lock().unwrap();
+            f.width = image.width() as u32;
+            f.height = image.height() as u32;
+            f.rgba.clear();
+            f.rgba.extend_from_slice(image.data());
+        }
+        let _ = self.proxy.send_event(UserEvent::Frame);
     }
     fn on_terminate(&mut self, reason: String) {
-        self.shared.lock().unwrap().closed = Some(reason);
+        let _ = self.proxy.send_event(UserEvent::Closed(reason));
     }
 }
 
@@ -69,9 +79,14 @@ fn main() -> anyhow::Result<()> {
     let shared = Arc::new(Mutex::new(SharedFrame::default()));
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<Vec<FastPathInputEvent>>(256);
 
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
+
     // RDP session runs on a dedicated tokio runtime thread.
     {
         let shared = shared.clone();
+        let proxy = proxy.clone();
         let target = cli.target.clone();
         let (w, h) = (cli.width, cli.height);
         std::thread::spawn(move || {
@@ -80,22 +95,22 @@ fn main() -> anyhow::Result<()> {
                 .build()
                 .expect("tokio runtime");
             rt.block_on(async move {
-                if let Err(e) = run_session(&target, w, h, shared.clone(), input_rx).await {
+                if let Err(e) = run_session(&target, w, h, shared, proxy.clone(), input_rx).await {
                     error!(error = %e, "RDP session failed");
-                    shared.lock().unwrap().closed = Some(e.to_string());
+                    let _ = proxy.send_event(UserEvent::Closed(e.to_string()));
                 }
             });
         });
     }
 
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
         shared,
         input_tx,
         window: None,
         surface: None,
         title: format!("SCCM RC — {}", cli.target),
+        last_cursor: (0, 0),
+        closed: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -106,13 +121,14 @@ async fn run_session(
     w: u16,
     h: u16,
     shared: Arc<Mutex<SharedFrame>>,
+    proxy: EventLoopProxy<UserEvent>,
     mut input_rx: rdp::InputReceiver,
 ) -> anyhow::Result<()> {
     let mut session = SccmSession::connect(target).await?;
     info!(grant = ?session.grant(), "session established");
     let result = rdp::connect_rdp(&mut session, w, h).await?;
     info!("RDP active — streaming");
-    let mut sink = FrameSink { shared };
+    let mut sink = FrameSink { shared, proxy };
     rdp::run_active_session(&mut session, result, &mut sink, &mut input_rx).await?;
     Ok(())
 }
@@ -123,6 +139,8 @@ struct App {
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     title: String,
+    last_cursor: (u16, u16),
+    closed: Option<String>,
 }
 
 impl App {
@@ -150,7 +168,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -165,33 +183,53 @@ impl ApplicationHandler for App {
         self.window = Some(window);
     }
 
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Frame => {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            UserEvent::Closed(reason) => {
+                warn!(%reason, "session closed");
+                self.closed = Some(reason);
+                if let Some(w) = &self.window {
+                    w.request_redraw(); // paint the closed banner once
+                }
+                event_loop.exit();
+            }
+        }
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let mut last_cursor = (0u16, 0u16);
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Resized(_) => {
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 let (x, y) = self.map_cursor(position.x, position.y);
-                last_cursor = (x, y);
+                self.last_cursor = (x, y);
                 self.send_input(FastPathInputEvent::MouseEvent(MousePdu {
                     flags: PointerFlags::MOVE,
                     number_of_wheel_rotation_units: 0,
                     x_position: x,
                     y_position: y,
                 }));
-                let _ = last_cursor;
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let down = state == ElementState::Pressed;
                 let mut flags = match button {
                     MouseButton::Left => PointerFlags::LEFT_BUTTON,
                     MouseButton::Right => PointerFlags::RIGHT_BUTTON,
-                    MouseButton::Middle => PointerFlags::empty(),
                     _ => PointerFlags::empty(),
                 };
                 if down {
                     flags |= PointerFlags::DOWN;
                 }
-                let (x, y) = last_cursor;
+                let (x, y) = self.last_cursor;
                 self.send_input(FastPathInputEvent::MouseEvent(MousePdu {
                     flags,
                     number_of_wheel_rotation_units: 0,
@@ -211,20 +249,23 @@ impl ApplicationHandler for App {
                     y_position: 0,
                 }));
             }
-            WindowEvent::RedrawRequested => {
-                self.render();
-                if let Some(reason) = self.shared.lock().unwrap().closed.clone() {
-                    warn!(%reason, "session closed — exiting");
-                    event_loop.exit();
+            WindowEvent::KeyboardInput { event, .. } => {
+                // winit gives us the OS hardware scancode, which on Windows is
+                // the PS/2 set-1 scancode RDP expects (0xE000 prefix = extended).
+                if let Some(sc) = event.physical_key.to_scancode() {
+                    let mut flags = KeyboardFlags::empty();
+                    if event.state == ElementState::Released {
+                        flags |= KeyboardFlags::RELEASE;
+                    }
+                    if sc & 0xE000 == 0xE000 || sc > 0xFF {
+                        flags |= KeyboardFlags::EXTENDED;
+                    }
+                    let code = (sc & 0xFF) as u8;
+                    self.send_input(FastPathInputEvent::KeyboardEvent(flags, code));
                 }
             }
+            WindowEvent::RedrawRequested => self.render(),
             _ => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(w) = &self.window {
-            w.request_redraw();
         }
     }
 }
@@ -236,34 +277,39 @@ impl App {
         };
         let size = window.inner_size();
         let (win_w, win_h) = (size.width.max(1), size.height.max(1));
-        let Some(nw) = NonZeroU32::new(win_w) else { return };
-        let Some(nh) = NonZeroU32::new(win_h) else { return };
+        let (Some(nw), Some(nh)) = (NonZeroU32::new(win_w), NonZeroU32::new(win_h)) else {
+            return;
+        };
         if surface.resize(nw, nh).is_err() {
             return;
         }
-        let Ok(mut buffer) = surface.buffer_mut() else { return };
+        let Ok(mut buffer) = surface.buffer_mut() else {
+            return;
+        };
 
         let frame = self.shared.lock().unwrap();
         if frame.width == 0 || frame.height == 0 || frame.rgba.is_empty() {
-            // Nothing yet — clear to dark grey.
+            let fill = if self.closed.is_some() { 0x0040_0000 } else { 0x0020_2020 };
             for px in buffer.iter_mut() {
-                *px = 0x0020_2020;
+                *px = fill;
             }
         } else {
-            // Nearest-neighbour scale framebuffer (fb_w x fb_h) into window.
             let (fb_w, fb_h) = (frame.width, frame.height);
             for wy in 0..win_h {
                 let sy = (wy as u64 * fb_h as u64 / win_h as u64) as u32;
+                let row = (sy * fb_w) as usize;
+                let out_row = (wy * win_w) as usize;
                 for wx in 0..win_w {
                     let sx = (wx as u64 * fb_w as u64 / win_w as u64) as u32;
-                    let si = ((sy * fb_w + sx) * 4) as usize;
-                    let (r, g, b) = if si + 2 < frame.rgba.len() {
-                        (frame.rgba[si], frame.rgba[si + 1], frame.rgba[si + 2])
+                    let si = (row + sx as usize) * 4;
+                    let px = if si + 2 < frame.rgba.len() {
+                        ((frame.rgba[si] as u32) << 16)
+                            | ((frame.rgba[si + 1] as u32) << 8)
+                            | (frame.rgba[si + 2] as u32)
                     } else {
-                        (0, 0, 0)
+                        0
                     };
-                    buffer[(wy * win_w + wx) as usize] =
-                        ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+                    buffer[out_row + wx as usize] = px;
                 }
             }
         }

@@ -43,7 +43,26 @@ async fn main() -> anyhow::Result<()> {
     // Process the live graphics stream headless to prove decoding works.
     info!("entering active session — processing graphics updates (Ctrl+C to stop)");
     let mut sink = rdp::LoggingSink::default();
-    let (_tx, mut input_rx) = tokio::sync::mpsc::channel(32);
+    let (tx, mut input_rx) = tokio::sync::mpsc::channel(32);
+    // Wiggle the mouse to wake a static/secure remote desktop.
+    tokio::spawn(async move {
+        use rdp::{FastPathInputEvent, MousePdu, PointerFlags};
+        let mut t = tokio::time::interval(std::time::Duration::from_millis(800));
+        let mut x = 100u16;
+        loop {
+            t.tick().await;
+            x = if x > 800 { 100 } else { x + 60 };
+            let ev = FastPathInputEvent::MouseEvent(MousePdu {
+                flags: PointerFlags::MOVE,
+                number_of_wheel_rotation_units: 0,
+                x_position: x,
+                y_position: 400,
+            });
+            if tx.send(vec![ev]).await.is_err() {
+                break;
+            }
+        }
+    });
     if let Err(e) = rdp::run_active_session(&mut session, result, &mut sink, &mut input_rx).await {
         error!(error = %e, updates = sink.updates, "active session ended with error");
     }
