@@ -445,3 +445,44 @@ impl SessionSink for LoggingSink {
         warn!(%reason, updates = self.updates, "session terminated");
     }
 }
+
+/// A sink that saves each decoded frame to a PNG (for headless visual debugging).
+pub struct PngDumpSink {
+    pub path: String,
+    pub updates: u64,
+    pub nonblack_pixels: u64,
+}
+
+impl PngDumpSink {
+    pub fn new(path: impl Into<String>) -> Self {
+        Self { path: path.into(), updates: 0, nonblack_pixels: 0 }
+    }
+}
+
+impl SessionSink for PngDumpSink {
+    fn on_graphics_update(&mut self, image: &DecodedImage, _region: UpdateRegion) {
+        self.updates += 1;
+        let w = image.width() as u32;
+        let h = image.height() as u32;
+        let data = image.data(); // RGBA32
+        // Count non-black pixels so we know if there's actual content.
+        let mut nonblack = 0u64;
+        for px in data.chunks_exact(4) {
+            if px[0] != 0 || px[1] != 0 || px[2] != 0 {
+                nonblack += 1;
+            }
+        }
+        self.nonblack_pixels = nonblack;
+        // Save as PNG (RGBA).
+        if let Some(buf) = image::RgbaImage::from_raw(w, h, data.to_vec()) {
+            if let Err(e) = buf.save(&self.path) {
+                warn!(error = %e, "png save failed");
+            } else {
+                info!(update = self.updates, fb = format!("{w}x{h}"), nonblack, path = %self.path, "saved frame PNG");
+            }
+        }
+    }
+    fn on_terminate(&mut self, reason: String) {
+        warn!(%reason, "session terminated");
+    }
+}

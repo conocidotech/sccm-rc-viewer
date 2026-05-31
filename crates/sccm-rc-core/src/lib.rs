@@ -140,15 +140,27 @@ impl SccmSession {
                 continue;
             }
             let plain = self.sspi.unseal(&frame.body)?;
-            // A sealed control string (e.g. a status update) — skip; the
-            // caller only wants RDP bytes.
-            if decode_control_utf16(&plain).is_some() && !plain.starts_with(&[0x03, 0x00]) {
-                debug!("skipped sealed control message");
-                continue;
+            // Skip only KNOWN SCCM data-phase control strings (status updates).
+            // Anything else — including all RDP graphics — is returned as-is.
+            // (The previous heuristic "looks like ASCII" risked dropping RDP
+            // PDUs whose bytes happened to be printable.)
+            if let Some(s) = decode_control_utf16(&plain) {
+                if is_sccm_control_keyword(&s) {
+                    debug!(control = %s, "skipped sealed control message");
+                    continue;
+                }
             }
             return Ok(Some(plain));
         }
     }
+}
+
+/// Is this string one of the known SCCM data-phase control keywords?
+fn is_sccm_control_keyword(s: &str) -> bool {
+    s.starts_with("SUCCESS_")
+        || s.starts_with("ERROR_")
+        || s.starts_with("START_")
+        || s == "STOP_HANDSHAKE"
 }
 
 /// Decode a decrypted SCCM control payload (raw UTF-16LE, no length prefix).
