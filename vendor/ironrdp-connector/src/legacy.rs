@@ -183,6 +183,14 @@ pub fn frame_is_server_demand_active(frame: &[u8]) -> bool {
     )
 }
 
+/// sccm-rc helper: extract the share_id from an IO-channel Share Control frame
+/// (e.g. the server's DemandActive). Client PDUs must echo this share_id.
+pub fn frame_share_id(frame: &[u8]) -> Option<u32> {
+    let send_data = decode_send_data_indication(frame).ok()?;
+    let share_control = decode_share_control(send_data).ok()?;
+    Some(share_control.share_id)
+}
+
 pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<IoChannelPdu> {
     let ctx = decode_share_control(ctx)?;
 

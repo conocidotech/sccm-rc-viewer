@@ -192,9 +192,12 @@ pub async fn run_active_session(
     let mut frames = 0u64;
     let mut pdus = 0u64;
 
+    // The server's PDUs carry a share_id that client PDUs must echo.
+    let mut share_id: u32 = 0;
+
     // Force an initial full-screen repaint. Without this, a static remote
     // desktop (e.g. no user logged in) sends nothing and the window stays blank.
-    send_refresh_rect(session, user_channel_id, io_channel_id, width, height).await?;
+    send_refresh_rect(session, user_channel_id, io_channel_id, share_id, width, height).await?;
 
     loop {
         // Either a network PDU arrives, or the UI sends input.
@@ -299,7 +302,11 @@ pub async fn run_active_session(
                     //  (b) a real ServerDeactivateAll — the DemandActive is the NEXT
                     //      frame, so do not re-feed.
                     let refeed = ironrdp_connector::legacy::frame_is_server_demand_active(&frame);
-                    info!(refeed, "server reactivation — re-running capability exchange");
+                    // Capture the server's share_id so our refresh-rect echoes it.
+                    if let Some(sid) = ironrdp_connector::legacy::frame_share_id(&frame) {
+                        share_id = sid;
+                    }
+                    info!(refeed, share_id, "server reactivation — re-running capability exchange");
                     if refeed {
                         buf.splice(0..0, frame.iter().copied());
                     }
@@ -310,9 +317,9 @@ pub async fn run_active_session(
                     user_channel_id = new_result.user_channel_id;
                     image = DecodedImage::new(PixelFormat::RgbA32, width, height);
                     stage = ActiveStage::new(new_result);
-                    info!(width, height, "reactivation complete — active session resumed");
-                    // Repaint after reactivation too.
-                    send_refresh_rect(session, user_channel_id, io_channel_id, width, height).await?;
+                    info!(width, height, share_id, "reactivation complete — active session resumed");
+                    // Repaint after reactivation too (with the server's share_id).
+                    send_refresh_rect(session, user_channel_id, io_channel_id, share_id, width, height).await?;
                     break; // restart the outer read loop with the new stage
                 }
                 // Pointer updates — handled by the UI layer later.
@@ -330,6 +337,7 @@ async fn send_refresh_rect(
     session: &mut SccmSession,
     user_channel_id: u16,
     io_channel_id: u16,
+    share_id: u32,
     width: u16,
     height: u16,
 ) -> Result<()> {
@@ -347,7 +355,7 @@ async fn send_refresh_rect(
         }],
     });
     let mut out = WriteBuf::new();
-    ironrdp_connector::legacy::encode_share_data(user_channel_id, io_channel_id, 0, pdu, &mut out)
+    ironrdp_connector::legacy::encode_share_data(user_channel_id, io_channel_id, share_id, pdu, &mut out)
         .map_err(|e| Error::Protocol(format!("encode refresh rect: {e}")))?;
     session.send_rdp(out.filled()).await?;
     debug!(width, height, "sent refresh-rect (full desktop)");
