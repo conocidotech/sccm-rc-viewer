@@ -6,7 +6,9 @@
 /// ```
 #[macro_export]
 macro_rules! general_err {
-    ( $context:expr $(,)? ) => {{ <$crate::ConnectorError as $crate::ConnectorErrorExt>::general($context) }};
+    ( $context:expr $(,)? ) => {{
+        <$crate::ConnectorError as $crate::ConnectorErrorExt>::general($context)
+    }};
 }
 
 /// Creates a `ConnectorError` with `Reason` kind
@@ -30,5 +32,7 @@ macro_rules! reason_err {
 /// ```
 #[macro_export]
 macro_rules! custom_err {
-    ( $context:expr, $source:expr $(,)? ) => {{ <$crate::ConnectorError as $crate::ConnectorErrorExt>::custom($context, $source) }};
+    ( $context:expr, $source:expr $(,)? ) => {{
+        <$crate::ConnectorError as $crate::ConnectorErrorExt>::custom($context, $source)
+    }};
 }

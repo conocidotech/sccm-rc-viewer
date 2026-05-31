@@ -1,24 +1,26 @@
-use ironrdp_core::{WriteBuf, other_err};
-use ironrdp_pdu::{PduHint, nego};
+use ironrdp_core::{other_err, WriteBuf};
+use ironrdp_pdu::{nego, PduHint};
 use picky::key::PrivateKey;
-use picky_asn1_x509::{Certificate, ExtensionView, GeneralName, oids};
+use picky_asn1_x509::{oids, Certificate, ExtensionView, GeneralName};
 use sspi::credssp::{self, ClientState, CredSspClient};
 use sspi::generator::{Generator, NetworkRequest};
-use sspi::{Secret, Username};
+use sspi::negotiate::ProtocolConfig;
+use sspi::Secret;
+use sspi::Username;
 use tracing::debug;
 
 use crate::{
-    ConnectorError, ConnectorErrorKind, ConnectorResult, Credentials, ServerName, Written, custom_err, general_err,
+    custom_err, general_err, ConnectorError, ConnectorErrorKind, ConnectorResult, Credentials, ServerName, Written,
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct KerberosConfig {
     pub kdc_proxy_url: Option<url::Url>,
-    pub hostname: String,
+    pub hostname: Option<String>,
 }
 
 impl KerberosConfig {
-    pub fn new(kdc_proxy_url: Option<String>, hostname: String) -> ConnectorResult<Self> {
+    pub fn new(kdc_proxy_url: Option<String>, hostname: Option<String>) -> ConnectorResult<Self> {
         let kdc_proxy_url = kdc_proxy_url
             .map(|url| url::Url::parse(&url))
             .transpose()
@@ -142,24 +144,23 @@ impl CredsspSequence {
 
         let service_principal_name = format!("TERMSRV/{}", &server_name);
 
-        let client_mode = match kerberos_config {
-            Some(ref krb_config) => {
-                let credssp_config = Box::new(Into::<sspi::KerberosConfig>::into(krb_config.clone()));
-                debug!(?credssp_config);
-                credssp::ClientMode::Negotiate(sspi::NegotiateConfig {
-                    protocol_config: credssp_config,
-                    package_list: None,
-                    client_computer_name: server_name,
-                })
-            }
-            None => credssp::ClientMode::Ntlm(sspi::ntlm::NtlmConfig::default()),
-        };
+        let credssp_config: Box<dyn ProtocolConfig>;
+        if let Some(ref krb_config) = kerberos_config {
+            credssp_config = Box::new(Into::<sspi::KerberosConfig>::into(krb_config.clone()));
+        } else {
+            credssp_config = Box::<sspi::ntlm::NtlmConfig>::default();
+        }
+        debug!(?credssp_config);
 
         let client = CredSspClient::new(
             server_public_key,
             credentials,
             credssp::CredSspMode::WithCredentials,
-            client_mode,
+            credssp::ClientMode::Negotiate(sspi::NegotiateConfig {
+                protocol_config: credssp_config,
+                package_list: None,
+                client_computer_name: server_name,
+            }),
             service_principal_name,
         )
         .map_err(|e| ConnectorError::new("CredSSP", ConnectorErrorKind::Credssp(e)))?;
@@ -258,7 +259,7 @@ fn extract_user_principal_name(cert: &Certificate) -> Option<String> {
             GeneralName::OtherName(name) if name.type_id.0 == oids::user_principal_name() => Some(name.value),
             _ => None,
         })
-        .and_then(|asn1| picky_asn1_der::from_bytes(&asn1.0.0).ok())
+        .and_then(|asn1| picky_asn1_der::from_bytes(&asn1.0 .0).ok())
 }
 
 fn write_credssp_request(ts_request: credssp::TsRequest, output: &mut WriteBuf) -> ConnectorResult<usize> {

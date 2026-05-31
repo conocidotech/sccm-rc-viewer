@@ -3,9 +3,9 @@ use core::net::SocketAddr;
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use ironrdp_core::{Encode, WriteBuf, decode, encode_vec};
+use ironrdp_core::{decode, encode_vec, Encode, WriteBuf};
 use ironrdp_pdu::x224::X224;
-use ironrdp_pdu::{PduHint, gcc, mcs, nego, rdp};
+use ironrdp_pdu::{gcc, mcs, nego, rdp, PduHint};
 use ironrdp_svc::{StaticChannelSet, StaticVirtualChannel, SvcClientProcessor};
 use tracing::{debug, error, info, warn};
 
@@ -13,26 +13,25 @@ use crate::channel_connection::{ChannelConnectionSequence, ChannelConnectionStat
 use crate::connection_activation::{ConnectionActivationSequence, ConnectionActivationState};
 use crate::license_exchange::{LicenseExchangeSequence, NoopLicenseCache};
 use crate::{
-    Config, ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind, ConnectorResult, DesktopSize,
-    NegotiationFailure, Sequence, State, Written, encode_x224_packet, general_err, reason_err,
+    encode_x224_packet, general_err, reason_err, Config, ConnectorError, ConnectorErrorExt as _, ConnectorErrorKind,
+    ConnectorResult, DesktopSize, NegotiationFailure, Sequence, State, Written,
 };
 
 #[derive(Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ConnectionResult {
     pub io_channel_id: u16,
     pub user_channel_id: u16,
-    pub share_id: u32,
     pub static_channels: StaticChannelSet,
     pub desktop_size: DesktopSize,
     pub enable_server_pointer: bool,
     pub pointer_software_rendering: bool,
     pub connection_activation: ConnectionActivationSequence,
-    /// The bulk compression type that was negotiated, if any.
-    pub compression_type: Option<rdp::client_info::CompressionType>,
 }
 
 #[derive(Default, Debug)]
 #[non_exhaustive]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum ClientConnectorState {
     #[default]
     Consumed,
@@ -120,6 +119,7 @@ impl State for ClientConnectorState {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ClientConnector {
     pub config: Config,
     pub state: ClientConnectorState,
@@ -233,7 +233,7 @@ impl Sequence for ClientConnector {
         let (written, next_state) = match mem::take(&mut self.state) {
             // Invalid state
             ClientConnectorState::Consumed => {
-                return Err(general_err!("connector sequence state is consumed (this is a bug)",));
+                return Err(general_err!("connector sequence state is consumed (this is a bug)",))
             }
 
             //== Connection Initiation ==//
@@ -260,10 +260,9 @@ impl Sequence for ClientConnector {
                     security_protocol.insert(nego::SecurityProtocol::HYBRID | nego::SecurityProtocol::HYBRID_EX);
                 }
 
-                // PATCHED for sccm-rc: allow standard RDP security. SCCM Remote
-                // Control negotiates PROTOCOL_RDP because the outer SecurityFilter
-                // already provides confidentiality. Investigating whether the inner
-                // RDP uses encryptionLevel=NONE (in which case this is safe).
+                // PATCHED for sccm-rc: allow standard RDP security. SCCM RC uses
+                // PROTOCOL_RDP with encryption=NONE; the outer SecurityFilter
+                // provides confidentiality. See vendor SCCM-PATCHES.md.
                 if security_protocol.is_standard_rdp_security() {
                     tracing::warn!("sccm-rc patch: proceeding with standard RDP security");
                 }
@@ -311,9 +310,8 @@ impl Sequence for ClientConnector {
 
                 info!(?selected_protocol, ?flags, "Server confirmed connection");
 
-                // PATCHED for sccm-rc: standard RDP security is SecurityProtocol(0x0)
-                // (empty), so intersects() is false even when both sides agree on it.
-                // Accept the case where both advertised standard security.
+                // PATCHED for sccm-rc: standard RDP security is SecurityProtocol(0x0),
+                // so intersects() is false even when both sides agree. Allow it.
                 let both_standard = selected_protocol.is_standard_rdp_security()
                     && requested_protocol.is_standard_rdp_security();
                 if !both_standard && !selected_protocol.intersects(requested_protocol) {
@@ -384,14 +382,6 @@ impl Sequence for ClientConnector {
                 let client_gcc_blocks = connect_initial.conference_create_request.gcc_blocks();
 
                 let server_gcc_blocks = connect_response.conference_create_response.into_gcc_blocks();
-
-                // sccm-rc investigation: log exactly what security the server requires.
-                warn!(
-                    server_security = ?server_gcc_blocks.security,
-                    client_security = ?client_gcc_blocks.security,
-                    server_is_no_security = server_gcc_blocks.security == gcc::ServerSecurityData::no_security(),
-                    "sccm-rc: MCS Connect Response server security data"
-                );
 
                 if client_gcc_blocks.security == gcc::ClientSecurityData::no_security()
                     && server_gcc_blocks.security != gcc::ServerSecurityData::no_security()
@@ -595,20 +585,17 @@ impl Sequence for ClientConnector {
                             io_channel_id,
                             user_channel_id,
                             desktop_size,
-                            share_id,
                             enable_server_pointer,
                             pointer_software_rendering,
                         } => ClientConnectorState::Connected {
                             result: ConnectionResult {
                                 io_channel_id,
                                 user_channel_id,
-                                share_id,
                                 static_channels: mem::take(&mut self.static_channels),
                                 desktop_size,
                                 enable_server_pointer,
                                 pointer_software_rendering,
                                 connection_activation,
-                                compression_type: self.config.compression_type,
                             },
                         },
                         _ => return Err(general_err!("invalid state (this is a bug)")),
@@ -662,27 +649,18 @@ fn create_gcc_blocks<'a>(
 
     let max_color_depth = config.bitmap.as_ref().map(|bitmap| bitmap.color_depth).unwrap_or(32);
 
-    // Derive the preferred depth indicator. 32bpp has no highColorDepth value; it is
-    // expressed via WANT_32_BPP_SESSION in earlyCapabilityFlags instead.
-    let high_color_depth = match max_color_depth {
-        15 => HighColorDepth::Rgb555Bpp16,
-        16 => HighColorDepth::Rgb565Bpp16,
-        24 | 32 => HighColorDepth::Bpp24,
+    let supported_color_depths = match max_color_depth {
+        15 => SupportedColorDepths::BPP15,
+        16 => SupportedColorDepths::BPP16,
+        24 => SupportedColorDepths::BPP24,
+        32 => SupportedColorDepths::BPP32 | SupportedColorDepths::BPP16,
         _ => {
             return Err(reason_err!(
                 "create gcc blocks",
                 "unsupported color depth: {max_color_depth}"
-            ));
+            ))
         }
     };
-
-    // Advertise all colour depth capabilities unconditionally. The preferred depth is
-    // expressed via highColorDepth and WANT_32_BPP_SESSION, not by restricting this
-    // bitmask. This lets servers negotiate down without resetting the connection.
-    let supported_color_depths = SupportedColorDepths::BPP32
-        | SupportedColorDepths::BPP24
-        | SupportedColorDepths::BPP16
-        | SupportedColorDepths::BPP15;
 
     let channels = static_channels
         .map(ironrdp_svc::make_channel_definition)
@@ -706,7 +684,7 @@ fn create_gcc_blocks<'a>(
                 post_beta2_color_depth: Some(ColorDepth::Bpp8), // ignored because we set high_color_depth
                 client_product_id: Some(1),
                 serial_number: Some(0),
-                high_color_depth: Some(high_color_depth),
+                high_color_depth: Some(HighColorDepth::Bpp24),
                 supported_color_depths: Some(supported_color_depths),
                 early_capability_flags: {
                     let mut early_capability_flags = ClientEarlyCapabilityFlags::VALID_CONNECTION_TYPE
@@ -754,20 +732,19 @@ fn create_gcc_blocks<'a>(
         monitor: None,
         // TODO(#140): support for Client Message Channel Data (https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/f50e791c-de03-4b25-b17e-e914c9020bc3)
         message_channel: None,
-        multi_transport_channel: config
-            .multitransport_flags
-            .map(|flags| gcc::MultiTransportChannelData { flags }),
+        // TODO(#140): support for Some(MultiTransportChannelData { flags: MultiTransportFlags::empty(), })
+        multi_transport_channel: None,
         monitor_extended: None,
     })
 }
 
 fn create_client_info_pdu(config: &Config, client_addr: &SocketAddr) -> rdp::ClientInfoPdu {
-    use ironrdp_pdu::rdp::ClientInfoPdu;
     use ironrdp_pdu::rdp::client_info::{
         AddressFamily, ClientInfo, ClientInfoFlags, CompressionType, Credentials, ExtendedClientInfo,
         ExtendedClientOptionalInfo,
     };
     use ironrdp_pdu::rdp::headers::{BasicSecurityHeader, BasicSecurityHeaderFlags};
+    use ironrdp_pdu::rdp::ClientInfoPdu;
 
     let security_header = BasicSecurityHeader {
         flags: BasicSecurityHeaderFlags::INFO_PKT,
@@ -796,15 +773,6 @@ fn create_client_info_pdu(config: &Config, client_addr: &SocketAddr) -> rdp::Cli
         flags |= ClientInfoFlags::NO_AUDIO_PLAYBACK;
     }
 
-    // Advertise bulk compression support if configured
-    let compression_type = if let Some(ct) = config.compression_type {
-        flags |= ClientInfoFlags::COMPRESSION;
-        info!(compression_type = ?ct, "Advertising bulk compression in Client Info PDU");
-        ct
-    } else {
-        CompressionType::K8 // ignored if ClientInfoFlags::COMPRESSION is not set
-    };
-
     let client_info = ClientInfo {
         credentials: Credentials {
             username: config.credentials.username().unwrap_or("").to_owned(),
@@ -813,9 +781,9 @@ fn create_client_info_pdu(config: &Config, client_addr: &SocketAddr) -> rdp::Cli
         },
         code_page: 0, // ignored if the keyboardLayout field of the Client Core Data is set to zero
         flags,
-        compression_type,
-        alternate_shell: config.alternate_shell.clone(),
-        work_dir: config.work_dir.clone(),
+        compression_type: CompressionType::K8, // ignored if ClientInfoFlags::COMPRESSION is not set
+        alternate_shell: String::new(),
+        work_dir: String::new(),
         extra_info: ExtendedClientInfo {
             address_family: match client_addr {
                 SocketAddr::V4(_) => AddressFamily::INET,

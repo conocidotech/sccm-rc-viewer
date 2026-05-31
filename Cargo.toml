@@ -7,6 +7,12 @@ members = [
     "crates/sccm-rc-viewer",
 ]
 
+# Redirect ironrdp-connector to our patched copy for ALL dependents
+# (including ironrdp-session), so ConnectionResult is a single type.
+# The patch allows standard RDP security (encryption=NONE) for SCCM RC.
+[patch.crates-io]
+ironrdp-connector = { path = "vendor/ironrdp-connector" }
+
 [workspace.package]
 version = "0.0.1"
 edition = "2021"

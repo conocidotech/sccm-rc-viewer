@@ -17,16 +17,16 @@ use core::any::Any;
 use core::fmt;
 use std::sync::Arc;
 
-use ironrdp_core::{Encode, WriteBuf, encode_buf, encode_vec};
+use ironrdp_core::{encode_buf, encode_vec, Encode, WriteBuf};
 use ironrdp_pdu::nego::NegoRequestData;
 use ironrdp_pdu::rdp::capability_sets::{self, BitmapCodecs};
-use ironrdp_pdu::rdp::client_info::{self, PerformanceFlags, TimezoneInfo};
+use ironrdp_pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp_pdu::x224::X224;
-use ironrdp_pdu::{PduHint, gcc, x224};
+use ironrdp_pdu::{gcc, x224, PduHint};
 pub use sspi;
 
 pub use self::channel_connection::{ChannelConnectionSequence, ChannelConnectionState};
-pub use self::connection::{ClientConnector, ClientConnectorState, ConnectionResult, encode_send_data_request};
+pub use self::connection::{encode_send_data_request, ClientConnector, ClientConnectorState, ConnectionResult};
 pub use self::connection_finalization::{ConnectionFinalizationSequence, ConnectionFinalizationState};
 pub use self::license_exchange::{LicenseExchangeSequence, LicenseExchangeState};
 pub use self::server_name::ServerName;
@@ -82,12 +82,14 @@ impl fmt::Display for NegotiationFailure {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct DesktopSize {
     pub width: u16,
     pub height: u16,
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct BitmapConfig {
     pub lossy_compression: bool,
     pub color_depth: u32,
@@ -137,6 +139,7 @@ impl Credentials {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Config {
     /// The initial desktop size to request
     pub desktop_size: DesktopSize,
@@ -206,12 +209,6 @@ pub struct Config {
     pub bitmap: Option<BitmapConfig>,
     pub dig_product_id: String,
     pub client_dir: String,
-    /// Alternate shell to execute on the remote server (e.g., specific application instead of desktop)
-    ///
-    /// Used by CyberArk PSM for privileged session tokens and remote application scenarios.
-    pub alternate_shell: String,
-    /// Working directory for the alternate shell
-    pub work_dir: String,
     pub platform: capability_sets::MajorPlatformType,
     /// Unique identifier for the computer
     ///
@@ -235,29 +232,9 @@ pub struct Config {
     // For Timezone Redirection to sync the server's timezone with the client's.
     pub timezone_info: TimezoneInfo,
 
-    /// Bulk compression type to negotiate with the server.
-    ///
-    /// When set, the `INFO_COMPRESSION` flag is included in the Client Info PDU
-    /// and the specified compression type is advertised. The server may then
-    /// send compressed PDUs (FastPath or Share Data) using any compression
-    /// algorithm up to and including this level.
-    ///
-    /// - `None` — no compression (default)
-    /// - `Some(K8)` — MPPC with 8 KB history (RDP 4.0)
-    /// - `Some(K64)` — MPPC with 64 KB history (RDP 5.0)
-    /// - `Some(Rdp6)` — NCRUSH (RDP 6.0)
-    /// - `Some(Rdp61)` — XCRUSH (RDP 6.1)
-    pub compression_type: Option<client_info::CompressionType>,
-
     // FIXME(@CBenoit): these are client-only options, not part of the connector.
     pub enable_server_pointer: bool,
     pub pointer_software_rendering: bool,
-
-    /// Flags to advertise in the [`MultiTransportChannelData`] GCC block.
-    ///
-    /// [\[MS-RDPBCGR\] 2.2.1.3.7]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/861f2bbb-6ca2-4c5a-8c44-0714fa901e70
-    /// [`MultiTransportChannelData`]: ironrdp_pdu::gcc::MultiTransportChannelData
-    pub multitransport_flags: Option<gcc::MultiTransportFlags>,
 }
 
 ironrdp_core::assert_impl!(Config: Send, Sync);
@@ -429,7 +406,8 @@ pub trait ConnectorResultExt {
 impl<T> ConnectorResultExt for ConnectorResult<T> {
     fn with_context(self, context: &'static str) -> Self {
         self.map_err(|mut e| {
-            e.set_context(context);
+            e.context = context;
+            // e.set_context(context);
             e
         })
     }

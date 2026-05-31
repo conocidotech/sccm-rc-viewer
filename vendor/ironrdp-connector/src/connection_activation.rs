@@ -5,8 +5,7 @@ use ironrdp_pdu::rdp::capability_sets::CapabilitySet;
 use tracing::{debug, warn};
 
 use crate::{
-    Config, ConnectionFinalizationSequence, ConnectorResult, DesktopSize, Sequence, State, Written, general_err,
-    legacy, reason_err,
+    general_err, legacy, Config, ConnectionFinalizationSequence, ConnectorResult, DesktopSize, Sequence, State, Written,
 };
 
 /// Represents the Capability Exchange and Connection Finalization phases
@@ -23,7 +22,9 @@ use crate::{
 /// [Server Deactivate All PDU]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/8a29971a-df3c-48da-add2-8ed9a05edc89
 #[derive(Debug, Clone)]
 pub struct ConnectionActivationSequence {
-    state: ConnectionActivationState,
+    // PATCHED for sccm-rc: made `state` pub so the client can detect the
+    // Finalized state and extract its fields after a reactivation.
+    pub state: ConnectionActivationState,
     config: Config,
 }
 
@@ -118,36 +119,13 @@ impl Sequence for ConnectionActivationSequence {
                     );
                 }
 
-                // Some servers (e.g. GNOME Remote Desktop) send a ServerDeactivateAll PDU
-                // before ServerDemandActive as part of a Deactivation-Reactivation Sequence
-                // (MS-RDPBCGR §1.3.1.3). Skip it and stay in the same state to wait for
-                // the actual DemandActive PDU.
-                //
-                // The decoded PDU is intentionally discarded: the DeactivateAll body carries
-                // no payload we need during initial activation.
-                if matches!(
-                    share_control_ctx.pdu,
-                    rdp::headers::ShareControlPdu::ServerDeactivateAll(_)
-                ) {
-                    debug!(
-                        "Skipping Server Deactivate All PDU received during Capabilities Exchange, awaiting Server Demand Active"
-                    );
-                    self.state = ConnectionActivationState::CapabilitiesExchange {
-                        io_channel_id,
-                        user_channel_id,
-                    };
-                    return Ok(Written::Nothing);
-                }
-
                 let capability_sets = if let rdp::headers::ShareControlPdu::ServerDemandActive(server_demand_active) =
                     share_control_ctx.pdu
                 {
                     server_demand_active.pdu.capability_sets
                 } else {
-                    return Err(reason_err!(
-                        "ConnectionActivation::CapabilitiesExchange",
-                        "unexpected Share Control PDU during capabilities exchange: got {} (expected Server Demand Active PDU)",
-                        share_control_ctx.pdu.as_short_name(),
+                    return Err(general_err!(
+                        "unexpected Share Control Pdu (expected ServerDemandActive)",
                     ));
                 };
 
@@ -183,8 +161,6 @@ impl Sequence for ConnectionActivationSequence {
                         height: self.config.desktop_size.height,
                     });
 
-                let share_id = share_control_ctx.share_id;
-
                 let client_confirm_active = rdp::headers::ShareControlPdu::ClientConfirmActive(
                     create_client_confirm_active(&self.config, capability_sets, desktop_size),
                 );
@@ -194,7 +170,7 @@ impl Sequence for ConnectionActivationSequence {
                 let written = legacy::encode_share_control(
                     user_channel_id,
                     io_channel_id,
-                    share_id,
+                    share_control_ctx.share_id,
                     client_confirm_active,
                     output,
                 )?;
@@ -205,12 +181,7 @@ impl Sequence for ConnectionActivationSequence {
                         io_channel_id,
                         user_channel_id,
                         desktop_size,
-                        share_id,
-                        connection_finalization: ConnectionFinalizationSequence::new(
-                            io_channel_id,
-                            user_channel_id,
-                            share_id,
-                        ),
+                        connection_finalization: ConnectionFinalizationSequence::new(io_channel_id, user_channel_id),
                     },
                 )
             }
@@ -218,7 +189,6 @@ impl Sequence for ConnectionActivationSequence {
                 io_channel_id,
                 user_channel_id,
                 desktop_size,
-                share_id,
                 mut connection_finalization,
             } => {
                 debug!("Connection Finalization");
@@ -230,7 +200,6 @@ impl Sequence for ConnectionActivationSequence {
                         io_channel_id,
                         user_channel_id,
                         desktop_size,
-                        share_id,
                         connection_finalization,
                     }
                 } else {
@@ -238,7 +207,6 @@ impl Sequence for ConnectionActivationSequence {
                         io_channel_id,
                         user_channel_id,
                         desktop_size,
-                        share_id,
                         enable_server_pointer: self.config.enable_server_pointer,
                         pointer_software_rendering: self.config.pointer_software_rendering,
                     }
@@ -266,14 +234,12 @@ pub enum ConnectionActivationState {
         io_channel_id: u16,
         user_channel_id: u16,
         desktop_size: DesktopSize,
-        share_id: u32,
         connection_finalization: ConnectionFinalizationSequence,
     },
     Finalized {
         io_channel_id: u16,
         user_channel_id: u16,
         desktop_size: DesktopSize,
-        share_id: u32,
         enable_server_pointer: bool,
         pointer_software_rendering: bool,
     },
@@ -306,11 +272,12 @@ fn create_client_confirm_active(
     desktop_size: DesktopSize,
 ) -> rdp::capability_sets::ClientConfirmActive {
     use ironrdp_pdu::rdp::capability_sets::{
-        BITMAP_CACHE_ENTRIES_NUM, Bitmap, BitmapCache, BitmapDrawingFlags, Brush, CacheDefinition, CacheEntry,
-        ClientConfirmActive, CmdFlags, DemandActive, FrameAcknowledge, GLYPH_CACHE_NUM, General, GeneralExtraFlags,
-        GlyphCache, GlyphSupportLevel, Input, InputFlags, LargePointer, LargePointerSupportFlags, MultifragmentUpdate,
-        OffscreenBitmapCache, Order, OrderFlags, OrderSupportExFlags, Pointer, SERVER_CHANNEL_ID, Sound, SoundFlags,
-        SupportLevel, SurfaceCommands, VirtualChannel, VirtualChannelFlags, client_codecs_capabilities,
+        client_codecs_capabilities, Bitmap, BitmapCache, BitmapDrawingFlags, Brush, CacheDefinition, CacheEntry,
+        ClientConfirmActive, CmdFlags, DemandActive, FrameAcknowledge, General, GeneralExtraFlags, GlyphCache,
+        GlyphSupportLevel, Input, InputFlags, LargePointer, LargePointerSupportFlags, MultifragmentUpdate,
+        OffscreenBitmapCache, Order, OrderFlags, OrderSupportExFlags, Pointer, Sound, SoundFlags, SupportLevel,
+        SurfaceCommands, VirtualChannel, VirtualChannelFlags, BITMAP_CACHE_ENTRIES_NUM, GLYPH_CACHE_NUM,
+        SERVER_CHANNEL_ID,
     };
 
     server_capability_sets.retain(|capability_set| matches!(capability_set, CapabilitySet::MultiFragmentUpdate(_)));

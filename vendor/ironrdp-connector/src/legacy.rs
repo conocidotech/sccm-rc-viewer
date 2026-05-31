@@ -1,12 +1,11 @@
 use std::borrow::Cow;
 
-use ironrdp_core::{Decode, Encode, WriteBuf, decode, encode_vec};
+use ironrdp_core::{decode, encode_vec, Decode, Encode, WriteBuf};
 use ironrdp_pdu::rdp;
-use ironrdp_pdu::rdp::headers::{BASIC_SECURITY_HEADER_SIZE, BasicSecurityHeaderFlags, ServerDeactivateAll};
-use ironrdp_pdu::rdp::multitransport::MultitransportRequestPdu;
+use ironrdp_pdu::rdp::headers::ServerDeactivateAll;
 use ironrdp_pdu::x224::X224;
 
-use crate::{ConnectorError, ConnectorErrorExt as _, ConnectorResult, reason_err};
+use crate::{general_err, reason_err, ConnectorError, ConnectorErrorExt as _, ConnectorResult};
 
 pub fn encode_send_data_request<T>(
     initiator_id: u16,
@@ -149,10 +148,8 @@ pub fn decode_share_data(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<Shar
     let ctx = decode_share_control(ctx)?;
 
     let rdp::headers::ShareControlPdu::Data(share_data_header) = ctx.pdu else {
-        return Err(reason_err!(
-            "decode_share_data",
-            "received unexpected Share Control PDU: got {} (expected Data PDU)",
-            ctx.pdu.as_short_name(),
+        return Err(general_err!(
+            "received unexpected Share Control Pdu (expected Share Data Header)"
         ));
     };
 
@@ -168,33 +165,25 @@ pub fn decode_share_data(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<Shar
 pub enum IoChannelPdu {
     Data(ShareDataCtx),
     DeactivateAll(ServerDeactivateAll),
-    /// Server Initiate Multitransport Request PDU.
-    ///
-    /// Received when the server wants the client to establish a sideband UDP transport.
-    MultitransportRequest(MultitransportRequestPdu),
+}
+
+/// sccm-rc helper: does this IO-channel frame carry a ServerDemandActive?
+/// Used by the client to decide whether a reactivation was triggered by a
+/// direct DemandActive (re-feed it) or a real ServerDeactivateAll (don't).
+pub fn frame_is_server_demand_active(frame: &[u8]) -> bool {
+    let Ok(send_data) = decode_send_data_indication(frame) else {
+        return false;
+    };
+    let Ok(share_control) = decode_share_control(send_data) else {
+        return false;
+    };
+    matches!(
+        share_control.pdu,
+        rdp::headers::ShareControlPdu::ServerDemandActive(_)
+    )
 }
 
 pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<IoChannelPdu> {
-    // Multitransport PDUs use BasicSecurityHeader (flags:u16, flagsHi:u16) instead
-    // of the ShareControlHeader (totalLength:u16, pduType:u16, ...) used by all
-    // other IO channel PDUs. We discriminate by checking flagsHi == 0 (ShareControl
-    // has pduType there, which is always non-zero) and requiring flags to be a valid
-    // BasicSecurityHeaderFlags combination.
-    if ctx.user_data.len() >= BASIC_SECURITY_HEADER_SIZE {
-        let flags_raw = u16::from_le_bytes([ctx.user_data[0], ctx.user_data[1]]);
-        let flags_hi = u16::from_le_bytes([ctx.user_data[2], ctx.user_data[3]]);
-
-        if flags_hi == 0 {
-            if let Some(flags) = BasicSecurityHeaderFlags::from_bits(flags_raw) {
-                if flags.contains(BasicSecurityHeaderFlags::TRANSPORT_REQ) {
-                    if let Ok(pdu) = decode::<MultitransportRequestPdu>(ctx.user_data) {
-                        return Ok(IoChannelPdu::MultitransportRequest(pdu));
-                    }
-                }
-            }
-        }
-    }
-
     let ctx = decode_share_control(ctx)?;
 
     match ctx.pdu {
@@ -212,10 +201,21 @@ pub fn decode_io_channel(ctx: SendDataIndicationCtx<'_>) -> ConnectorResult<IoCh
 
             Ok(IoChannelPdu::Data(share_data_ctx))
         }
-        other => Err(reason_err!(
-            "decode_io_channel",
-            "received unexpected Share Control PDU: got {} (expected Data PDU or Server Deactivate All PDU)",
-            other.as_short_name(),
-        )),
+        // PATCHED for sccm-rc: the SCCM RDP server performs a
+        // deactivation-reactivation by sending a fresh ServerDemandActive
+        // immediately after the initial connection sequence, WITHOUT a
+        // preceding ServerDeactivateAll. Map it to DeactivateAll so the
+        // session emits a reactivation; the client re-feeds this DemandActive
+        // frame into the reactivation sequence.
+        rdp::headers::ShareControlPdu::ServerDemandActive(_) => {
+            tracing::debug!("sccm-rc: ServerDemandActive in IO channel -> triggering reactivation");
+            Ok(IoChannelPdu::DeactivateAll(ServerDeactivateAll))
+        }
+        other => {
+            tracing::warn!(pdu = ?other, "sccm-rc: unexpected Share Control PDU in IO channel");
+            Err(general_err!(
+                "received unexpected Share Control Pdu (expected Share Data Header or Server Deactivate All)"
+            ))
+        }
     }
 }

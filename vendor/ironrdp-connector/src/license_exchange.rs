@@ -5,16 +5,17 @@ use std::str;
 use std::sync::Arc;
 
 use ironrdp_core::WriteBuf;
-use ironrdp_pdu::PduHint;
 use ironrdp_pdu::rdp::server_license::{self, LicenseInformation, LicensePdu, ServerLicenseError};
+use ironrdp_pdu::PduHint;
 use rand::RngCore as _;
 use tracing::{debug, error, info, trace};
 
-use super::{ConnectorError, ConnectorErrorExt as _, custom_err, general_err, legacy};
-use crate::{ConnectorResult, ConnectorResultExt as _, Sequence, State, Written, encode_send_data_request};
+use super::{custom_err, general_err, legacy, ConnectorError, ConnectorErrorExt as _};
+use crate::{encode_send_data_request, ConnectorResult, ConnectorResultExt as _, Sequence, State, Written};
 
 #[derive(Default, Debug)]
 #[non_exhaustive]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum LicenseExchangeState {
     #[default]
     Consumed,
@@ -55,6 +56,7 @@ impl State for LicenseExchangeState {
 ///
 /// [3.1.5.3.1]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpele/8f9b860a-3687-401d-b3bc-7e9f5d4f7528
 #[derive(Debug)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct LicenseExchangeSequence {
     pub state: LicenseExchangeState,
     pub io_channel_id: u16,
@@ -122,7 +124,7 @@ impl Sequence for LicenseExchangeSequence {
             LicenseExchangeState::Consumed => {
                 return Err(general_err!(
                     "license exchange sequence state is consumed (this is a bug)",
-                ));
+                ))
             }
 
             LicenseExchangeState::NewLicenseRequest => {
