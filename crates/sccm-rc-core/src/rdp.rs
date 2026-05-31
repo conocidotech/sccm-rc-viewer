@@ -17,11 +17,20 @@ use ironrdp_core::WriteBuf;
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_pdu::gcc::KeyboardType;
 use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
-use ironrdp_session::image::DecodedImage;
+pub use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageOutput};
 use sccm_rc_protocol::{Error, Result};
 use std::net::{Ipv4Addr, SocketAddr};
 use tracing::{debug, info, warn};
+
+// Re-export the input event types so the UI can construct them.
+pub use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags};
+pub use ironrdp_pdu::input::mouse::PointerFlags;
+pub use ironrdp_pdu::input::MousePdu;
+
+/// Input channel: the UI sends batches of fastpath input events to the session.
+pub type InputReceiver = tokio::sync::mpsc::Receiver<Vec<FastPathInputEvent>>;
+pub type InputSender = tokio::sync::mpsc::Sender<Vec<FastPathInputEvent>>;
 
 /// Build a Config for an SCCM RC session: standard RDP security (no TLS,
 /// no CredSSP) since the outer SecurityFilter already encrypts everything.
@@ -153,12 +162,14 @@ pub trait SessionSink: Send {
 }
 
 /// Run the active RDP session loop: read PDUs from the sealed channel, feed
-/// them to IronRDP's `ActiveStage`, send response frames back, and surface
-/// graphics updates to the sink. Returns when the session ends.
+/// them to IronRDP's `ActiveStage`, send response frames back, surface
+/// graphics updates to the sink, and forward UI input. Returns when the
+/// session ends.
 pub async fn run_active_session(
     session: &mut SccmSession,
     connection_result: ConnectionResult,
     sink: &mut dyn SessionSink,
+    input_rx: &mut InputReceiver,
 ) -> Result<()> {
     let width = connection_result.desktop_size.width;
     let height = connection_result.desktop_size.height;
@@ -170,19 +181,45 @@ pub async fn run_active_session(
     let mut pdus = 0u64;
 
     loop {
-        // Accumulate one full PDU (FastPath or X.224).
-        let pdu_info = loop {
-            match ironrdp_pdu::find_size(&buf).map_err(|e| Error::Protocol(format!("find_size: {e}")))? {
-                Some(info) => break info,
-                None => {
-                    let more = session
-                        .recv_rdp()
-                        .await?
-                        .ok_or_else(|| Error::Protocol("server closed during RDP session".into()))?;
-                    buf.extend_from_slice(&more);
+        // Either a network PDU arrives, or the UI sends input.
+        // Drain any complete PDU already buffered before awaiting more.
+        if ironrdp_pdu::find_size(&buf)
+            .map_err(|e| Error::Protocol(format!("find_size: {e}")))?
+            .is_none()
+        {
+            tokio::select! {
+                biased;
+                events = input_rx.recv() => {
+                    let Some(events) = events else { return Ok(()); }; // UI closed
+                    let outs = stage
+                        .process_fastpath_input(&mut image, &events)
+                        .map_err(|e| Error::Protocol(format!("input: {e}")))?;
+                    for out in outs {
+                        if let ActiveStageOutput::ResponseFrame(bytes) = out {
+                            session.send_rdp(&bytes).await?;
+                        }
+                    }
+                    continue;
+                }
+                more = session.recv_rdp() => {
+                    match more? {
+                        Some(b) => buf.extend_from_slice(&b),
+                        None => return Ok(()),
+                    }
+                    // fall through to try to parse a PDU
+                    if ironrdp_pdu::find_size(&buf)
+                        .map_err(|e| Error::Protocol(format!("find_size: {e}")))?
+                        .is_none()
+                    {
+                        continue;
+                    }
                 }
             }
-        };
+        }
+
+        let pdu_info = ironrdp_pdu::find_size(&buf)
+            .map_err(|e| Error::Protocol(format!("find_size: {e}")))?
+            .expect("just checked a PDU is present");
         let frame: Vec<u8> = buf.drain(..pdu_info.length).collect();
         pdus += 1;
         if pdus % 200 == 0 {

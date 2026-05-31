@@ -43,7 +43,8 @@ async fn main() -> anyhow::Result<()> {
     // Process the live graphics stream headless to prove decoding works.
     info!("entering active session — processing graphics updates (Ctrl+C to stop)");
     let mut sink = rdp::LoggingSink::default();
-    if let Err(e) = rdp::run_active_session(&mut session, result, &mut sink).await {
+    let (_tx, mut input_rx) = tokio::sync::mpsc::channel(32);
+    if let Err(e) = rdp::run_active_session(&mut session, result, &mut sink, &mut input_rx).await {
         error!(error = %e, updates = sink.updates, "active session ended with error");
     }
     info!(updates = sink.updates, total_pixels = sink.total_pixels, "active session ended");

@@ -5,10 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "SCCM Remote Control viewer UI (Tauri 2 + egui canvas — see roadmap Fase 5)"
+description = "SCCM Remote Control viewer UI (winit + softbuffer)"
 
-# Empty stub. UI framework choice deferred to Fase 5.
-# This will become a [bin] when we get there.
+[[bin]]
+name = "sccm-rc-viewer"
+path = "src/main.rs"
 
 [dependencies]
 sccm-rc-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+winit = "0.30"
+softbuffer = "0.4"
