@@ -78,6 +78,38 @@ fn map_err(e: ConnectorError) -> Error {
     Error::Protocol(format!("ironrdp: {e}"))
 }
 
+/// A passive static virtual channel: it is declared in the MCS Connect Initial
+/// and joined, but ignores all traffic. mstscax declares several channels
+/// (rdpdr/rdpsnd/cliprdr/…); the SCCM server appears to withhold its
+/// deactivation-reactivation (and thus all graphics) until the client presents
+/// a mstscax-like channel set. We don't need the channels' functionality —
+/// only their presence in the capability/channel negotiation.
+#[derive(Debug)]
+struct PassiveChannel {
+    name: ironrdp_pdu::gcc::ChannelName,
+}
+
+impl PassiveChannel {
+    fn new(name: &str) -> Self {
+        Self {
+            name: ironrdp_pdu::gcc::ChannelName::from_utf8(name).expect("valid 8-char channel name"),
+        }
+    }
+}
+
+ironrdp_svc::impl_as_any!(PassiveChannel);
+
+impl ironrdp_svc::SvcProcessor for PassiveChannel {
+    fn channel_name(&self) -> ironrdp_pdu::gcc::ChannelName {
+        self.name.clone()
+    }
+    fn process(&mut self, _payload: &[u8]) -> ironrdp_pdu::PduResult<Vec<ironrdp_svc::SvcMessage>> {
+        Ok(Vec::new())
+    }
+}
+
+impl ironrdp_svc::SvcClientProcessor for PassiveChannel {}
+
 /// Run the full RDP connection sequence over the established SCCM session.
 /// Returns the negotiated connection result on success.
 pub async fn connect_rdp(
@@ -94,6 +126,14 @@ pub async fn connect_rdp(
     // is fine since the real transport is our sealed channel.
     let client_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
     let mut connector = ClientConnector::new(config, client_addr);
+    // Declare mstscax-like static virtual channels (SCCM_RC_CHANNELS=1). The
+    // server seems to require them before it reactivates + paints.
+    if std::env::var("SCCM_RC_CHANNELS").as_deref() == Ok("1") {
+        for name in ["cliprdr", "rdpsnd", "rdpdr", "drdynvc"] {
+            connector = connector.with_static_channel(PassiveChannel::new(name));
+        }
+        info!("declared passive static virtual channels: cliprdr, rdpsnd, rdpdr, drdynvc");
+    }
 
     let mut input_buf: Vec<u8> = Vec::new();
     let mut out = WriteBuf::new();
