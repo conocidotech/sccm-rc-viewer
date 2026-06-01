@@ -361,10 +361,22 @@ fn create_client_confirm_active(
         // (Gated on SCCM_RC_ORDERS=1.)
         {
             use ironrdp_pdu::rdp::capability_sets::OrderSupportIndex as Osi;
+            // In orders mode mirror the server's Order cap flags + desktop save
+            // size (it advertises COLOR_INDEX_SUPPORT | ORDER_FLAGS_EXTRA_FLAGS,
+            // desktop_save_size=1000000). A well-behaved client confirms
+            // compatible flags.
+            let order_flags = if orders_mode {
+                OrderFlags::NEGOTIATE_ORDER_SUPPORT
+                    | OrderFlags::ZERO_BOUNDS_DELTAS_SUPPORT
+                    | OrderFlags::COLOR_INDEX_SUPPORT
+                    | OrderFlags::ORDER_FLAGS_EXTRA_FLAGS
+            } else {
+                OrderFlags::NEGOTIATE_ORDER_SUPPORT | OrderFlags::ZERO_BOUNDS_DELTAS_SUPPORT
+            };
             let mut order = Order::new(
-                OrderFlags::NEGOTIATE_ORDER_SUPPORT | OrderFlags::ZERO_BOUNDS_DELTAS_SUPPORT,
+                order_flags,
                 OrderSupportExFlags::empty(),
-                0,
+                if orders_mode { 1_000_000 } else { 0 },
                 0,
             );
             if orders_mode {
