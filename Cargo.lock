@@ -3130,6 +3130,7 @@ dependencies = [
  "ironrdp-pdu",
  "ironrdp-session",
  "ironrdp-svc",
+ "sccm-rc-orders",
  "sccm-rc-protocol",
  "thiserror 2.0.18",
  "tokio",

@@ -13,12 +13,14 @@ use ironrdp_connector::{
     DesktopSize, Sequence,
 };
 use ironrdp_connector::State;
-use ironrdp_core::WriteBuf;
+use ironrdp_core::{decode_cursor, ReadCursor, WriteBuf};
 use ironrdp_graphics::image_processing::PixelFormat;
+use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode};
 use ironrdp_pdu::gcc::KeyboardType;
 use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
 pub use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageOutput};
+use sccm_rc_orders::{ColorDepth, OrderCanvas, OrderProcessor};
 use sccm_rc_protocol::{Error, Result};
 use std::net::{Ipv4Addr, SocketAddr};
 use tracing::{debug, info, warn};
@@ -160,11 +162,45 @@ pub struct UpdateRegion {
     pub bottom: u16,
 }
 
+/// A read-only view of an RGBA32 framebuffer. Implemented by both IronRDP's
+/// `DecodedImage` (bitmap/surface/RemoteFx updates) and our `OrderCanvas`
+/// (drawing-order updates), so a sink can render whichever produced the frame.
+pub trait FrameView {
+    fn data(&self) -> &[u8];
+    fn width(&self) -> u16;
+    fn height(&self) -> u16;
+}
+
+impl FrameView for DecodedImage {
+    fn data(&self) -> &[u8] {
+        DecodedImage::data(self)
+    }
+    fn width(&self) -> u16 {
+        DecodedImage::width(self)
+    }
+    fn height(&self) -> u16 {
+        DecodedImage::height(self)
+    }
+}
+
+impl FrameView for OrderCanvas {
+    fn data(&self) -> &[u8] {
+        OrderCanvas::data(self)
+    }
+    fn width(&self) -> u16 {
+        OrderCanvas::width(self)
+    }
+    fn height(&self) -> u16 {
+        OrderCanvas::height(self)
+    }
+}
+
 /// Callbacks for an active RDP session: receive framebuffer updates.
 pub trait SessionSink: Send {
-    /// Called when a region of the framebuffer changed. `image` is the full
-    /// RGBA framebuffer; `region` is the dirty rectangle.
-    fn on_graphics_update(&mut self, image: &DecodedImage, region: UpdateRegion);
+    /// Called when a region of the framebuffer changed. `frame` is the full
+    /// RGBA framebuffer (either IronRDP's or the order renderer's); `region` is
+    /// the dirty rectangle.
+    fn on_graphics_update(&mut self, frame: &dyn FrameView, region: UpdateRegion);
     /// Called when the session ends.
     fn on_terminate(&mut self, reason: String);
 }
@@ -186,6 +222,13 @@ pub async fn run_active_session(
     let mut user_channel_id = connection_result.user_channel_id;
     let mut image = DecodedImage::new(PixelFormat::RgbA32, width, height);
     let mut stage = ActiveStage::new(connection_result);
+
+    // Drawing-order renderer for Fast-Path "Orders" updates (which IronRDP
+    // drops). The SCCM RC server paints via drawing orders; `order_frag`
+    // reassembles fragmented order updates.
+    let mut orders = OrderProcessor::new(width, height, ColorDepth::Bpp16);
+    let mut order_frag: Vec<u8> = Vec::new();
+    let mut order_frag_active = false;
 
     // Seed with any PDUs left over from the connection sequence (initial paint).
     let mut buf: Vec<u8> = initial_buf;
@@ -249,6 +292,33 @@ pub async fn run_active_session(
         pdus += 1;
         if pdus % 200 == 0 {
             debug!(pdus, graphics_updates = frames, "session heartbeat");
+        }
+
+        // Intercept Fast-Path "Orders" updates before IronRDP (which silently
+        // drops them). Render them into our OrderCanvas instead.
+        if pdu_info.action == ironrdp_pdu::Action::FastPath {
+            if let Some((frag, data)) = decode_fastpath_orders(&frame) {
+                if let Some(complete) =
+                    reassemble_orders(&mut order_frag, &mut order_frag_active, frag, data)
+                {
+                    match orders.process_orders(&complete) {
+                        Ok(outcome) => {
+                            debug!(
+                                orders = outcome.orders,
+                                skipped = outcome.skipped,
+                                "rendered drawing orders"
+                            );
+                            if let Some(r) = outcome.dirty {
+                                frames += 1;
+                                let region = order_region(orders.canvas(), r);
+                                sink.on_graphics_update(orders.canvas(), region);
+                            }
+                        }
+                        Err(e) => warn!(error = %e, "order stream decode failed"),
+                    }
+                }
+                continue; // handled — do not pass to IronRDP
+            }
         }
 
         let outputs = stage
@@ -316,6 +386,7 @@ pub async fn run_active_session(
                     io_channel_id = new_result.io_channel_id;
                     user_channel_id = new_result.user_channel_id;
                     image = DecodedImage::new(PixelFormat::RgbA32, width, height);
+                    orders.resize(width, height);
                     stage = ActiveStage::new(new_result);
                     info!(width, height, share_id, "reactivation complete — active session resumed");
                     // Repaint after reactivation too (with the server's share_id).
@@ -329,6 +400,68 @@ pub async fn run_active_session(
                 | ActiveStageOutput::PointerBitmap(_) => {}
             }
         }
+    }
+}
+
+/// Decode a Fast-Path frame and, if it carries a drawing-order update, return
+/// the fragmentation flag and the order bytes. Returns None for any other
+/// update type (bitmap/surface/pointer), which IronRDP handles.
+fn decode_fastpath_orders(frame: &[u8]) -> Option<(Fragmentation, Vec<u8>)> {
+    let mut cur = ReadCursor::new(frame);
+    let _header = decode_cursor::<FastPathHeader>(&mut cur).ok()?;
+    let update = decode_cursor::<FastPathUpdatePdu<'_>>(&mut cur).ok()?;
+    if update.update_code != UpdateCode::Orders {
+        return None;
+    }
+    Some((update.fragmentation, update.data.to_vec()))
+}
+
+/// Reassemble a possibly-fragmented order update. Returns the complete order
+/// stream once a Single or Last fragment arrives.
+fn reassemble_orders(
+    buf: &mut Vec<u8>,
+    active: &mut bool,
+    frag: Fragmentation,
+    data: Vec<u8>,
+) -> Option<Vec<u8>> {
+    match frag {
+        Fragmentation::Single => Some(data),
+        Fragmentation::First => {
+            buf.clear();
+            buf.extend_from_slice(&data);
+            *active = true;
+            None
+        }
+        Fragmentation::Next => {
+            if *active {
+                buf.extend_from_slice(&data);
+            }
+            None
+        }
+        Fragmentation::Last => {
+            if *active {
+                buf.extend_from_slice(&data);
+                *active = false;
+                Some(std::mem::take(buf))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Convert an order-renderer dirty `Rect` (exclusive, i32) to an inclusive,
+/// canvas-clamped `UpdateRegion`.
+fn order_region(canvas: &OrderCanvas, r: sccm_rc_orders::Rect) -> UpdateRegion {
+    let w = canvas.width() as i32;
+    let h = canvas.height() as i32;
+    let clampx = |v: i32| v.clamp(0, (w - 1).max(0)) as u16;
+    let clampy = |v: i32| v.clamp(0, (h - 1).max(0)) as u16;
+    UpdateRegion {
+        left: clampx(r.x),
+        top: clampy(r.y),
+        right: clampx(r.right() - 1),
+        bottom: clampy(r.bottom() - 1),
     }
 }
 
@@ -452,7 +585,7 @@ impl Default for LoggingSink {
 }
 
 impl SessionSink for LoggingSink {
-    fn on_graphics_update(&mut self, image: &DecodedImage, region: UpdateRegion) {
+    fn on_graphics_update(&mut self, image: &dyn FrameView, region: UpdateRegion) {
         self.updates += 1;
         let w = region.right.saturating_sub(region.left) as u64 + 1;
         let h = region.bottom.saturating_sub(region.top) as u64 + 1;
@@ -485,7 +618,7 @@ impl PngDumpSink {
 }
 
 impl SessionSink for PngDumpSink {
-    fn on_graphics_update(&mut self, image: &DecodedImage, _region: UpdateRegion) {
+    fn on_graphics_update(&mut self, image: &dyn FrameView, _region: UpdateRegion) {
         self.updates += 1;
         let w = image.width() as u32;
         let h = image.height() as u32;
@@ -509,5 +642,77 @@ impl SessionSink for PngDumpSink {
     }
     fn on_terminate(&mut self, reason: String) {
         warn!(%reason, "session terminated");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Wrap order bytes in a real Fast-Path Orders update frame
+    /// (FastPathHeader + FastPathUpdatePdu, Single fragment, no compression).
+    fn fastpath_orders_frame(order_data: &[u8]) -> Vec<u8> {
+        let pdu_len = 1 /* updateHeader */ + 2 /* size */ + order_data.len();
+        let total = 1 /* fp header */ + 1 /* per length */ + pdu_len;
+        assert!(total < 0x80, "test helper only supports short frames");
+        let mut f = vec![0x00u8, total as u8, 0x00];
+        f.extend_from_slice(&(order_data.len() as u16).to_le_bytes());
+        f.extend_from_slice(order_data);
+        f
+    }
+
+    #[test]
+    fn decode_fastpath_orders_extracts_order_bytes() {
+        // numberOrders=1 + an OpaqueRect order.
+        let order_data = [
+            0x01, 0x00, // numberOrders
+            0x09, 0x0A, 0x7F, 10, 0, 20, 0, 30, 0, 40, 0, 0x11, 0x22, 0x33,
+        ];
+        let frame = fastpath_orders_frame(&order_data);
+        let (frag, data) = decode_fastpath_orders(&frame).expect("orders update");
+        assert_eq!(frag, Fragmentation::Single);
+        assert_eq!(data, order_data);
+    }
+
+    #[test]
+    fn non_order_fastpath_returns_none() {
+        // updateCode = 1 (Bitmap), not Orders.
+        let mut frame = vec![0x00u8, 0x05, 0x01];
+        frame.extend_from_slice(&0u16.to_le_bytes());
+        assert!(decode_fastpath_orders(&frame).is_none());
+    }
+
+    #[test]
+    fn reassemble_orders_joins_fragments() {
+        let mut buf = Vec::new();
+        let mut active = false;
+        assert_eq!(
+            reassemble_orders(&mut buf, &mut active, Fragmentation::First, vec![1, 2]),
+            None
+        );
+        assert_eq!(
+            reassemble_orders(&mut buf, &mut active, Fragmentation::Next, vec![3]),
+            None
+        );
+        assert_eq!(
+            reassemble_orders(&mut buf, &mut active, Fragmentation::Last, vec![4, 5]),
+            Some(vec![1, 2, 3, 4, 5])
+        );
+        // A stray Last without a First is ignored.
+        assert_eq!(
+            reassemble_orders(&mut buf, &mut active, Fragmentation::Last, vec![9]),
+            None
+        );
+    }
+
+    #[test]
+    fn order_region_clamps_to_canvas() {
+        let canvas = OrderCanvas::new(100, 50);
+        let r = sccm_rc_orders::Rect::new(-5, 10, 200, 200);
+        let region = order_region(&canvas, r);
+        assert_eq!(region.left, 0);
+        assert_eq!(region.top, 10);
+        assert_eq!(region.right, 99);
+        assert_eq!(region.bottom, 49);
     }
 }

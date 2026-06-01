@@ -21,6 +21,7 @@ thiserror.workspace = true
 bytes.workspace = true
 clap.workspace = true
 sccm-rc-protocol.workspace = true
+sccm-rc-orders.workspace = true
 ironrdp-connector = "0.8"
 ironrdp-pdu = "0.7"
 ironrdp-core = "0.1"

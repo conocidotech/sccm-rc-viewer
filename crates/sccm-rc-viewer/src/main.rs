@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use sccm_rc_core::rdp::{
-    self, DecodedImage, FastPathInputEvent, InputSender, KeyboardFlags, MousePdu, PointerFlags,
+    self, FastPathInputEvent, FrameView, InputSender, KeyboardFlags, MousePdu, PointerFlags,
     SessionSink, UpdateRegion,
 };
 use sccm_rc_core::SccmSession;
@@ -55,7 +55,7 @@ struct FrameSink {
 }
 
 impl SessionSink for FrameSink {
-    fn on_graphics_update(&mut self, image: &DecodedImage, _region: UpdateRegion) {
+    fn on_graphics_update(&mut self, image: &dyn FrameView, _region: UpdateRegion) {
         {
             let mut f = self.shared.lock().unwrap();
             f.width = image.width() as u32;
