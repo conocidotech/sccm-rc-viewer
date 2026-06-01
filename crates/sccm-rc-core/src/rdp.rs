@@ -289,10 +289,10 @@ pub async fn connect_rdp(
     // activation. Also declare the sibling WLC channels the real client opens.
     if std::env::var("SCCM_RC_ARB").as_deref() == Ok("1") {
         connector = connector.with_static_channel(ArbitrationChannel::default());
-        for name in ["curtain", "rcclip", "dynres", "dskcfg"] {
+        for name in ["curtain", "cliprdr", "dynres", "dskcfg"] {
             connector = connector.with_static_channel(PassiveChannel::new(name));
         }
-        info!("declared SCCM RC arbitration channel 'sessarb' (+ curtain/rcclip/dynres/dskcfg)");
+        info!("declared SCCM RC arbitration channel 'sessarb' (+ curtain/cliprdr/dynres/dskcfg)");
     }
 
     let mut input_buf: Vec<u8> = Vec::new();
