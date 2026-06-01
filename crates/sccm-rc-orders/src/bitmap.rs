@@ -1,0 +1,76 @@
+//! Decoding cache-bitmap data into an RGBA [`Bitmap`]. RDP bitmaps are stored
+//! bottom-up in the session color depth, optionally interleaved-RLE compressed.
+//! Compression is handled by `ironrdp-graphics` (well-tested); raw decoding and
+//! the bottom-up -> top-down flip + color conversion are done here.
+
+use crate::canvas::Bitmap;
+use crate::color::ColorDepth;
+use crate::OrderError;
+
+/// Decode bitmap pixel data into a top-down RGBA [`Bitmap`].
+///
+/// * `data` — the bitmap bits (raw or RLE-compressed), bottom-up.
+/// * `compressed` — whether `data` is interleaved-RLE compressed.
+/// * `depth` — the source color depth.
+/// * `palette` — required for 8 bpp (else grayscale fallback).
+pub fn decode(
+    data: &[u8],
+    width: u16,
+    height: u16,
+    depth: ColorDepth,
+    compressed: bool,
+    palette: Option<&[[u8; 4]; 256]>,
+) -> Result<Bitmap, OrderError> {
+    let bpp = depth.bytes_per_pixel();
+    let w = width as usize;
+    let h = height as usize;
+
+    // Source pixels, bottom-up, in the session bpp.
+    let raw: std::borrow::Cow<'_, [u8]> = if compressed {
+        let mut out = Vec::with_capacity(w * h * bpp);
+        let bits = match depth {
+            ColorDepth::Bpp8 => 8,
+            ColorDepth::Bpp15 => 15,
+            ColorDepth::Bpp16 => 16,
+            ColorDepth::Bpp24 => 24,
+            // 32 bpp interleaved RLE is not used; fall back to treating as raw.
+            ColorDepth::Bpp32 => 32,
+        };
+        if bits == 32 {
+            std::borrow::Cow::Borrowed(data)
+        } else {
+            ironrdp_graphics::rle::decompress(data, &mut out, w, h, bits)
+                .map_err(|_| OrderError::Malformed("RLE decompression failed"))?;
+            std::borrow::Cow::Owned(out)
+        }
+    } else {
+        std::borrow::Cow::Borrowed(data)
+    };
+
+    let stride = w * bpp;
+    if raw.len() < stride * h {
+        return Err(OrderError::UnexpectedEof {
+            needed: stride * h,
+            have: raw.len(),
+        });
+    }
+
+    // Convert bottom-up source -> top-down RGBA.
+    let mut rgba = vec![0u8; w * h * 4];
+    for dst_row in 0..h {
+        let src_row = h - 1 - dst_row; // flip vertical
+        let src_off = src_row * stride;
+        let dst_off = dst_row * w * 4;
+        for x in 0..w {
+            let sp = &raw[src_off + x * bpp..src_off + x * bpp + bpp];
+            let c = depth.to_rgba(sp, palette);
+            let d = dst_off + x * 4;
+            rgba[d] = c[0];
+            rgba[d + 1] = c[1];
+            rgba[d + 2] = c[2];
+            rgba[d + 3] = 0xff;
+        }
+    }
+
+    Ok(Bitmap::new(width, height, rgba))
+}

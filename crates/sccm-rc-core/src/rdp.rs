@@ -290,7 +290,7 @@ pub async fn run_active_session(
                     );
                 }
                 ActiveStageOutput::Terminate(reason) => {
-                    info!(?reason, frames, "RDP session terminated by server");
+                    warn!(?reason, frames, pdus, "RDP session terminated by server");
                     sink.on_terminate(format!("{reason:?}"));
                     return Ok(());
                 }

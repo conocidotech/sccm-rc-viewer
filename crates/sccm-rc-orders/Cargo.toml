@@ -1,0 +1,20 @@
+[package]
+name = "sccm-rc-orders"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Pure-Rust RDP primary/secondary drawing-order decoder + software renderer.
+# Deliberately ZERO IronRDP dependency: it operates on a plain RGBA byte
+# buffer (`OrderCanvas`) so the whole thing is unit-testable offline against
+# pinned order byte sequences, independent of the RDP stack.
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+# Only used for interleaved-RLE bitmap decompression (cache bitmaps). The order
+# decoder/renderer itself is pure and IronRDP-independent.
+ironrdp-graphics = "0.7"
+
+[dev-dependencies]

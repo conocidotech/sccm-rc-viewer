@@ -3152,6 +3152,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sccm-rc-orders"
+version = "0.0.1"
+dependencies = [
+ "ironrdp-graphics",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "sccm-rc-protocol"
 version = "0.0.1"
 dependencies = [

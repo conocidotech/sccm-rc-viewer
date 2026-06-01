@@ -5,6 +5,7 @@ members = [
     "crates/sccm-rc-core",
     "crates/sccm-rc-diag",
     "crates/sccm-rc-viewer",
+    "crates/sccm-rc-orders",
 ]
 
 # Redirect ironrdp-connector to our patched copy for ALL dependents
@@ -68,6 +69,7 @@ windows = { version = "0.61", features = [
 sccm-rc-protocol = { path = "crates/sccm-rc-protocol" }
 sccm-rc-core = { path = "crates/sccm-rc-core" }
 sccm-rc-diag = { path = "crates/sccm-rc-diag" }
+sccm-rc-orders = { path = "crates/sccm-rc-orders" }
 
 [profile.release]
 opt-level = 3
