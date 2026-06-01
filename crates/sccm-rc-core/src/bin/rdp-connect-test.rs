@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     let mut session = SccmSession::connect(&cli.target).await?;
     info!(grant = ?session.grant(), "session established");
 
-    let (result, initial_buf) = match rdp::connect_rdp(&mut session, cli.width, cli.height).await {
+    let (result, initial_buf, share_id) = match rdp::connect_rdp(&mut session, cli.width, cli.height).await {
         Ok(r) => {
             info!(
                 desktop = format!("{}x{}", r.0.desktop_size.width, r.0.desktop_size.height),
@@ -63,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
-    if let Err(e) = rdp::run_active_session(&mut session, result, initial_buf, &mut sink, &mut input_rx).await {
+    if let Err(e) = rdp::run_active_session(&mut session, result, initial_buf, share_id, &mut sink, &mut input_rx).await {
         error!(error = %e, updates = sink.updates, "active session ended with error");
     }
     info!(updates = sink.updates, nonblack = sink.nonblack_pixels, "active session ended");

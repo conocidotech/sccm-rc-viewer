@@ -84,7 +84,7 @@ pub async fn connect_rdp(
     session: &mut SccmSession,
     width: u16,
     height: u16,
-) -> Result<(ConnectionResult, Vec<u8>)> {
+) -> Result<(ConnectionResult, Vec<u8>, u32)> {
     if session.grant() == Grant::ViewOnly {
         debug!("session is view-only — input will be rejected by the server");
     }
@@ -97,6 +97,10 @@ pub async fn connect_rdp(
 
     let mut input_buf: Vec<u8> = Vec::new();
     let mut out = WriteBuf::new();
+    // Capture the server's share_id from its DemandActive (CapabilitiesExchange)
+    // so post-activation PDUs we send (Refresh Rect, Suppress Output) echo it.
+    // A static lock screen only repaints on a Refresh Rect with the right id.
+    let mut share_id: u32 = 0;
 
     loop {
         if connector.state.is_terminal() {
@@ -120,6 +124,12 @@ pub async fn connect_rdp(
             };
             let pdu: Vec<u8> = input_buf.drain(..pdu_len).collect();
             debug!(state = connector.state.name(), pdu_len, "RDP step (with input)");
+            if share_id == 0 {
+                if let Some(sid) = ironrdp_connector::legacy::frame_share_id(&pdu) {
+                    share_id = sid;
+                    debug!(share_id, "captured server share_id from DemandActive");
+                }
+            }
             connector.step(&pdu, &mut out).map_err(map_err)?
         } else {
             debug!(state = connector.state.name(), "RDP step (no input)");
@@ -144,7 +154,7 @@ pub async fn connect_rdp(
         // Any bytes still buffered are the server's first post-activation PDUs
         // (often the initial screen paint). They must be carried into the
         // active session, not dropped.
-        Ok((result, input_buf))
+        Ok((result, input_buf, share_id))
     } else {
         Err(Error::Protocol(format!(
             "RDP connector ended in non-connected state: {}",
@@ -213,6 +223,7 @@ pub async fn run_active_session(
     session: &mut SccmSession,
     connection_result: ConnectionResult,
     initial_buf: Vec<u8>,
+    initial_share_id: u32,
     sink: &mut dyn SessionSink,
     input_rx: &mut InputReceiver,
 ) -> Result<()> {
@@ -238,12 +249,20 @@ pub async fn run_active_session(
     let mut frames = 0u64;
     let mut pdus = 0u64;
 
-    // The server's PDUs carry a share_id that client PDUs must echo.
-    let mut share_id: u32 = 0;
+    // The server's PDUs carry a share_id that client PDUs must echo. Seeded
+    // from the DemandActive captured during the connection sequence so the very
+    // first Refresh Rect is valid (a static lock screen ignores share_id=0).
+    let mut share_id: u32 = initial_share_id;
 
     // Force an initial full-screen repaint. Without this, a static remote
-    // desktop (e.g. no user logged in) sends nothing and the window stays blank.
-    send_refresh_rect(session, user_channel_id, io_channel_id, share_id, width, height).await?;
+    // desktop (e.g. locked / no user) sends nothing and the window stays blank.
+    // (SCCM_RC_NO_REFRESH=1 skips it, to test whether the server auto-paints.)
+    if std::env::var("SCCM_RC_NO_REFRESH").as_deref() != Ok("1") {
+        info!(share_id, "initial repaint request");
+        send_refresh_rect(session, user_channel_id, io_channel_id, share_id, width, height).await?;
+    } else {
+        info!("skipping initial refresh (SCCM_RC_NO_REFRESH=1)");
+    }
 
     loop {
         // Either a network PDU arrives, or the UI sends input.
