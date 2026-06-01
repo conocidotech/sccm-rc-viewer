@@ -11,3 +11,6 @@ captures/*.pcap
 *.etl
 *.pcapng
 experiments/capture.*
+
+# Live-test logs (transient)
+rc-*.log
