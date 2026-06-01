@@ -15,6 +15,25 @@ SCCM inner-RDP uses encryption_method=NONE / encryption_level=None
 (confirmed via MCS Connect Response). The outer SCCM SecurityFilter
 (Kerberos GSS) provides all confidentiality. There is no RC4 to perform.
 
+## Drawing-order patches (`src/connection_activation.rs`)
+
+The 2014-era SCCM RDP server only paints via RDP primary drawing orders
+(MS-RDPEGDI), which IronRDP does not implement. `crates/sccm-rc-orders`
+implements them; these capability changes make the server send them.
+Gated on `SCCM_RC_ORDERS=1` (default off — leave off for plain bitmap mode):
+
+3. Order capability advertises NEGOTIATE_ORDER_SUPPORT and, in orders mode,
+   the order-support flags for exactly the orders our renderer services
+   (DstBlt, PatBlt, ScrBlt, MemBlt, LineTo).
+4. BitmapCache capability is populated with the classic mstsc rev1 cache
+   dimensions (120/256, 120/1024, 336/4096) in orders mode. Advertising
+   MemBlt with a zero-capacity cache makes the server reject the inconsistent
+   caps (Terminate); a populated rev1 cache also steers it to Cache Bitmap
+   Rev1 secondary orders, which the renderer decodes.
+
+Also note `SCCM_RC_LEGACY_GFX=1` (separate gate) drops Surface Commands +
+RemoteFx codec caps to force slow-path bitmaps.
+
 ## Version
 
 Pinned to the IronRDP 0.8 release set: connector 0.8.0, session 0.8.0,

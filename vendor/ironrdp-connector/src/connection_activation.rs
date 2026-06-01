@@ -296,6 +296,20 @@ fn create_client_confirm_active(
         BitmapDrawingFlags::ALLOW_SKIP_ALPHA
     };
 
+    // PATCHED for sccm-rc: drawing-order mode (SCCM_RC_ORDERS=1) advertises
+    // MemBlt + a populated rev1 bitmap cache so the SCCM server paints via
+    // drawing orders that sccm-rc-orders renders.
+    let orders_mode = std::env::var("SCCM_RC_ORDERS").as_deref() == Ok("1");
+    let bitmap_cache_caches = if orders_mode {
+        [
+            CacheEntry { entries: 120, max_cell_size: 256 },
+            CacheEntry { entries: 120, max_cell_size: 1024 },
+            CacheEntry { entries: 336, max_cell_size: 4096 },
+        ]
+    } else {
+        [CacheEntry::default(); BITMAP_CACHE_ENTRIES_NUM]
+    };
+
     server_capability_sets.extend_from_slice(&[
         CapabilitySet::General(General {
             major_platform_type: config.platform,
@@ -311,8 +325,9 @@ fn create_client_confirm_active(
             drawing_flags,
         }),
         // PATCHED for sccm-rc: advertise primary drawing-order support (like
-        // mstscax). The 2014 SCCM RDP server may only start sending graphics
-        // to an order-capable client. (Experiment via SCCM_RC_ORDERS=1.)
+        // mstscax). The 2014 SCCM RDP server only starts sending graphics to an
+        // order-capable client. Our sccm-rc-orders renderer paints these.
+        // (Gated on SCCM_RC_ORDERS=1.)
         {
             use ironrdp_pdu::rdp::capability_sets::OrderSupportIndex as Osi;
             let mut order = Order::new(
@@ -321,22 +336,23 @@ fn create_client_confirm_active(
                 0,
                 0,
             );
-            if std::env::var("SCCM_RC_ORDERS").as_deref() == Ok("1") {
+            if orders_mode {
+                // Only the orders our renderer actually services.
                 for f in [
-                    Osi::DstBlt, Osi::PatBlt, Osi::ScrBlt, Osi::MemBlt, Osi::Mem3Blt,
-                    Osi::LineTo, Osi::SaveBitmap, Osi::MultiDstBlt, Osi::MultiPatBlt,
-                    Osi::MultiScrBlt, Osi::MultiOpaqueRect, Osi::Polyline,
+                    Osi::DstBlt, Osi::PatBlt, Osi::ScrBlt, Osi::MemBlt, Osi::LineTo,
                 ] {
                     order.set_support_flag(f, true);
                 }
             }
             CapabilitySet::Order(order)
         },
+        // PATCHED for sccm-rc: when advertising MemBlt the bitmap cache MUST
+        // have non-zero capacity, otherwise the server rejects the inconsistent
+        // capability set (the cause of the Terminate). These are the classic
+        // mstsc rev1 cache dimensions; advertising the rev1 cache steers the
+        // server to Cache Bitmap Rev1 secondary orders (which we decode).
         CapabilitySet::BitmapCache(BitmapCache {
-            caches: [CacheEntry {
-                entries: 0,
-                max_cell_size: 0,
-            }; BITMAP_CACHE_ENTRIES_NUM],
+            caches: bitmap_cache_caches,
         }),
         CapabilitySet::Input(Input {
             input_flags: InputFlags::all(),
