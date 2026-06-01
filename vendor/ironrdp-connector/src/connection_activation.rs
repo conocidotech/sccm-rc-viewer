@@ -308,6 +308,39 @@ fn create_client_confirm_active(
     let want_memblt = orders_mode && std::env::var("SCCM_RC_NO_MEMBLT").as_deref() != Ok("1");
     let bitmap_cache_caches = [CacheEntry::default(); BITMAP_CACHE_ENTRIES_NUM];
 
+    // In orders mode advertise a mstscax-like glyph cache + offscreen cache. The
+    // lock screen is text-heavy; a server may refuse to paint to a client that
+    // advertises GlyphSupportLevel::None. (Gated via orders_mode.)
+    let (glyph_array, glyph_frag, glyph_level) = if orders_mode {
+        (
+            [
+                CacheDefinition { entries: 254, max_cell_size: 4 },
+                CacheDefinition { entries: 254, max_cell_size: 4 },
+                CacheDefinition { entries: 254, max_cell_size: 8 },
+                CacheDefinition { entries: 254, max_cell_size: 8 },
+                CacheDefinition { entries: 254, max_cell_size: 16 },
+                CacheDefinition { entries: 254, max_cell_size: 32 },
+                CacheDefinition { entries: 254, max_cell_size: 64 },
+                CacheDefinition { entries: 254, max_cell_size: 128 },
+                CacheDefinition { entries: 254, max_cell_size: 256 },
+                CacheDefinition { entries: 64, max_cell_size: 256 },
+            ],
+            CacheDefinition { entries: 256, max_cell_size: 256 },
+            GlyphSupportLevel::Full,
+        )
+    } else {
+        (
+            [CacheDefinition::default(); GLYPH_CACHE_NUM],
+            CacheDefinition::default(),
+            GlyphSupportLevel::None,
+        )
+    };
+    let offscreen_cap = if orders_mode {
+        OffscreenBitmapCache { is_supported: true, cache_size: 7680, cache_entries: 100 }
+    } else {
+        OffscreenBitmapCache { is_supported: false, cache_size: 0, cache_entries: 0 }
+    };
+
     server_capability_sets.extend_from_slice(&[
         CapabilitySet::General(General {
             major_platform_type: config.platform,
@@ -371,21 +404,11 @@ fn create_client_confirm_active(
             support_level: SupportLevel::Default,
         }),
         CapabilitySet::GlyphCache(GlyphCache {
-            glyph_cache: [CacheDefinition {
-                entries: 0,
-                max_cell_size: 0,
-            }; GLYPH_CACHE_NUM],
-            frag_cache: CacheDefinition {
-                entries: 0,
-                max_cell_size: 0,
-            },
-            glyph_support_level: GlyphSupportLevel::None,
+            glyph_cache: glyph_array,
+            frag_cache: glyph_frag,
+            glyph_support_level: glyph_level,
         }),
-        CapabilitySet::OffscreenBitmapCache(OffscreenBitmapCache {
-            is_supported: false,
-            cache_size: 0,
-            cache_entries: 0,
-        }),
+        CapabilitySet::OffscreenBitmapCache(offscreen_cap),
         CapabilitySet::VirtualChannel(VirtualChannel {
             flags: VirtualChannelFlags::NO_COMPRESSION,
             chunk_size: Some(0), // ignored
