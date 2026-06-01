@@ -201,8 +201,9 @@ fn dump_timeline_timed(segs: &[&Seg]) {
             break;
         }
     }
-    let window_start = first_big.map(|i| i.saturating_sub(25)).unwrap_or(0);
-    let window_end = first_big.map(|i| i + 3).unwrap_or(events.len());
+    let full = std::env::var("TIMELINE_ALL").is_ok();
+    let window_start = if full { 0 } else { first_big.map(|i| i.saturating_sub(25)).unwrap_or(0) };
+    let window_end = if full { events.len() } else { first_big.map(|i| i + 8).unwrap_or(events.len()) };
     println!("\n--- timeline around graphics start (deduped) ---");
     for (i, (ms, dir, t, l)) in events.iter().enumerate() {
         if i >= window_start && i <= window_end {

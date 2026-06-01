@@ -135,8 +135,14 @@ impl SccmSession {
                 Some(f) => f,
                 None => return Ok(None),
             };
+            debug!(
+                msg_type = format_args!("{:#04x}", frame.msg_type),
+                body_len = frame.body.len(),
+                "recv_rdp: frame from server"
+            );
             if frame.msg_type != MSG_TYPE_DATA {
                 // Unencrypted control frame — unusual mid-session; skip.
+                debug!(msg_type = format_args!("{:#04x}", frame.msg_type), "skipped non-data frame");
                 continue;
             }
             let plain = self.sspi.unseal(&frame.body)?;
