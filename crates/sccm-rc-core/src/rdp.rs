@@ -78,6 +78,73 @@ fn map_err(e: ConnectorError) -> Error {
     Error::Protocol(format!("ironrdp: {e}"))
 }
 
+/// The SCCM RC server's reactivation DemandActive carries a Bitmap Cache Rev2
+/// capability whose body is 24 bytes (it omits the 12-byte trailing pad).
+/// IronRDP's decoder requires the full 36-byte fixed part and errors. Pad any
+/// short Rev2 cap (type 0x13) up to a 36-byte body with zeros, fixing every
+/// enclosing length field (cap length, lengthCombinedCapabilities, share
+/// control totalLength, MCS per-length, TPKT length).
+fn fix_short_bitmap_cache_rev2(frame: &[u8]) -> Option<Vec<u8>> {
+    const REV2_TYPE: u16 = 0x13;
+    const REV2_FULL_BODY: usize = 36;
+    if frame.len() < 15 || frame[0] != 0x03 {
+        return None; // not a TPKT frame
+    }
+    // TPKT(4) + X224(3) + MCS SendDataIndication header.
+    if frame[7] != 0x68 {
+        return None; // not a SendDataIndication
+    }
+    // per-length of the MCS user data at offset 13.
+    let (mcs_len_off, mcs_user_off) = if frame[13] & 0x80 != 0 { (13usize, 15usize) } else { (13, 14) };
+    // Share Control Header at mcs_user_off: totalLength(2), pduType(2), src(2).
+    let sc = mcs_user_off;
+    let pdu_type = u16::from_le_bytes([frame[sc + 2], frame[sc + 3]]);
+    if pdu_type & 0x0f != 0x01 {
+        return None; // not a DemandActive
+    }
+    // DemandActive: shareId(4), lenSrcDesc(2), lenCombCaps(2), srcDesc, numCaps(2), pad(2)
+    let da = sc + 6;
+    let len_src = u16::from_le_bytes([frame[da + 4], frame[da + 5]]) as usize;
+    let lcc_off = da + 6; // lengthCombinedCapabilities field
+    let num_caps_off = da + 8 + len_src;
+    let num_caps = u16::from_le_bytes([frame[num_caps_off], frame[num_caps_off + 1]]) as usize;
+    let mut p = num_caps_off + 4; // skip numCaps(2)+pad(2)
+
+    for _ in 0..num_caps {
+        if p + 4 > frame.len() {
+            return None;
+        }
+        let ctype = u16::from_le_bytes([frame[p], frame[p + 1]]);
+        let clen = u16::from_le_bytes([frame[p + 2], frame[p + 3]]) as usize;
+        if ctype == REV2_TYPE && clen < REV2_FULL_BODY + 4 {
+            let pad = (REV2_FULL_BODY + 4) - clen; // bytes to add
+            let mut out = Vec::with_capacity(frame.len() + pad);
+            out.extend_from_slice(&frame[..p + clen]); // up to end of short cap body
+            out.extend(std::iter::repeat(0u8).take(pad)); // pad the cap body
+            out.extend_from_slice(&frame[p + clen..]); // rest of frame
+            // Patch lengths (+pad).
+            let new_cap_len = (clen + pad) as u16;
+            out[p + 2..p + 4].copy_from_slice(&new_cap_len.to_le_bytes());
+            let lcc = u16::from_le_bytes([out[lcc_off], out[lcc_off + 1]]) + pad as u16;
+            out[lcc_off..lcc_off + 2].copy_from_slice(&lcc.to_le_bytes());
+            let tot = u16::from_le_bytes([out[sc], out[sc + 1]]) + pad as u16;
+            out[sc..sc + 2].copy_from_slice(&tot.to_le_bytes());
+            // MCS per-length (2-byte form, high bit set).
+            if frame[13] & 0x80 != 0 {
+                let mcs = (((frame[mcs_len_off] as usize & 0x7f) << 8) | frame[mcs_len_off + 1] as usize) + pad;
+                out[mcs_len_off] = 0x80 | ((mcs >> 8) as u8);
+                out[mcs_len_off + 1] = (mcs & 0xff) as u8;
+            }
+            // TPKT length (big-endian u16).
+            let tpkt = u16::from_be_bytes([frame[2], frame[3]]) + pad as u16;
+            out[2..4].copy_from_slice(&tpkt.to_be_bytes());
+            return Some(out);
+        }
+        p += clen;
+    }
+    None
+}
+
 /// Decode the server's DemandActive frame and log its source descriptor and
 /// every capability set (full Debug). Used for byte-level RE: comparing what
 /// the server advertises/expects against what our ConfirmActive sends.
@@ -816,8 +883,21 @@ async fn drive_reactivation(
                     }
                 }
             };
-            let pdu: Vec<u8> = buf.drain(..pdu_len).collect();
-            seq.step(&pdu, &mut out).map_err(|e| Error::Protocol(format!("reactivation: {e}")))?;
+            let mut pdu: Vec<u8> = buf.drain(..pdu_len).collect();
+            // The SCCM reactivation DemandActive has a short Bitmap Cache Rev2
+            // cap that IronRDP can't decode; pad it before processing.
+            if let Some(fixed) = fix_short_bitmap_cache_rev2(&pdu) {
+                debug!(old = pdu.len(), new = fixed.len(), "padded short BitmapCacheRev2 in reactivation DemandActive");
+                pdu = fixed;
+            }
+            let state_name = seq.state.name();
+            if let Err(e) = seq.step(&pdu, &mut out) {
+                let path = std::env::temp_dir().join("sccm-reactivation-demandactive.bin");
+                let _ = std::fs::write(&path, &pdu);
+                warn!(state = state_name, len = pdu.len(), error = %e, path = %path.display(), "reactivation step failed — frame dumped");
+                log_demand_active(&pdu);
+                return Err(Error::Protocol(format!("reactivation: {e}")));
+            }
         } else {
             seq.step_no_input(&mut out).map_err(|e| Error::Protocol(format!("reactivation: {e}")))?;
         }
