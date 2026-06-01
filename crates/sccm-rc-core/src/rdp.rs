@@ -254,6 +254,13 @@ pub async fn run_active_session(
     // first Refresh Rect is valid (a static lock screen ignores share_id=0).
     let mut share_id: u32 = initial_share_id;
 
+    // Some servers (and possibly this SCCM RC server) withhold all graphics
+    // until they receive a Persistent Bitmap Cache Key List PDU — mstscax sends
+    // a flood of these right after ConfirmActive. (SCCM_RC_PERSIST=1.)
+    if std::env::var("SCCM_RC_PERSIST").as_deref() == Ok("1") {
+        send_persistent_key_list(session, user_channel_id, io_channel_id, share_id).await?;
+    }
+
     // Force an initial full-screen repaint. Without this, a static remote
     // desktop (e.g. locked / no user) sends nothing and the window stays blank.
     // (SCCM_RC_NO_REFRESH=1 skips it, to test whether the server auto-paints.)
@@ -502,6 +509,77 @@ fn order_region(canvas: &OrderCanvas, r: sccm_rc_orders::Rect) -> UpdateRegion {
         top: clampy(r.y),
         right: clampx(r.right() - 1),
         bottom: clampy(r.bottom() - 1),
+    }
+}
+
+/// Send an (empty) Persistent Bitmap Cache Key List PDU. mstscax sends a flood
+/// of these right after ConfirmActive; a server that advertised expecting them
+/// may withhold all graphics until it receives one. An empty list (zero
+/// entries, FIRST|LAST) tells the server we have nothing cached, unblocking it.
+async fn send_persistent_key_list(
+    session: &mut SccmSession,
+    user_channel_id: u16,
+    io_channel_id: u16,
+    share_id: u32,
+) -> Result<()> {
+    // IronRDP can't encode ShareDataPdu::BitmapCachePersistentList (it's a
+    // decode-only raw variant), so build the Share Data PDU bytes by hand,
+    // matching IronRDP's framing exactly (Share Control Header 10 bytes incl.
+    // shareId + Share Data Header 8 bytes + body).
+    let mut out = WriteBuf::new();
+    ironrdp_connector::legacy::encode_send_data_request(
+        user_channel_id,
+        io_channel_id,
+        &PersistentKeyListPdu {
+            pdu_source: user_channel_id,
+            share_id,
+        },
+        &mut out,
+    )
+    .map_err(|e| Error::Protocol(format!("encode persistent key list: {e}")))?;
+    session.send_rdp(out.filled()).await?;
+    info!(share_id, "sent empty persistent bitmap cache key list");
+    Ok(())
+}
+
+/// An empty TS_BITMAPCACHE_PERSISTENT_LIST_PDU (MS-RDPBCGR 2.2.1.17.1) wrapped
+/// in a Share Control + Share Data header. Encoded by hand because IronRDP's
+/// `ShareDataPdu::BitmapCachePersistentList` is decode-only.
+struct PersistentKeyListPdu {
+    pdu_source: u16,
+    share_id: u32,
+}
+
+impl ironrdp_core::Encode for PersistentKeyListPdu {
+    fn encode(&self, dst: &mut ironrdp_core::WriteCursor<'_>) -> ironrdp_core::EncodeResult<()> {
+        // Body: numEntriesCache0..4 (5xu16=0), totalEntriesCache0..4 (5xu16=0),
+        // bBitMask = PERSIST_FIRST_PDU|PERSIST_LAST_PDU (0x03), Pad2(1), Pad3(2).
+        const BODY_LEN: usize = 24;
+        // Share Control Header (10 bytes: totalLength, pduType, pduSource, shareId).
+        dst.write_u16((18 + BODY_LEN) as u16); // totalLength = control(10)+data(8)+body
+        dst.write_u16(0x10 | 0x07); // PROTOCOL_VERSION | PDUTYPE_DATAPDU
+        dst.write_u16(self.pdu_source);
+        dst.write_u32(self.share_id);
+        // Share Data Header (8 bytes).
+        dst.write_u8(0); // pad1
+        dst.write_u8(2); // streamId = STREAM_MED
+        dst.write_u16((BODY_LEN + 4) as u16); // uncompressedLength = body + pduType2+comp+compLen
+        dst.write_u8(0x2b); // pduType2 = PDUTYPE2_BITMAPCACHE_PERSISTENT_LIST
+        dst.write_u8(0); // compressionFlags
+        dst.write_u16(0); // compressedLength
+        // Body.
+        let mut body = [0u8; BODY_LEN];
+        body[20] = 0x03; // bBitMask = PERSIST_FIRST_PDU | PERSIST_LAST_PDU
+        dst.write_slice(&body);
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "PersistentKeyListPdu"
+    }
+
+    fn size(&self) -> usize {
+        18 + 24
     }
 }
 

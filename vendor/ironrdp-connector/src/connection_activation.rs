@@ -427,8 +427,14 @@ fn create_client_confirm_active(
     // dimensions.
     if orders_mode && want_memblt {
         server_capability_sets.retain(|c| !matches!(c, CapabilitySet::BitmapCache(_)));
+        // PERSISTENT_KEYS_EXPECTED makes the server wait for a Persistent Key
+        // List PDU before painting (some servers require it). Gated for A/B.
+        let mut cache_flags = CacheFlags::ALLOW_CACHE_WAITING_LIST_FLAG;
+        if std::env::var("SCCM_RC_PERSIST").as_deref() == Ok("1") {
+            cache_flags |= CacheFlags::PERSISTENT_KEYS_EXPECTED_FLAG;
+        }
         server_capability_sets.push(CapabilitySet::BitmapCacheRev2(BitmapCacheRev2 {
-            cache_flags: CacheFlags::ALLOW_CACHE_WAITING_LIST_FLAG,
+            cache_flags,
             num_cell_caches: 5,
             cache_cell_info: [
                 CellInfo { num_entries: 600, is_cache_persistent: false },
