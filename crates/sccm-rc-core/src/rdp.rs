@@ -78,6 +78,33 @@ fn map_err(e: ConnectorError) -> Error {
     Error::Protocol(format!("ironrdp: {e}"))
 }
 
+/// Decode the server's DemandActive frame and log its source descriptor and
+/// every capability set (full Debug). Used for byte-level RE: comparing what
+/// the server advertises/expects against what our ConfirmActive sends.
+fn log_demand_active(frame: &[u8]) {
+    use ironrdp_pdu::rdp::headers::ShareControlPdu;
+    let Ok(send) = ironrdp_connector::legacy::decode_send_data_indication(frame) else {
+        warn!("dump-caps: could not decode SendDataIndication");
+        return;
+    };
+    let Ok(sc) = ironrdp_connector::legacy::decode_share_control(send) else {
+        warn!("dump-caps: could not decode ShareControl");
+        return;
+    };
+    if let ShareControlPdu::ServerDemandActive(da) = sc.pdu {
+        info!(
+            source = %da.pdu.source_descriptor,
+            count = da.pdu.capability_sets.len(),
+            "=== server DemandActive capability sets ==="
+        );
+        for cap in &da.pdu.capability_sets {
+            info!("  server cap: {cap:?}");
+        }
+    } else {
+        warn!(pdu = ?sc.pdu, "dump-caps: frame was not a ServerDemandActive");
+    }
+}
+
 /// A passive static virtual channel: it is declared in the MCS Connect Initial
 /// and joined, but ignores all traffic. mstscax declares several channels
 /// (rdpdr/rdpsnd/cliprdr/…); the SCCM server appears to withhold its
@@ -168,6 +195,9 @@ pub async fn connect_rdp(
                 if let Some(sid) = ironrdp_connector::legacy::frame_share_id(&pdu) {
                     share_id = sid;
                     debug!(share_id, "captured server share_id from DemandActive");
+                    if std::env::var("SCCM_RC_DUMP_CAPS").as_deref() == Ok("1") {
+                        log_demand_active(&pdu);
+                    }
                 }
             }
             connector.step(&pdu, &mut out).map_err(map_err)?
