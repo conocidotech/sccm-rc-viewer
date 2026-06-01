@@ -14,3 +14,6 @@ experiments/capture.*
 
 # Live-test logs (transient)
 rc-*.log
+
+# Frida capture artifacts (transient)
+frida-frames.txt
