@@ -137,6 +137,62 @@ impl ironrdp_svc::SvcProcessor for PassiveChannel {
 
 impl ironrdp_svc::SvcClientProcessor for PassiveChannel {}
 
+/// The SCCM RC session-arbitration static virtual channel ("sessarb"). The
+/// server withholds the shadow-attach (and thus all graphics) until the client
+/// arbitrates the session over this channel. RE of RdpCoreSccm.dll: the event
+/// is a 16-byte payload `[u32 tag=2][u32 len=16][u32 eventType][u32 arg2]`.
+/// We log every byte the server sends back (its Host Allowed/Idle/InUse/Denied).
+#[derive(Debug, Default)]
+pub struct ArbitrationChannel {
+    replies_sent: u32,
+}
+
+impl ArbitrationChannel {
+    /// Build the 16-byte arbitration event payload.
+    pub fn event(event_type: u32, arg2: u32) -> Vec<u8> {
+        let mut v = Vec::with_capacity(16);
+        v.extend_from_slice(&2u32.to_le_bytes()); // tag
+        v.extend_from_slice(&16u32.to_le_bytes()); // length
+        v.extend_from_slice(&event_type.to_le_bytes());
+        v.extend_from_slice(&arg2.to_le_bytes());
+        v
+    }
+}
+
+ironrdp_svc::impl_as_any!(ArbitrationChannel);
+
+impl ironrdp_svc::SvcProcessor for ArbitrationChannel {
+    fn channel_name(&self) -> ironrdp_pdu::gcc::ChannelName {
+        ironrdp_pdu::gcc::ChannelName::from_utf8("sessarb").expect("valid name")
+    }
+    fn process(&mut self, payload: &[u8]) -> ironrdp_pdu::PduResult<Vec<ironrdp_svc::SvcMessage>> {
+        let hex: Vec<String> = payload.iter().take(32).map(|b| format!("{b:02x}")).collect();
+        let server_event = if payload.len() >= 12 {
+            u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]])
+        } else {
+            0
+        };
+        info!(len = payload.len(), server_event, bytes = %hex.join(" "), "sessarb: server arbitration event");
+
+        // Optionally send a follow-up event in response (SCCM_RC_ARB_REPLY=<type>),
+        // once, to complete the arbitration handshake.
+        if let Ok(reply) = std::env::var("SCCM_RC_ARB_REPLY") {
+            if let Ok(reply_type) = reply.parse::<u32>() {
+                if self.replies_sent == 0 {
+                    self.replies_sent += 1;
+                    info!(reply_type, "sessarb: sending follow-up arbitration event");
+                    return Ok(vec![ironrdp_svc::SvcMessage::from(ArbitrationChannel::event(
+                        reply_type, 0,
+                    ))]);
+                }
+            }
+        }
+        Ok(Vec::new())
+    }
+}
+
+impl ironrdp_svc::SvcClientProcessor for ArbitrationChannel {}
+
 /// Run the full RDP connection sequence over the established SCCM session.
 /// Returns the negotiated connection result on success.
 pub async fn connect_rdp(
@@ -160,6 +216,16 @@ pub async fn connect_rdp(
             connector = connector.with_static_channel(PassiveChannel::new(name));
         }
         info!("declared passive static virtual channels: cliprdr, rdpsnd, rdpdr, drdynvc");
+    }
+    // The SCCM RC session-arbitration channel (SCCM_RC_ARB=1). Required for the
+    // server to attach the shadow; we send the arbitration event after
+    // activation. Also declare the sibling WLC channels the real client opens.
+    if std::env::var("SCCM_RC_ARB").as_deref() == Ok("1") {
+        connector = connector.with_static_channel(ArbitrationChannel::default());
+        for name in ["curtain", "rcclip", "dynres", "dskcfg"] {
+            connector = connector.with_static_channel(PassiveChannel::new(name));
+        }
+        info!("declared SCCM RC arbitration channel 'sessarb' (+ curtain/rcclip/dynres/dskcfg)");
     }
 
     let mut input_buf: Vec<u8> = Vec::new();
@@ -329,6 +395,28 @@ pub async fn run_active_session(
     // a flood of these right after ConfirmActive. (SCCM_RC_PERSIST=1.)
     if std::env::var("SCCM_RC_PERSIST").as_deref() == Ok("1") {
         send_persistent_key_list(session, user_channel_id, io_channel_id, share_id).await?;
+    }
+
+    // SCCM RC session arbitration: send the arbitration request event over the
+    // "sessarb" channel so the server attaches the shadow. Event type is
+    // configurable (SCCM_RC_ARB_EVENT, default 1) while we determine which one
+    // the real client sends to initiate.
+    if std::env::var("SCCM_RC_ARB").as_deref() == Ok("1") {
+        let event_type: u32 = std::env::var("SCCM_RC_ARB_EVENT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let payload = ArbitrationChannel::event(event_type, 0);
+        let msgs = ironrdp_svc::SvcProcessorMessages::<ArbitrationChannel>::new(vec![
+            ironrdp_svc::SvcMessage::from(payload),
+        ]);
+        match stage.process_svc_processor_messages(msgs) {
+            Ok(bytes) => {
+                session.send_rdp(&bytes).await?;
+                info!(event_type, sent = bytes.len(), "sent sessarb arbitration event");
+            }
+            Err(e) => warn!(error = %e, "failed to encode sessarb arbitration event"),
+        }
     }
 
     // Force an initial full-screen repaint. Without this, a static remote
