@@ -272,11 +272,11 @@ fn create_client_confirm_active(
     desktop_size: DesktopSize,
 ) -> rdp::capability_sets::ClientConfirmActive {
     use ironrdp_pdu::rdp::capability_sets::{
-        client_codecs_capabilities, Bitmap, BitmapCache, BitmapDrawingFlags, Brush, CacheDefinition, CacheEntry,
-        ClientConfirmActive, CmdFlags, DemandActive, FrameAcknowledge, General, GeneralExtraFlags, GlyphCache,
-        GlyphSupportLevel, Input, InputFlags, LargePointer, LargePointerSupportFlags, MultifragmentUpdate,
-        OffscreenBitmapCache, Order, OrderFlags, OrderSupportExFlags, Pointer, Sound, SoundFlags, SupportLevel,
-        SurfaceCommands, VirtualChannel, VirtualChannelFlags, BITMAP_CACHE_ENTRIES_NUM, GLYPH_CACHE_NUM,
+        client_codecs_capabilities, Bitmap, BitmapCache, BitmapCacheRev2, BitmapDrawingFlags, Brush, CacheDefinition,
+        CacheEntry, CacheFlags, CellInfo, ClientConfirmActive, CmdFlags, DemandActive, FrameAcknowledge, General,
+        GeneralExtraFlags, GlyphCache, GlyphSupportLevel, Input, InputFlags, LargePointer, LargePointerSupportFlags,
+        MultifragmentUpdate, OffscreenBitmapCache, Order, OrderFlags, OrderSupportExFlags, Pointer, Sound, SoundFlags,
+        SupportLevel, SurfaceCommands, VirtualChannel, VirtualChannelFlags, BITMAP_CACHE_ENTRIES_NUM, GLYPH_CACHE_NUM,
         SERVER_CHANNEL_ID,
     };
 
@@ -300,15 +300,13 @@ fn create_client_confirm_active(
     // MemBlt + a populated rev1 bitmap cache so the SCCM server paints via
     // drawing orders that sccm-rc-orders renders.
     let orders_mode = std::env::var("SCCM_RC_ORDERS").as_deref() == Ok("1");
-    let bitmap_cache_caches = if orders_mode {
-        [
-            CacheEntry { entries: 120, max_cell_size: 256 },
-            CacheEntry { entries: 120, max_cell_size: 1024 },
-            CacheEntry { entries: 336, max_cell_size: 4096 },
-        ]
-    } else {
-        [CacheEntry::default(); BITMAP_CACHE_ENTRIES_NUM]
-    };
+    // MemBlt needs a bitmap cache. We advertise a Bitmap Cache Rev2 cap (like
+    // mstscax) — a populated Rev1 cap made the server reject with ConnectFailed,
+    // Rev2 is accepted. On by default in orders mode; SCCM_RC_NO_MEMBLT=1 opts
+    // out (A/B: non-cache orders only). The literal Rev1 BitmapCache below stays
+    // empty and is replaced by Rev2 in the post-step.
+    let want_memblt = orders_mode && std::env::var("SCCM_RC_NO_MEMBLT").as_deref() != Ok("1");
+    let bitmap_cache_caches = [CacheEntry::default(); BITMAP_CACHE_ENTRIES_NUM];
 
     server_capability_sets.extend_from_slice(&[
         CapabilitySet::General(General {
@@ -337,11 +335,13 @@ fn create_client_confirm_active(
                 0,
             );
             if orders_mode {
-                // Only the orders our renderer actually services.
-                for f in [
-                    Osi::DstBlt, Osi::PatBlt, Osi::ScrBlt, Osi::MemBlt, Osi::LineTo,
-                ] {
+                // Non-cache orders our renderer services (OpaqueRect is always
+                // supported implicitly, no flag). MemBlt is gated separately.
+                for f in [Osi::DstBlt, Osi::PatBlt, Osi::ScrBlt, Osi::LineTo] {
                     order.set_support_flag(f, true);
+                }
+                if want_memblt {
+                    order.set_support_flag(Osi::MemBlt, true);
                 }
             }
             CapabilitySet::Order(order)
@@ -419,6 +419,26 @@ fn create_client_confirm_active(
             max_unacknowledged_frame_count: 20,
         }),
     ]);
+
+    // PATCHED for sccm-rc: in MemBlt mode replace the (empty) Rev1 bitmap cache
+    // with a Bitmap Cache Rev2 capability, as mstscax does. The server rejected
+    // a populated Rev1 cache with ConnectFailed. Rev2 also steers the server to
+    // Cache Bitmap Rev2 secondary orders. Non-persistent, mstsc/FreeRDP cell
+    // dimensions.
+    if orders_mode && want_memblt {
+        server_capability_sets.retain(|c| !matches!(c, CapabilitySet::BitmapCache(_)));
+        server_capability_sets.push(CapabilitySet::BitmapCacheRev2(BitmapCacheRev2 {
+            cache_flags: CacheFlags::ALLOW_CACHE_WAITING_LIST_FLAG,
+            num_cell_caches: 5,
+            cache_cell_info: [
+                CellInfo { num_entries: 600, is_cache_persistent: false },
+                CellInfo { num_entries: 600, is_cache_persistent: false },
+                CellInfo { num_entries: 2048, is_cache_persistent: false },
+                CellInfo { num_entries: 4096, is_cache_persistent: false },
+                CellInfo { num_entries: 2048, is_cache_persistent: false },
+            ],
+        }));
+    }
 
     // PATCHED for sccm-rc: when SCCM_RC_LEGACY_GFX=1, drop the modern
     // Surface Commands + RemoteFx codec caps so the legacy SCCM RDP server

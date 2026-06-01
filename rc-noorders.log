@@ -1,0 +1,70 @@
+[2m2026-06-01T01:17:47.920768Z[0m [32m INFO[0m [2mrdp_connect_test[0m[2m:[0m connecting + authenticating [3mtarget[0m[2m=[0mTARGET-HOST
+[2m2026-06-01T01:17:47.963764Z[0m [32m INFO[0m [2msccm_rc_core[0m[2m:[0m TCP connected [3mtarget[0m[2m=[0mTARGET-HOST
+[2m2026-06-01T01:17:47.983895Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m server greeting [3mgreeting[0m[2m=[0mSTART_HANDSHAKE
+[2m2026-06-01T01:17:48.019872Z[0m [32m INFO[0m [2msccm_rc_core[0m[2m:[0m SSPI handshake complete
+[2m2026-06-01T01:17:48.088086Z[0m [32m INFO[0m [2msccm_rc_core[0m[2m:[0m remote control session granted [3mgrant[0m[2m=[0mFullControl
+[2m2026-06-01T01:17:48.088942Z[0m [32m INFO[0m [2mrdp_connect_test[0m[2m:[0m session established [3mgrant[0m[2m=[0mFullControl
+[2m2026-06-01T01:17:48.089308Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"ConnectionInitiationSendRequest"
+[2m2026-06-01T01:17:48.089676Z[0m [33m WARN[0m [2mironrdp_connector::connection[0m[2m:[0m sccm-rc patch: proceeding with standard RDP security
+[2m2026-06-01T01:17:48.090480Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m46
+[2m2026-06-01T01:17:48.112358Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (with input) [3mstate[0m[2m=[0m"ConnectionInitiationWaitResponse" [3mpdu_len[0m[2m=[0m19
+[2m2026-06-01T01:17:48.112930Z[0m [32m INFO[0m [2mironrdp_connector::connection[0m[2m:[0m Server confirmed connection [3mselected_protocol[0m[2m=[0mSecurityProtocol(0x0) [3mflags[0m[2m=[0mResponseFlags(EXTENDED_CLIENT_DATA_SUPPORTED)
+[2m2026-06-01T01:17:48.113242Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"EnhancedSecurityUpgrade"
+[2m2026-06-01T01:17:48.113391Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"BasicSettingsExchangeSendInitial"
+[2m2026-06-01T01:17:48.113857Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m383
+[2m2026-06-01T01:17:48.139044Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (with input) [3mstate[0m[2m=[0m"BasicSettingsExchangeWaitResponse" [3mpdu_len[0m[2m=[0m100
+[2m2026-06-01T01:17:48.139841Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"ChannelConnection"
+[2m2026-06-01T01:17:48.140274Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m12
+[2m2026-06-01T01:17:48.140502Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"ChannelConnection"
+[2m2026-06-01T01:17:48.140687Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m8
+[2m2026-06-01T01:17:48.235327Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (with input) [3mstate[0m[2m=[0m"ChannelConnection" [3mpdu_len[0m[2m=[0m11
+[2m2026-06-01T01:17:48.235803Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"ChannelConnection"
+[2m2026-06-01T01:17:48.236072Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m24
+[2m2026-06-01T01:17:48.255273Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (with input) [3mstate[0m[2m=[0m"ChannelConnection" [3mpdu_len[0m[2m=[0m15
+[2m2026-06-01T01:17:48.320816Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (with input) [3mstate[0m[2m=[0m"ChannelConnection" [3mpdu_len[0m[2m=[0m15
+[2m2026-06-01T01:17:48.321581Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"SecureSettingsExchange"
+[2m2026-06-01T01:17:48.322113Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m271
+[2m2026-06-01T01:17:48.322480Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"ConnectTimeAutoDetection"
+[2m2026-06-01T01:17:48.342647Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (with input) [3mstate[0m[2m=[0m"LicensingExchange" [3mpdu_len[0m[2m=[0m34
+[2m2026-06-01T01:17:48.343063Z[0m [32m INFO[0m [2mironrdp_connector::license_exchange[0m[2m:[0m Server did not initiate license exchange
+[2m2026-06-01T01:17:48.343437Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"MultitransportBootstrapping"
+[2m2026-06-01T01:17:48.409024Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (with input) [3mstate[0m[2m=[0m"CapabilitiesExchange" [3mpdu_len[0m[2m=[0m395
+[2m2026-06-01T01:17:48.409954Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m512
+[2m2026-06-01T01:17:48.410248Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"ConnectionFinalization"
+[2m2026-06-01T01:17:48.410507Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m36
+[2m2026-06-01T01:17:48.410723Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"ConnectionFinalization"
+[2m2026-06-01T01:17:48.410892Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m40
+[2m2026-06-01T01:17:48.410985Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"ConnectionFinalization"
+[2m2026-06-01T01:17:48.411094Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m40
+[2m2026-06-01T01:17:48.411179Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (no input) [3mstate[0m[2m=[0m"ConnectionFinalization"
+[2m2026-06-01T01:17:48.411285Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m40
+[2m2026-06-01T01:17:48.429686Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (with input) [3mstate[0m[2m=[0m"ConnectionFinalization" [3mpdu_len[0m[2m=[0m36
+[2m2026-06-01T01:17:48.449121Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (with input) [3mstate[0m[2m=[0m"ConnectionFinalization" [3mpdu_len[0m[2m=[0m40
+[2m2026-06-01T01:17:48.514425Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (with input) [3mstate[0m[2m=[0m"ConnectionFinalization" [3mpdu_len[0m[2m=[0m40
+[2m2026-06-01T01:17:48.515003Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m RDP step (with input) [3mstate[0m[2m=[0m"ConnectionFinalization" [3mpdu_len[0m[2m=[0m40
+[2m2026-06-01T01:17:48.515348Z[0m [32m INFO[0m [2msccm_rc_core::rdp[0m[2m:[0m ✅ RDP connection sequence complete — active session [3mwidth[0m[2m=[0m1920 [3mheight[0m[2m=[0m1080 [3mio_channel[0m[2m=[0m1003 [3muser_channel[0m[2m=[0m1004 [3mleftover[0m[2m=[0m0
+[2m2026-06-01T01:17:48.515580Z[0m [32m INFO[0m [2mrdp_connect_test[0m[2m:[0m ✅✅ RDP ACTIVE SESSION — full connection sequence completed over SCCM transport [3mdesktop[0m[2m=[0m"1920x1080"
+[2m2026-06-01T01:17:48.515792Z[0m [32m INFO[0m [2mrdp_connect_test[0m[2m:[0m entering active session — processing graphics updates (Ctrl+C to stop)
+[2m2026-06-01T01:17:48.516372Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m44
+[2m2026-06-01T01:17:48.516700Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m44
+[2m2026-06-01T01:17:48.516871Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m sent allow-output + refresh-rect [3mwidth[0m[2m=[0m1920 [3mheight[0m[2m=[0m1080 [3mshare_id[0m[2m=[0m0
+[2m2026-06-01T01:17:48.517187Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:48.517389Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m forwarded input [3mevents[0m[2m=[0m1 [3msent_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:49.320062Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:49.321306Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m forwarded input [3mevents[0m[2m=[0m1 [3msent_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:50.126087Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:50.142720Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m forwarded input [3mevents[0m[2m=[0m1 [3msent_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:50.920832Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:50.921436Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m forwarded input [3mevents[0m[2m=[0m1 [3msent_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:51.722671Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:51.723675Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m forwarded input [3mevents[0m[2m=[0m1 [3msent_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:52.527398Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:52.528067Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m forwarded input [3mevents[0m[2m=[0m1 [3msent_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:53.328065Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:53.343246Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m forwarded input [3mevents[0m[2m=[0m1 [3msent_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:54.119832Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:54.120449Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m forwarded input [3mevents[0m[2m=[0m1 [3msent_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:54.926490Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:54.941531Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m forwarded input [3mevents[0m[2m=[0m1 [3msent_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:55.731995Z[0m [34mDEBUG[0m [2msccm_rc_core[0m[2m:[0m sent sealed RDP [3mrdp_bytes[0m[2m=[0m9
+[2m2026-06-01T01:17:55.738382Z[0m [34mDEBUG[0m [2msccm_rc_core::rdp[0m[2m:[0m forwarded input [3mevents[0m[2m=[0m1 [3msent_bytes[0m[2m=[0m9
