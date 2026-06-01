@@ -229,6 +229,9 @@ pub async fn run_active_session(
     let mut orders = OrderProcessor::new(width, height, ColorDepth::Bpp16);
     let mut order_frag: Vec<u8> = Vec::new();
     let mut order_frag_active = false;
+    // Dump the first few complete order streams raw, for offline verification
+    // of cache-bitmap encoding / compression-header assumptions.
+    let mut order_dump_count = 0u32;
 
     // Seed with any PDUs left over from the connection sequence (initial paint).
     let mut buf: Vec<u8> = initial_buf;
@@ -301,6 +304,24 @@ pub async fn run_active_session(
                 if let Some(complete) =
                     reassemble_orders(&mut order_frag, &mut order_frag_active, frag, data)
                 {
+                    if order_dump_count < 5 {
+                        order_dump_count += 1;
+                        let path = std::env::temp_dir()
+                            .join(format!("sccm-orders-{order_dump_count:03}.bin"));
+                        let _ = std::fs::write(&path, &complete);
+                        let preview: Vec<String> = complete
+                            .iter()
+                            .take(48)
+                            .map(|b| format!("{b:02x}"))
+                            .collect();
+                        info!(
+                            n = order_dump_count,
+                            len = complete.len(),
+                            path = %path.display(),
+                            head = %preview.join(" "),
+                            "first order streams — raw dump"
+                        );
+                    }
                     match orders.process_orders(&complete) {
                         Ok(outcome) => {
                             debug!(
