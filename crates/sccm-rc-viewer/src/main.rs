@@ -11,7 +11,7 @@ use sccm_rc_core::rdp::{
     SessionSink, UpdateRegion,
 };
 use sccm_rc_core::SccmSession;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -48,25 +48,50 @@ struct SharedFrame {
 }
 
 /// Sink that copies decoded frames into the shared framebuffer and wakes
-/// the UI thread.
+/// the UI thread. Copies only the dirty region (the incoming frame is the full
+/// accumulated desktop) and throttles wake-ups so a burst of small order updates
+/// doesn't trigger a redraw storm.
 struct FrameSink {
     shared: Arc<Mutex<SharedFrame>>,
     proxy: EventLoopProxy<UserEvent>,
 }
 
 impl SessionSink for FrameSink {
-    fn on_graphics_update(&mut self, image: &dyn FrameView, _region: UpdateRegion) {
+    fn on_graphics_update(&mut self, image: &dyn FrameView, region: UpdateRegion) {
+        let iw = image.width() as u32;
+        let ih = image.height() as u32;
+        let src = image.data();
         {
             let mut f = self.shared.lock().unwrap();
-            f.width = image.width() as u32;
-            f.height = image.height() as u32;
-            f.rgba.clear();
-            f.rgba.extend_from_slice(image.data());
+            if f.width != iw || f.height != ih || f.rgba.len() != src.len() {
+                // First frame or size change (reactivation): full copy.
+                f.width = iw;
+                f.height = ih;
+                f.rgba.clear();
+                f.rgba.extend_from_slice(src);
+            } else {
+                // Copy only the dirty region's rows.
+                let w = iw as usize;
+                let left = region.left as usize;
+                let right = (region.right as usize).min(w.saturating_sub(1));
+                let bottom = (region.bottom as usize).min((ih as usize).saturating_sub(1));
+                let top = (region.top as usize).min(bottom);
+                for y in top..=bottom {
+                    let a = (y * w + left) * 4;
+                    let b = (y * w + right + 1) * 4;
+                    if b <= f.rgba.len() && b <= src.len() {
+                        f.rgba[a..b].copy_from_slice(&src[a..b]);
+                    }
+                }
+            }
         }
+        // winit coalesces multiple request_redraw() into a single RedrawRequested,
+        // so a burst of region updates results in one redraw — no throttle needed.
         let _ = self.proxy.send_event(UserEvent::Frame);
     }
     fn on_terminate(&mut self, reason: String) {
-        let _ = self.proxy.send_event(UserEvent::Closed(reason));
+        // Don't close the window — the reconnect loop will resume the session.
+        tracing::warn!(%reason, "server ended session; will reconnect");
     }
 }
 
@@ -95,9 +120,16 @@ fn main() -> anyhow::Result<()> {
                 .build()
                 .expect("tokio runtime");
             rt.block_on(async move {
-                if let Err(e) = run_session(&target, w, h, shared, proxy.clone(), input_rx).await {
-                    error!(error = %e, "RDP session failed");
-                    let _ = proxy.send_event(UserEvent::Closed(e.to_string()));
+                // Auto-reconnect: a transport desync or server-side reset ends the
+                // session; rather than crashing the window, reconnect and resume.
+                // The window closes only when the user closes it (exits the loop).
+                let mut input_rx = input_rx;
+                loop {
+                    match run_session(&target, w, h, shared.clone(), proxy.clone(), &mut input_rx).await {
+                        Ok(()) => info!("session ended; reconnecting in 1s"),
+                        Err(e) => warn!(error = %e, "session error; reconnecting in 1s"),
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 }
             });
         });
@@ -122,14 +154,17 @@ async fn run_session(
     h: u16,
     shared: Arc<Mutex<SharedFrame>>,
     proxy: EventLoopProxy<UserEvent>,
-    mut input_rx: rdp::InputReceiver,
+    input_rx: &mut rdp::InputReceiver,
 ) -> anyhow::Result<()> {
     let mut session = SccmSession::connect(target).await?;
     info!(grant = ?session.grant(), "session established");
     let (result, initial_buf, share_id) = rdp::connect_rdp(&mut session, w, h).await?;
     info!("RDP active — streaming");
     let mut sink = FrameSink { shared, proxy };
-    rdp::run_active_session(&mut session, result, initial_buf, share_id, &mut sink, &mut input_rx).await?;
+    let res = rdp::run_active_session(&mut session, result, initial_buf, share_id, &mut sink, input_rx).await;
+    // Graceful teardown so the server releases the shadow/host before we reconnect.
+    session.disconnect().await;
+    res?;
     Ok(())
 }
 

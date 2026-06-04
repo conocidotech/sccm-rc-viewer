@@ -17,3 +17,11 @@ rc-*.log
 
 # Frida capture artifacts (transient)
 frida-frames.txt
+
+# Hook/injector build artifacts (rebuild from experiments/*.c)
+/hook.dll
+/inject.exe
+
+# SSPI hook capture output — decrypted session plaintext, never commit
+/hook-frames.txt
+experiments/captures/*.txt
