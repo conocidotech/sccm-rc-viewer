@@ -4,7 +4,7 @@
 //! `update_read_*_order`.
 
 use crate::canvas::{OrderCanvas, Rect};
-use crate::cache::BitmapCache;
+use crate::cache::{BitmapCache, Glyph, GlyphCache};
 use crate::color::colorref;
 use crate::cursor::Cursor;
 use crate::header::{coord, field};
@@ -237,6 +237,311 @@ impl LineTo {
             self.y_end,
             self.pen_color,
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Glyph / text orders (MS-RDPEGDI 2.2.2.2.1.1.2.13–15). Cached glyphs (1-bpp
+// bitmaps from Cache Glyph secondary orders) are blitted in the foreground color
+// along an advancing pen. Fragment-cache escapes (0xFE/0xFF) are consumed but not
+// yet rendered. NOTE: implemented from the spec; not yet validated against a real
+// glyph-emitting session (the SCCM login screen paints text via bitmap tiles).
+
+/// Read a glyph-run advance/delta byte (0x80 escape → 2-byte LE value).
+fn read_glyph_delta(data: &[u8], i: &mut usize) -> i32 {
+    if *i >= data.len() {
+        return 0;
+    }
+    let b = data[*i];
+    *i += 1;
+    if b == 0x80 {
+        if *i + 1 < data.len() {
+            let v = u16::from_le_bytes([data[*i], data[*i + 1]]) as i32;
+            *i += 2;
+            v
+        } else {
+            0
+        }
+    } else {
+        b as i32
+    }
+}
+
+/// Render a glyph-fragment byte stream: each index draws a cached glyph and
+/// advances the pen (by `ul_char_inc`, or a trailing delta when it is 0). The
+/// `0xFF` escape caches the preceding bytes as a fragment; `0xFE` replays a
+/// cached fragment. Recursion is depth-limited as a safety guard.
+#[allow(clippy::too_many_arguments)]
+fn process_glyph_bytes(
+    canvas: &mut OrderCanvas,
+    clip: Option<Rect>,
+    cache: &mut GlyphCache,
+    cache_id: usize,
+    ul_char_inc: u8,
+    fore: [u8; 4],
+    data: &[u8],
+    gx: &mut i32,
+    y: i32,
+    dirty: &mut Rect,
+    depth: u8,
+) {
+    if depth > 8 {
+        return;
+    }
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        i += 1;
+        match b {
+            0xFF => {
+                // ADD: id(u8), size(u8) — cache the `size` bytes immediately
+                // preceding this escape under fragment id.
+                if i + 1 < data.len() {
+                    let id = data[i] as usize;
+                    let size = data[i + 1] as usize;
+                    let frag_end = i - 1; // index of the 0xFF byte
+                    let frag_start = frag_end.saturating_sub(size);
+                    let frag = data[frag_start..frag_end].to_vec();
+                    cache.put_fragment(id, &frag);
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+            0xFE => {
+                // USE: id(u8) [+ delta]; replay the cached fragment's glyphs.
+                if i >= data.len() {
+                    break;
+                }
+                let id = data[i] as usize;
+                i += 1;
+                let delta = if ul_char_inc == 0 {
+                    read_glyph_delta(data, &mut i)
+                } else {
+                    0
+                };
+                if let Some(frag) = cache.fragment(id).map(|f| f.to_vec()) {
+                    process_glyph_bytes(canvas, clip, cache, cache_id, ul_char_inc, fore, &frag, gx, y, dirty, depth + 1);
+                }
+                *gx += delta;
+            }
+            idx => {
+                let mut adv = 0;
+                if let Some(g) = cache.get(cache_id, idx as usize) {
+                    let r = canvas.blit_glyph(*gx + g.x as i32, y + g.y as i32, g.cx, g.cy, &g.aj, clip, fore);
+                    if !r.is_empty() {
+                        *dirty = if dirty.is_empty() { r } else { dirty.union(&r) };
+                    }
+                    adv = if ul_char_inc != 0 { ul_char_inc as i32 } else { read_glyph_delta(data, &mut i) };
+                } else if ul_char_inc == 0 {
+                    let _ = read_glyph_delta(data, &mut i);
+                }
+                *gx += adv;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_glyph_run(
+    canvas: &mut OrderCanvas,
+    clip: Option<Rect>,
+    cache: &mut GlyphCache,
+    cache_id: usize,
+    ul_char_inc: u8,
+    data: &[u8],
+    x: i32,
+    y: i32,
+    fore: [u8; 4],
+) -> Rect {
+    let mut gx = x;
+    let mut dirty = Rect::new(0, 0, 0, 0);
+    process_glyph_bytes(canvas, clip, cache, cache_id, ul_char_inc, fore, data, &mut gx, y, &mut dirty, 0);
+    dirty
+}
+
+/// Fill the text background box with `back_color` (inclusive coords), then return
+/// it as a dirty seed. A zero/empty box is ignored.
+fn fill_text_bg(canvas: &mut OrderCanvas, clip: Option<Rect>, l: i32, t: i32, r: i32, b: i32, color: [u8; 4]) -> Rect {
+    if r > l && b > t {
+        canvas.fill_rect(Rect::from_inclusive(l, t, r, b), clip, color)
+    } else {
+        Rect::new(0, 0, 0, 0)
+    }
+}
+
+/// GlyphIndex order (0x1B) — the full text order.
+#[derive(Debug, Clone, Default)]
+pub struct GlyphIndex {
+    pub cache_id: u8,
+    pub fl_accel: u8,
+    pub ul_char_inc: u8,
+    pub fop_redundant: u8,
+    pub back_color: [u8; 4],
+    pub fore_color: [u8; 4],
+    pub bk: [i32; 4], // left, top, right, bottom (inclusive)
+    pub op: [i32; 4],
+    pub brush_org_x: u8,
+    pub brush_org_y: u8,
+    pub brush_style: u8,
+    pub brush_hatch: u8,
+    pub x: i32,
+    pub y: i32,
+    pub data: Vec<u8>,
+}
+
+impl GlyphIndex {
+    pub fn decode(&mut self, c: &mut Cursor, ff: u32, delta: bool) -> Result<(), OrderError> {
+        field(ff, 0, &mut self.cache_id, || c.u8())?;
+        field(ff, 1, &mut self.fl_accel, || c.u8())?;
+        field(ff, 2, &mut self.ul_char_inc, || c.u8())?;
+        field(ff, 3, &mut self.fop_redundant, || c.u8())?;
+        field(ff, 4, &mut self.back_color, || read_color3(c))?;
+        field(ff, 5, &mut self.fore_color, || read_color3(c))?;
+        for (bit, slot) in self.bk.iter_mut().enumerate() {
+            coord(ff, 6 + bit as u32, c, delta, slot)?;
+        }
+        for (bit, slot) in self.op.iter_mut().enumerate() {
+            coord(ff, 10 + bit as u32, c, delta, slot)?;
+        }
+        field(ff, 14, &mut self.brush_org_x, || c.u8())?;
+        field(ff, 15, &mut self.brush_org_y, || c.u8())?;
+        field(ff, 16, &mut self.brush_style, || c.u8())?;
+        field(ff, 17, &mut self.brush_hatch, || c.u8())?;
+        if ff & (1 << 18) != 0 {
+            c.skip(7)?; // brushExtra
+        }
+        coord(ff, 19, c, delta, &mut self.x)?;
+        coord(ff, 20, c, delta, &mut self.y)?;
+        if ff & (1 << 21) != 0 {
+            let n = c.u8()? as usize;
+            self.data = c.bytes(n.min(c.remaining()))?.to_vec();
+        }
+        Ok(())
+    }
+
+    pub fn draw(&self, canvas: &mut OrderCanvas, clip: Option<Rect>, glyphs: &mut GlyphCache) -> Rect {
+        let bg = fill_text_bg(canvas, clip, self.bk[0], self.bk[1], self.bk[2], self.bk[3], self.back_color);
+        let fg = draw_glyph_run(canvas, clip, glyphs, self.cache_id as usize, self.ul_char_inc, &self.data, self.x, self.y, self.fore_color);
+        if bg.is_empty() { fg } else if fg.is_empty() { bg } else { bg.union(&fg) }
+    }
+}
+
+/// FastIndex order (0x13) — compact text order (no brush / fOpRedundant).
+#[derive(Debug, Clone, Default)]
+pub struct FastIndex {
+    pub cache_id: u8,
+    pub ul_char_inc: u8,
+    pub fl_accel: u8,
+    pub back_color: [u8; 4],
+    pub fore_color: [u8; 4],
+    pub bk: [i32; 4],
+    pub op: [i32; 4],
+    pub x: i32,
+    pub y: i32,
+    pub data: Vec<u8>,
+}
+
+impl FastIndex {
+    pub fn decode(&mut self, c: &mut Cursor, ff: u32, delta: bool) -> Result<(), OrderError> {
+        field(ff, 0, &mut self.cache_id, || c.u8())?;
+        // bit 1: two bytes — ulCharInc then flAccel.
+        if ff & (1 << 1) != 0 {
+            self.ul_char_inc = c.u8()?;
+            self.fl_accel = c.u8()?;
+        }
+        field(ff, 2, &mut self.back_color, || read_color3(c))?;
+        field(ff, 3, &mut self.fore_color, || read_color3(c))?;
+        for (bit, slot) in self.bk.iter_mut().enumerate() {
+            coord(ff, 4 + bit as u32, c, delta, slot)?;
+        }
+        for (bit, slot) in self.op.iter_mut().enumerate() {
+            coord(ff, 8 + bit as u32, c, delta, slot)?;
+        }
+        coord(ff, 12, c, delta, &mut self.x)?;
+        coord(ff, 13, c, delta, &mut self.y)?;
+        if ff & (1 << 14) != 0 {
+            let n = c.u8()? as usize;
+            self.data = c.bytes(n.min(c.remaining()))?.to_vec();
+        }
+        Ok(())
+    }
+
+    pub fn draw(&self, canvas: &mut OrderCanvas, clip: Option<Rect>, glyphs: &mut GlyphCache) -> Rect {
+        let bg = fill_text_bg(canvas, clip, self.bk[0], self.bk[1], self.bk[2], self.bk[3], self.back_color);
+        let fg = draw_glyph_run(canvas, clip, glyphs, self.cache_id as usize, self.ul_char_inc, &self.data, self.x, self.y, self.fore_color);
+        if bg.is_empty() { fg } else if fg.is_empty() { bg } else { bg.union(&fg) }
+    }
+}
+
+/// FastGlyph order (0x18) — like FastIndex but the data carries one inline glyph
+/// (cached under `cacheId`/index and drawn once).
+#[derive(Debug, Clone, Default)]
+pub struct FastGlyph {
+    pub cache_id: u8,
+    pub ul_char_inc: u8,
+    pub fl_accel: u8,
+    pub back_color: [u8; 4],
+    pub fore_color: [u8; 4],
+    pub bk: [i32; 4],
+    pub op: [i32; 4],
+    pub x: i32,
+    pub y: i32,
+    pub data: Vec<u8>,
+}
+
+impl FastGlyph {
+    pub fn decode(&mut self, c: &mut Cursor, ff: u32, delta: bool) -> Result<(), OrderError> {
+        field(ff, 0, &mut self.cache_id, || c.u8())?;
+        if ff & (1 << 1) != 0 {
+            self.ul_char_inc = c.u8()?;
+            self.fl_accel = c.u8()?;
+        }
+        field(ff, 2, &mut self.back_color, || read_color3(c))?;
+        field(ff, 3, &mut self.fore_color, || read_color3(c))?;
+        for (bit, slot) in self.bk.iter_mut().enumerate() {
+            coord(ff, 4 + bit as u32, c, delta, slot)?;
+        }
+        for (bit, slot) in self.op.iter_mut().enumerate() {
+            coord(ff, 8 + bit as u32, c, delta, slot)?;
+        }
+        coord(ff, 12, c, delta, &mut self.x)?;
+        coord(ff, 13, c, delta, &mut self.y)?;
+        if ff & (1 << 14) != 0 {
+            let n = c.u8()? as usize;
+            self.data = c.bytes(n.min(c.remaining()))?.to_vec();
+        }
+        Ok(())
+    }
+
+    /// Draws (and caches) the inline glyph. `data` = cacheIndex(u8) then, if more
+    /// bytes follow, a TS_CACHE_GLYPH_DATA (x,y,cx,cy,aj) to cache + draw.
+    pub fn draw(&self, canvas: &mut OrderCanvas, clip: Option<Rect>, glyphs: &mut GlyphCache) -> Rect {
+        let bg = fill_text_bg(canvas, clip, self.bk[0], self.bk[1], self.bk[2], self.bk[3], self.back_color);
+        let mut dirty = bg;
+        if self.data.len() >= 1 {
+            let cache_index = self.data[0] as usize;
+            if self.data.len() >= 9 {
+                // inline TS_CACHE_GLYPH_DATA
+                let gx = i16::from_le_bytes([self.data[1], self.data[2]]);
+                let gy = i16::from_le_bytes([self.data[3], self.data[4]]);
+                let cx = u16::from_le_bytes([self.data[5], self.data[6]]);
+                let cy = u16::from_le_bytes([self.data[7], self.data[8]]);
+                let aj = self.data.get(9..).unwrap_or(&[]).to_vec();
+                let glyph = Glyph { x: gx, y: gy, cx, cy, aj };
+                let r = canvas.blit_glyph(self.x + gx as i32, self.y + gy as i32, cx, cy, &glyph.aj, clip, self.fore_color);
+                glyphs.insert(self.cache_id as usize, cache_index, glyph);
+                if !r.is_empty() {
+                    dirty = if dirty.is_empty() { r } else { dirty.union(&r) };
+                }
+            } else if let Some(g) = glyphs.get(self.cache_id as usize, cache_index) {
+                let r = canvas.blit_glyph(self.x + g.x as i32, self.y + g.y as i32, g.cx, g.cy, &g.aj, clip, self.fore_color);
+                if !r.is_empty() {
+                    dirty = if dirty.is_empty() { r } else { dirty.union(&r) };
+                }
+            }
+        }
+        dirty
     }
 }
 

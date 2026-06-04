@@ -197,6 +197,40 @@ impl OrderCanvas {
         r
     }
 
+    /// Blit a 1-bit-per-pixel glyph at `(x, y)`. `aj` is the glyph bitmap,
+    /// `ceil(cx/8)` bytes per row, MSB-first (bit 7 = leftmost pixel); set bits
+    /// are painted `color`, clear bits are left unchanged. Clipped to the canvas
+    /// and the optional bounds rect. Returns the touched (clipped) rect.
+    pub fn blit_glyph(
+        &mut self,
+        x: i32,
+        y: i32,
+        cx: u16,
+        cy: u16,
+        aj: &[u8],
+        bounds: Option<Rect>,
+        color: [u8; 4],
+    ) -> Rect {
+        let dst = Rect::from_ltwh(x, y, cx as i32, cy as i32);
+        let r = self.clip(dst, bounds);
+        if r.is_empty() {
+            return r;
+        }
+        let row_bytes = (cx as usize + 7) / 8;
+        for py in r.y..r.bottom() {
+            let gy = (py - y) as usize;
+            let row = gy * row_bytes;
+            for px in r.x..r.right() {
+                let gx = (px - x) as usize;
+                let byte = aj.get(row + gx / 8).copied().unwrap_or(0);
+                if (byte >> (7 - (gx % 8))) & 1 != 0 {
+                    self.put(px, py, color);
+                }
+            }
+        }
+        r
+    }
+
     /// Apply a destination-only ROP3 (no source/pattern): BLACKNESS (0x00),
     /// WHITENESS (0xFF), DSTINVERT (0x55). Other dest-only codes fall back to
     /// a no-op.

@@ -172,6 +172,100 @@ fn memblt_blits_cached_bitmap() {
 }
 
 #[test]
+fn cache_glyph_then_fast_index_draws_text() {
+    let mut p = proc();
+
+    // Secondary Cache Glyph: cacheId=0, 1 glyph, index 0, origin (0,0), 8x8,
+    // all bits set (a solid 8x8 block). aj = 8 bytes (1 row-byte * 8 rows).
+    #[rustfmt::skip]
+    let payload: Vec<u8> = vec![
+        0x00, // cacheId
+        0x01, // cGlyphs
+        0, 0, // cacheIndex
+        0, 0, // x
+        0, 0, // y
+        8, 0, // cx
+        8, 0, // cy
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // aj
+    ];
+    assert_eq!(payload.len(), 20); // orderLength = 20 - 7 = 13
+    let mut secondary = vec![0x03]; // STANDARD | SECONDARY
+    secondary.extend_from_slice(&(13u16).to_le_bytes());
+    secondary.extend_from_slice(&(0u16).to_le_bytes()); // extraFlags
+    secondary.push(0x03); // orderType = CACHE_GLYPH
+    secondary.extend_from_slice(&payload);
+
+    // Primary FastIndex (0x13): draw cached glyph 0 in red at (10,10).
+    // fields: cacheId(0), ulCharInc+flAccel(1), foreColor(3), x(12), y(13), data(14)
+    // = bits 0,1,3,12,13,14 = 0x700B -> 3 bytes LE 0B 70 00.
+    #[rustfmt::skip]
+    let fast_index = [
+        0x09, 0x13,        // STANDARD|TYPE_CHANGE, FAST_INDEX
+        0x0B, 0x70, 0x00,  // field flags
+        0x00,              // cacheId = 0
+        0x08, 0x00,        // ulCharInc = 8, flAccel = 0
+        0xFF, 0x00, 0x00,  // foreColor R,G,B = red
+        10, 0,             // x = 10
+        10, 0,             // y = 10
+        0x01, 0x00,        // cbData = 1, data = [glyph index 0]
+    ];
+
+    let mut bytes = secondary;
+    bytes.extend_from_slice(&fast_index);
+    let outcome = p.process_orders(&update(2, &bytes)).unwrap();
+    assert_eq!(outcome.orders, 2);
+    assert_eq!(outcome.skipped, 0);
+
+    // The 8x8 glyph painted red at (10,10)..(17,17).
+    assert_eq!(px(&p, 10, 10), [0xff, 0x00, 0x00, 0xff]);
+    assert_eq!(px(&p, 17, 17), [0xff, 0x00, 0x00, 0xff]);
+    assert_eq!(px(&p, 18, 18), [0, 0, 0, 0]); // just outside the glyph
+    assert_eq!(px(&p, 9, 9), [0, 0, 0, 0]); // before the glyph origin
+}
+
+#[test]
+fn glyph_fragment_cache_replays() {
+    let mut p = proc();
+
+    // Cache one 8x8 solid glyph (index 0), as in the previous test.
+    #[rustfmt::skip]
+    let payload: Vec<u8> = vec![
+        0x00, 0x01, 0, 0, 0, 0, 0, 0, 8, 0, 8, 0,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    ];
+    let mut secondary = vec![0x03];
+    secondary.extend_from_slice(&(13u16).to_le_bytes());
+    secondary.extend_from_slice(&(0u16).to_le_bytes());
+    secondary.push(0x03);
+    secondary.extend_from_slice(&payload);
+
+    // FastIndex with glyph data: [idx0, 0xFF id=0 size=1, 0xFE id=0].
+    // -> draw glyph0 at x=10 (advance 8), cache the preceding [idx0] as fragment 0,
+    //    then replay fragment 0 -> draw glyph0 again at x=18.
+    #[rustfmt::skip]
+    let fast_index = [
+        0x09, 0x13,
+        0x0B, 0x70, 0x00,
+        0x00,            // cacheId
+        0x08, 0x00,      // ulCharInc=8, flAccel=0
+        0xFF, 0x00, 0x00, // foreColor red
+        10, 0,           // x
+        10, 0,           // y
+        0x06,            // cbData = 6
+        0x00, 0xFF, 0x00, 0x01, 0xFE, 0x00,
+    ];
+
+    let mut bytes = secondary;
+    bytes.extend_from_slice(&fast_index);
+    p.process_orders(&update(2, &bytes)).unwrap();
+
+    assert_eq!(px(&p, 10, 10), [0xff, 0x00, 0x00, 0xff]); // first glyph
+    assert_eq!(px(&p, 18, 10), [0xff, 0x00, 0x00, 0xff]); // replayed fragment glyph
+    assert_eq!(px(&p, 25, 10), [0xff, 0x00, 0x00, 0xff]); // right edge of 2nd glyph
+    assert_eq!(px(&p, 26, 10), [0, 0, 0, 0]); // just past it
+}
+
+#[test]
 fn bounds_clip_restricts_drawing() {
     let mut p = proc();
     // OpaqueRect 0..50 square but clipped to bounds (0,0)-(9,9) inclusive.
