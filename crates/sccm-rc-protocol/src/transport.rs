@@ -140,6 +140,12 @@ impl RawConnection {
         Ok(Some(Frame { msg_type, body }))
     }
 
+    /// Gracefully shut down the write half (TCP FIN) so the peer sees a clean
+    /// close rather than a reset. Best-effort.
+    pub async fn shutdown(&mut self) {
+        let _ = self.stream.shutdown().await;
+    }
+
     pub fn into_stream(self) -> TcpStream {
         self.stream
     }

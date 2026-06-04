@@ -11,7 +11,7 @@ use sccm_rc_protocol::framing::{self, MSG_TYPE_CONTROL, MSG_TYPE_DATA};
 use sccm_rc_protocol::handshake::SspiSession;
 use sccm_rc_protocol::transport::RawConnection;
 use sccm_rc_protocol::{Error, Result};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub mod rdp;
 
@@ -29,6 +29,9 @@ pub struct SccmSession {
     grant: Grant,
     /// Leftover decrypted RDP bytes not yet consumed by the caller.
     rx_buf: Vec<u8>,
+    /// Diagnostics: sealed frames sent / unsealed (for desync analysis).
+    data_sent: u64,
+    data_recvd: u64,
 }
 
 impl std::fmt::Debug for SccmSession {
@@ -104,11 +107,34 @@ impl SccmSession {
             sspi,
             grant,
             rx_buf: Vec::new(),
+            data_sent: 0,
+            data_recvd: 0,
         })
     }
 
     pub fn grant(&self) -> Grant {
         self.grant
+    }
+
+    /// (sealed frames sent, unsealed frames received) — for desync diagnostics.
+    pub fn seal_stats(&self) -> (u64, u64) {
+        (self.data_sent, self.data_recvd)
+    }
+
+    /// Gracefully tear down the session so the SCCM server releases the shadow /
+    /// host immediately instead of holding it until a timeout (which leaves the
+    /// host stuck in `HostInUse` for the next connection). Best-effort:
+    ///   1. send an MCS Disconnect-Provider-Ultimatum (TPKT+X.224+MCS), sealed;
+    ///   2. close the TCP write half cleanly (FIN).
+    pub async fn disconnect(&mut self) {
+        // TPKT(len=9) + X.224 Data(02 f0 80) + MCS DisconnectProviderUltimatum(21 80).
+        const MCS_DPUM: &[u8] = &[0x03, 0x00, 0x00, 0x09, 0x02, 0xf0, 0x80, 0x21, 0x80];
+        if let Err(e) = self.send_rdp(MCS_DPUM).await {
+            debug!(error = %e, "disconnect: MCS ultimatum send failed (already closing?)");
+        } else {
+            info!("sent MCS Disconnect-Provider-Ultimatum (graceful release)");
+        }
+        self.conn.shutdown().await;
     }
 
     /// Seal and send a chunk of RDP bytes as one data frame.
@@ -119,6 +145,7 @@ impl SccmSession {
         wire.extend_from_slice(&header.to_le_bytes());
         wire.extend_from_slice(&sealed);
         self.conn.send_raw(&wire).await?;
+        self.data_sent += 1;
         debug!(rdp_bytes = rdp_bytes.len(), "sent sealed RDP");
         Ok(())
     }
@@ -145,7 +172,25 @@ impl SccmSession {
                 debug!(msg_type = format_args!("{:#04x}", frame.msg_type), "skipped non-data frame");
                 continue;
             }
-            let plain = self.sspi.unseal(&frame.body)?;
+            let plain = match self.sspi.unseal(&frame.body) {
+                Ok(p) => {
+                    self.data_recvd += 1;
+                    p
+                }
+                Err(e) => {
+                    let head: Vec<String> =
+                        frame.body.iter().take(24).map(|b| format!("{b:02x}")).collect();
+                    warn!(
+                        error = %e,
+                        body_len = frame.body.len(),
+                        data_recvd = self.data_recvd,
+                        data_sent = self.data_sent,
+                        head = %head.join(" "),
+                        "unseal FAILED — sealed-stream desync"
+                    );
+                    return Err(e.into());
+                }
+            };
             // Skip only KNOWN SCCM data-phase control strings (status updates).
             // Anything else — including all RDP graphics — is returned as-is.
             // (The previous heuristic "looks like ASCII" risked dropping RDP

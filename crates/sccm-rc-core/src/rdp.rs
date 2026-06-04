@@ -278,21 +278,27 @@ pub async fn connect_rdp(
     let mut connector = ClientConnector::new(config, client_addr);
     // Declare mstscax-like static virtual channels (SCCM_RC_CHANNELS=1). The
     // server seems to require them before it reactivates + paints.
-    if std::env::var("SCCM_RC_CHANNELS").as_deref() == Ok("1") {
+    // The SCCM RC session-arbitration channel (SCCM_RC_ARB=1). Required for the
+    // server to attach the shadow. We declare the full WLC static virtual channel
+    // set in the EXACT order the real CmRcViewer advertises it (captured
+    // 2026-06-03): rdpdr, rdpsnd, cliprdr, curtain, sessarb, dynres, dskcfg,
+    // drdynvc — with sessarb being our active ArbitrationChannel. The server
+    // assigns MCS ids 03ec..03f3 to these in this order.
+    if std::env::var("SCCM_RC_ARB").as_deref() == Ok("1") {
+        connector = connector.with_static_channel(PassiveChannel::new("rdpdr"));
+        connector = connector.with_static_channel(PassiveChannel::new("rdpsnd"));
+        connector = connector.with_static_channel(PassiveChannel::new("cliprdr"));
+        connector = connector.with_static_channel(PassiveChannel::new("curtain"));
+        connector = connector.with_static_channel(ArbitrationChannel::default());
+        connector = connector.with_static_channel(PassiveChannel::new("dynres"));
+        connector = connector.with_static_channel(PassiveChannel::new("dskcfg"));
+        connector = connector.with_static_channel(PassiveChannel::new("drdynvc"));
+        info!("declared WLC channels (mstscax order): rdpdr,rdpsnd,cliprdr,curtain,sessarb,dynres,dskcfg,drdynvc");
+    } else if std::env::var("SCCM_RC_CHANNELS").as_deref() == Ok("1") {
         for name in ["cliprdr", "rdpsnd", "rdpdr", "drdynvc"] {
             connector = connector.with_static_channel(PassiveChannel::new(name));
         }
         info!("declared passive static virtual channels: cliprdr, rdpsnd, rdpdr, drdynvc");
-    }
-    // The SCCM RC session-arbitration channel (SCCM_RC_ARB=1). Required for the
-    // server to attach the shadow; we send the arbitration event after
-    // activation. Also declare the sibling WLC channels the real client opens.
-    if std::env::var("SCCM_RC_ARB").as_deref() == Ok("1") {
-        connector = connector.with_static_channel(ArbitrationChannel::default());
-        for name in ["curtain", "cliprdr", "dynres", "dskcfg"] {
-            connector = connector.with_static_channel(PassiveChannel::new(name));
-        }
-        info!("declared SCCM RC arbitration channel 'sessarb' (+ curtain/cliprdr/dynres/dskcfg)");
     }
 
     let mut input_buf: Vec<u8> = Vec::new();
@@ -408,6 +414,66 @@ impl FrameView for OrderCanvas {
     }
 }
 
+/// A unified RGBA32 framebuffer that composites both graphics sources. The SCCM
+/// RC server paints some regions via drawing orders (our `OrderCanvas`) and
+/// others via bitmap/surface updates (IronRDP's `DecodedImage`); each writes its
+/// own buffer. We blit every dirty region from whichever source produced it into
+/// this composite so the sink always sees the complete desktop.
+pub struct CompositeFrame {
+    data: Vec<u8>,
+    width: u16,
+    height: u16,
+}
+
+impl CompositeFrame {
+    fn new(width: u16, height: u16) -> Self {
+        Self {
+            data: vec![0u8; width as usize * height as usize * 4],
+            width,
+            height,
+        }
+    }
+
+    fn resize(&mut self, width: u16, height: u16) {
+        self.width = width;
+        self.height = height;
+        self.data = vec![0u8; width as usize * height as usize * 4];
+    }
+
+    /// Copy the pixels in `region` (inclusive) from `src` into the composite.
+    fn blit(&mut self, src: &dyn FrameView, region: UpdateRegion) {
+        if src.width() != self.width || src.height() != self.height {
+            return; // size mismatch (mid-reactivation); skip this update
+        }
+        let w = self.width as usize;
+        let right = (region.right as usize).min(w.saturating_sub(1));
+        let bottom = (region.bottom as usize).min((self.height as usize).saturating_sub(1));
+        let left = (region.left as usize).min(right);
+        let top = (region.top as usize).min(bottom);
+        let src = src.data();
+        for y in top..=bottom {
+            let row = y * w * 4;
+            let a = row + left * 4;
+            let b = row + (right + 1) * 4;
+            if b <= self.data.len() && b <= src.len() {
+                self.data[a..b].copy_from_slice(&src[a..b]);
+            }
+        }
+    }
+}
+
+impl FrameView for CompositeFrame {
+    fn data(&self) -> &[u8] {
+        &self.data
+    }
+    fn width(&self) -> u16 {
+        self.width
+    }
+    fn height(&self) -> u16 {
+        self.height
+    }
+}
+
 /// Callbacks for an active RDP session: receive framebuffer updates.
 pub trait SessionSink: Send {
     /// Called when a region of the framebuffer changed. `frame` is the full
@@ -441,6 +507,9 @@ pub async fn run_active_session(
     // drops). The SCCM RC server paints via drawing orders; `order_frag`
     // reassembles fragmented order updates.
     let mut orders = OrderProcessor::new(width, height, ColorDepth::Bpp16);
+    // Unified framebuffer compositing the order renderer and IronRDP's bitmap/
+    // surface output, so the sink always sees the complete desktop.
+    let mut composite = CompositeFrame::new(width, height);
     let mut order_frag: Vec<u8> = Vec::new();
     let mut order_frag_active = false;
     // Dump the first few complete order streams raw, for offline verification
@@ -484,6 +553,14 @@ pub async fn run_active_session(
             }
             Err(e) => warn!(error = %e, "failed to encode sessarb arbitration event"),
         }
+    }
+
+    // SCCM RC WLC desktop capability handshake (SCCM_RC_WLC=1). The MSTSC
+    // capability envelope + control TLVs over the I/O channel are what make the
+    // server begin desktop fast-path graphics. Sent both here (first activation)
+    // and again after reactivation, mirroring the real CmRcViewer.
+    if std::env::var("SCCM_RC_WLC").as_deref() == Ok("1") {
+        send_wlc_desktop_caps(session, user_channel_id, io_channel_id).await?;
     }
 
     // Force an initial full-screen repaint. Without this, a static remote
@@ -555,7 +632,14 @@ pub async fn run_active_session(
                 if let Some(complete) =
                     reassemble_orders(&mut order_frag, &mut order_frag_active, frag, data)
                 {
-                    if order_dump_count < 5 {
+                    // Dump order streams to disk for offline replay/debug. Default
+                    // 5; SCCM_RC_DUMP_ORDERS=N raises the cap (N up to a few hundred
+                    // captures a full desktop paint).
+                    let dump_cap: u32 = std::env::var("SCCM_RC_DUMP_ORDERS")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(5);
+                    if order_dump_count < dump_cap {
                         order_dump_count += 1;
                         let path = std::env::temp_dir()
                             .join(format!("sccm-orders-{order_dump_count:03}.bin"));
@@ -583,7 +667,23 @@ pub async fn run_active_session(
                             if let Some(r) = outcome.dirty {
                                 frames += 1;
                                 let region = order_region(orders.canvas(), r);
-                                sink.on_graphics_update(orders.canvas(), region);
+                                composite.blit(orders.canvas(), region);
+                                sink.on_graphics_update(&composite, region);
+                            } else if std::env::var("SCCM_RC_FORCE_PAINT").as_deref() == Ok("1")
+                                && pdus % 40 == 0
+                            {
+                                // Diagnostic: flush the whole composite even with no
+                                // dirty region, to see whether pixels are landing.
+                                frames += 1;
+                                let (w, h) = (composite.width(), composite.height());
+                                composite.blit(
+                                    orders.canvas(),
+                                    UpdateRegion { left: 0, top: 0, right: w.saturating_sub(1), bottom: h.saturating_sub(1) },
+                                );
+                                sink.on_graphics_update(
+                                    &composite,
+                                    UpdateRegion { left: 0, top: 0, right: w.saturating_sub(1), bottom: h.saturating_sub(1) },
+                                );
                             }
                         }
                         Err(e) => warn!(error = %e, "order stream decode failed"),
@@ -593,9 +693,22 @@ pub async fn run_active_session(
             }
         }
 
-        let outputs = stage
-            .process(&mut image, pdu_info.action, &frame)
-            .map_err(|e| Error::Protocol(format!("active-stage: {e}")))?;
+        let outputs = match stage.process(&mut image, pdu_info.action, &frame) {
+            Ok(o) => o,
+            Err(e) => {
+                // After arbitration HostAllowed the SCCM server restarts the
+                // session (Server Control PDUs: Cooperate / Granted Control, Font
+                // Map, etc.) before the reactivation DemandActive. IronRDP's active
+                // stage treats these as a fatal "unhandled PDU"; swallow them so the
+                // session survives to the reactivation + graphics.
+                let msg = e.to_string();
+                if msg.contains("unhandled PDU") {
+                    debug!(error = %msg, "ignoring benign unhandled PDU in active session");
+                    continue;
+                }
+                return Err(Error::Protocol(format!("active-stage: {e}")));
+            }
+        };
 
         if !outputs.is_empty() {
             let kinds: Vec<&str> = outputs
@@ -621,15 +734,14 @@ pub async fn run_active_session(
                 }
                 ActiveStageOutput::GraphicsUpdate(r) => {
                     frames += 1;
-                    sink.on_graphics_update(
-                        &image,
-                        UpdateRegion {
-                            left: r.left,
-                            top: r.top,
-                            right: r.right,
-                            bottom: r.bottom,
-                        },
-                    );
+                    let region = UpdateRegion {
+                        left: r.left,
+                        top: r.top,
+                        right: r.right,
+                        bottom: r.bottom,
+                    };
+                    composite.blit(&image, region);
+                    sink.on_graphics_update(&composite, region);
                 }
                 ActiveStageOutput::Terminate(reason) => {
                     warn!(?reason, frames, pdus, "RDP session terminated by server");
@@ -659,8 +771,18 @@ pub async fn run_active_session(
                     user_channel_id = new_result.user_channel_id;
                     image = DecodedImage::new(PixelFormat::RgbA32, width, height);
                     orders.resize(width, height);
+                    composite.resize(width, height);
                     stage = ActiveStage::new(new_result);
                     info!(width, height, share_id, "reactivation complete — active session resumed");
+                    // Re-send the WLC desktop handshake after the shadow-attach
+                    // reactivation — this is what triggers the server to start the
+                    // desktop capture/stream. (SCCM_RC_WLC_ONCE=1 sends it only on the
+                    // first activation, to A/B whether it causes the later desync.)
+                    if std::env::var("SCCM_RC_WLC").as_deref() == Ok("1")
+                        && std::env::var("SCCM_RC_WLC_ONCE").as_deref() != Ok("1")
+                    {
+                        send_wlc_desktop_caps(session, user_channel_id, io_channel_id).await?;
+                    }
                     // Repaint after reactivation too (with the server's share_id).
                     send_refresh_rect(session, user_channel_id, io_channel_id, share_id, width, height).await?;
                     break; // restart the outer read loop with the new stage
@@ -684,6 +806,10 @@ fn decode_fastpath_orders(frame: &[u8]) -> Option<(Fragmentation, Vec<u8>)> {
     let update = decode_cursor::<FastPathUpdatePdu<'_>>(&mut cur).ok()?;
     if update.update_code != UpdateCode::Orders {
         return None;
+    }
+    if let Some(cf) = update.compression_flags {
+        debug!(compression_flags = ?cf, frag = ?update.fragmentation, data = update.data.len(),
+            "fastpath ORDERS update is COMPRESSED");
     }
     Some((update.fragmentation, update.data.to_vec()))
 }
@@ -735,6 +861,120 @@ fn order_region(canvas: &OrderCanvas, r: sccm_rc_orders::Rect) -> UpdateRegion {
         right: clampx(r.right() - 1),
         bottom: clampy(r.bottom() - 1),
     }
+}
+
+// ---------------------------------------------------------------------------
+// WLC desktop capability handshake (captured from the real CmRcViewer, 2026-06-03;
+// see experiments/captures/DECODE.md). These are the client->server messages on
+// the I/O channel (MCS id 03eb) that make the SCCM RC server begin sending desktop
+// fast-path graphics. They are constant capability advertisements wrapped in the
+// WLC inner envelope `[u16 innerLen][u16 type][u16 src=03f4][u16 dst=03ea]...`,
+// replayed verbatim. WLC_MSTSC = the "MSTSC" capability envelope (C#16); WLC_TLV1..4
+// = the curtain/dynres/dskcfg control TLVs (C#17..20). IronRDP re-adds the MCS
+// Send-Data header, so these are the raw user-data payloads only.
+// Kept for reference; the ConfirmActive is now emitted by the vendored connector.
+#[allow(dead_code)]
+const WLC_MSTSC: &[u8] = &[
+    0xea, 0x01, 0x13, 0x00, 0xf4, 0x03, 0xea, 0x03, 0x01, 0x00, 0xea, 0x03, 0x06, 0x00, 0xd4, 0x01,
+    0x4d, 0x53, 0x54, 0x53, 0x43, 0x00, 0x15, 0x00, 0x00, 0x00, 0x01, 0x00, 0x18, 0x00, 0x01, 0x00,
+    0x03, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x02, 0x00, 0x1c, 0x00, 0x10, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x70, 0x04,
+    0x58, 0x02, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x18, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00,
+    0x58, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x14, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0xaa, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x01, 0x01, 0x01, 0x00, 0x01, 0x00, 0x00,
+    0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xa1, 0x06, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x84, 0x03, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0xe4, 0x04, 0x00, 0x00, 0x13, 0x00, 0x28, 0x00, 0x02, 0x00, 0x00, 0x03, 0x78, 0x00,
+    0x00, 0x00, 0x78, 0x00, 0x00, 0x00, 0x51, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00,
+    0x08, 0x00, 0x06, 0x00, 0x00, 0x00, 0x07, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x05, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02, 0x00, 0x08, 0x00,
+    0x0a, 0x00, 0x01, 0x00, 0x14, 0x00, 0x15, 0x00, 0x09, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x0d, 0x00, 0x58, 0x00, 0xb1, 0x00, 0x00, 0x00, 0x09, 0x04, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00,
+    0x0e, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x10, 0x00, 0x34, 0x00, 0xfe, 0x00, 0x04, 0x00,
+    0xfe, 0x00, 0x04, 0x00, 0xfe, 0x00, 0x08, 0x00, 0xfe, 0x00, 0x08, 0x00, 0xfe, 0x00, 0x10, 0x00,
+    0xfe, 0x00, 0x20, 0x00, 0xfe, 0x00, 0x40, 0x00, 0xfe, 0x00, 0x80, 0x00, 0xfe, 0x00, 0x00, 0x01,
+    0x40, 0x00, 0x00, 0x08, 0x00, 0x01, 0x00, 0x01, 0x03, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x08, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x11, 0x00, 0x0c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x14, 0x64, 0x00,
+    0x14, 0x00, 0x0c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x15, 0x00, 0x0c, 0x00,
+    0x02, 0x00, 0x00, 0x00, 0x00, 0x0a, 0x00, 0x01, 0x1a, 0x00, 0x08, 0x00, 0x2b, 0x48, 0x09, 0x00,
+    0x1c, 0x00, 0x0c, 0x00, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1b, 0x00, 0x06, 0x00,
+    0x01, 0x00, 0x1e, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00,
+];
+const WLC_TLV1: &[u8] = &[
+    0x16, 0x00, 0x17, 0x00, 0xf4, 0x03, 0xea, 0x03, 0x01, 0x00, 0x00, 0x01, 0x08, 0x00, 0x1f, 0x00,
+    0x00, 0x00, 0x01, 0x00, 0xea, 0x03,
+];
+const WLC_TLV2: &[u8] = &[
+    0x1a, 0x00, 0x17, 0x00, 0xf4, 0x03, 0xea, 0x03, 0x01, 0x00, 0x00, 0x01, 0x0c, 0x00, 0x14, 0x00,
+    0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+const WLC_TLV3: &[u8] = &[
+    0x1a, 0x00, 0x17, 0x00, 0xf4, 0x03, 0xea, 0x03, 0x01, 0x00, 0x00, 0x01, 0x0c, 0x00, 0x14, 0x00,
+    0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+const WLC_TLV4: &[u8] = &[
+    0x1a, 0x00, 0x17, 0x00, 0xf4, 0x03, 0xea, 0x03, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x27, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x32, 0x00,
+];
+
+/// A raw WLC user-data payload sent over the MCS I/O channel. The WLC desktop
+/// protocol is not a Share PDU, so we emit the captured bytes verbatim and let
+/// `encode_send_data_request` wrap them in the MCS Send-Data header.
+struct WlcRawPdu<'a> {
+    payload: &'a [u8],
+}
+
+impl ironrdp_core::Encode for WlcRawPdu<'_> {
+    fn encode(&self, dst: &mut ironrdp_core::WriteCursor<'_>) -> ironrdp_core::EncodeResult<()> {
+        dst.write_slice(self.payload);
+        Ok(())
+    }
+    fn name(&self) -> &'static str {
+        "WlcRawPdu"
+    }
+    fn size(&self) -> usize {
+        self.payload.len()
+    }
+}
+
+/// Send the WLC desktop capability handshake (MSTSC envelope + curtain/dynres/
+/// dskcfg control TLVs) over the I/O channel. This is the trigger the SCCM RC
+/// server waits for before it starts sending desktop fast-path graphics; without
+/// it, arbitration + reactivation succeed but no pixels ever arrive.
+async fn send_wlc_desktop_caps(
+    session: &mut SccmSession,
+    user_channel_id: u16,
+    io_channel_id: u16,
+) -> Result<()> {
+    // NOTE: the "MSTSC" ConfirmActive is now emitted by the vendored connector
+    // (SCCM_RC_MSTSC_CAPS=1); sending it here too would be a duplicate ConfirmActive.
+    // We only send the 4 WLC control Share-Data PDUs (curtain/dynres/dskcfg).
+    for (label, payload) in [
+        ("TLV1", WLC_TLV1),
+        ("TLV2", WLC_TLV2),
+        ("TLV3", WLC_TLV3),
+        ("TLV4", WLC_TLV4),
+    ] {
+        let mut out = WriteBuf::new();
+        ironrdp_connector::legacy::encode_send_data_request(
+            user_channel_id,
+            io_channel_id,
+            &WlcRawPdu { payload },
+            &mut out,
+        )
+        .map_err(|e| Error::Protocol(format!("encode WLC {label}: {e}")))?;
+        session.send_rdp(out.filled()).await?;
+        debug!(label, len = payload.len(), "sent WLC desktop message");
+    }
+    info!("sent WLC desktop capability handshake (MSTSC + 4 control TLVs)");
+    Ok(())
 }
 
 /// Send an (empty) Persistent Bitmap Cache Key List PDU. mstscax sends a flood
@@ -987,12 +1227,19 @@ impl SessionSink for PngDumpSink {
             }
         }
         self.nonblack_pixels = nonblack;
-        // Save as PNG (RGBA).
+        // Save as PNG (RGBA). Write to a temp file then rename, so a reader (or a
+        // killed process) never sees a half-written/0-byte PNG.
         if let Some(buf) = image::RgbaImage::from_raw(w, h, data.to_vec()) {
-            if let Err(e) = buf.save(&self.path) {
-                warn!(error = %e, "png save failed");
-            } else {
-                info!(update = self.updates, fb = format!("{w}x{h}"), nonblack, path = %self.path, "saved frame PNG");
+            let tmp = format!("{}.tmp", self.path);
+            match buf.save_with_format(&tmp, image::ImageFormat::Png) {
+                Ok(()) => {
+                    if let Err(e) = std::fs::rename(&tmp, &self.path) {
+                        warn!(error = %e, "png rename failed");
+                    } else if self.updates <= 3 || self.updates % 25 == 0 {
+                        info!(update = self.updates, fb = format!("{w}x{h}"), nonblack, path = %self.path, "saved frame PNG");
+                    }
+                }
+                Err(e) => warn!(error = %e, "png save failed"),
             }
         }
     }
