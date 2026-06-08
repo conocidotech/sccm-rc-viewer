@@ -1377,6 +1377,10 @@ pub async fn run_active_session(
                     // corrupt it.
                     order_frag.clear();
                     order_frag_active = false;
+                    // Fresh decoder state after reactivation — don't carry a
+                    // pre-reactivation failure streak into the new desktop.
+                    order_fail_streak = 0;
+                    order_ok_streak = 0;
                     stage = ActiveStage::new(new_result);
                     sink.on_status("Bureaublad laden...");
                     info!(width, height, share_id, "reactivation complete — active session resumed");

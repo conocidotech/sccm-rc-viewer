@@ -82,3 +82,27 @@ pub fn decode(
 
     Ok(Bitmap::new(width, height, rgba))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_absurd_dimensions() {
+        // Dimensions past MAX_DIM must be rejected BEFORE any allocation (RRCV-8):
+        // a 5000x5000 RGBA buffer would be ~100 MB, 0x7FFF² would be ~4 GB.
+        let data = [0u8; 16];
+        assert!(decode(&data, 5000, 10, ColorDepth::Bpp16, false, None).is_err());
+        assert!(decode(&data, 10, 5000, ColorDepth::Bpp16, false, None).is_err());
+        // Zero-area tiles are rejected too.
+        assert!(decode(&data, 0, 10, ColorDepth::Bpp16, false, None).is_err());
+        assert!(decode(&data, 10, 0, ColorDepth::Bpp16, false, None).is_err());
+    }
+
+    #[test]
+    fn accepts_normal_tile() {
+        // A normal small uncompressed 2x2 16bpp tile (8 source bytes) decodes.
+        let data = [0u8; 2 * 2 * 2];
+        assert!(decode(&data, 2, 2, ColorDepth::Bpp16, false, None).is_ok());
+    }
+}

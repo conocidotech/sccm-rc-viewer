@@ -83,8 +83,8 @@ impl Rect {
         Rect {
             x,
             y,
-            w: right - x,
-            h: bottom - y,
+            w: right.saturating_sub(x),
+            h: bottom.saturating_sub(y),
         }
     }
 }
@@ -341,5 +341,39 @@ impl OrderCanvas {
             }
         }
         clipped
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rect_arithmetic_is_overflow_safe() {
+        // Extreme / inverted edges must saturate, not panic (RRCV-9).
+        let r = Rect::from_inclusive(i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+        let _ = (r.right(), r.bottom());
+        let a = Rect::from_ltwh(0, 0, i32::MAX, i32::MAX);
+        let b = Rect::from_ltwh(i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+        let _ = a.intersect(&b); // must not panic
+        let _ = a.union(&b); // must not panic
+        // A normal intersection is still computed correctly.
+        let i = Rect::from_ltwh(0, 0, 100, 100).intersect(&Rect::from_ltwh(50, 50, 100, 100));
+        assert_eq!((i.x, i.y, i.w, i.h), (50, 50, 50, 50));
+    }
+
+    #[test]
+    fn canvas_put_get_out_of_bounds_is_noop() {
+        // The in_bounds guard must turn an out-of-range write into a no-op rather
+        // than an out-of-bounds index (RRCV-9 defense-in-depth).
+        let mut c = OrderCanvas::new(4, 4);
+        c.put(1_000_000, 1_000_000, [1, 2, 3, 4]);
+        c.put(-5, -5, [1, 2, 3, 4]);
+        assert!(c.data().iter().all(|&b| b == 0), "OOB put must not modify the buffer");
+        assert_eq!(c.get(-1, -1), [0, 0, 0, 0xff], "OOB get returns the opaque fallback");
+        assert_eq!(c.get(4, 4), [0, 0, 0, 0xff]);
+        // In-bounds round-trip still works (alpha forced opaque).
+        c.put(2, 2, [10, 20, 30, 0]);
+        assert_eq!(c.get(2, 2), [10, 20, 30, 0xff]);
     }
 }

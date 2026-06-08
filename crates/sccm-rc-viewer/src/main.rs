@@ -474,7 +474,19 @@ async fn run_session(
 ) -> anyhow::Result<()> {
     shared.lock().unwrap().status = format!("Verbinden met {target}...");
     let _ = proxy.send_event(UserEvent::Frame);
-    let mut session = SccmSession::connect(target).await?;
+    // Bound the WHOLE bring-up (TCP connect + SSPI handshake + grant), not just
+    // the TCP connect: a peer that completes the TCP handshake but then stalls
+    // mid-greeting/SSPI would otherwise hang this session thread indefinitely and
+    // leak it past a host-switch. 20 s is far above a healthy sub-second connect.
+    let mut session = match tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        SccmSession::connect(target),
+    )
+    .await
+    {
+        Ok(r) => r?,
+        Err(_) => anyhow::bail!("verbinden met {target} duurde te lang (time-out)"),
+    };
     shared.lock().unwrap().status = "Beeldverbinding opzetten...".to_string();
     let _ = proxy.send_event(UserEvent::Frame);
     // Best-effort: remember this host's MAC (from the ARP table now that we've
