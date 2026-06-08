@@ -396,6 +396,16 @@ impl SspiSession {
         let token_len = bufs[0].cbBuffer as usize;
         let data_len = bufs[1].cbBuffer as usize;
 
+        // The wire format prefixes each part with a u16 length. RDP PDUs handed to
+        // send_rdp stay well under 64 KB (MCS/TPKT framing), but guard the cast so
+        // an oversized chunk errors loudly instead of silently truncating the
+        // length and corrupting the frame.
+        if data_len > u16::MAX as usize || token_len > u16::MAX as usize {
+            return Err(Error::Protocol(format!(
+                "sealed frame exceeds u16 length prefix: data={data_len} token={token_len}"
+            )));
+        }
+
         let mut out = Vec::with_capacity(2 + data_len + 2 + token_len);
         out.extend_from_slice(&(data_len as u16).to_le_bytes());
         out.extend_from_slice(&data[..data_len]);
