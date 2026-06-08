@@ -25,6 +25,14 @@ pub fn decode(
     let w = width as usize;
     let h = height as usize;
 
+    // DoS guard: cache-bitmap tiles are small. A malformed Cache Bitmap Rev2 can
+    // declare dimensions up to 0x7FFF each → `w*h*4` ≈ 4 GB allocated before any
+    // data is even read. Reject absurd dimensions before allocating.
+    const MAX_DIM: usize = 4096;
+    if w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM {
+        return Err(OrderError::Malformed("bitmap dimensions out of range"));
+    }
+
     // Source pixels, bottom-up, in the session bpp.
     let raw: std::borrow::Cow<'_, [u8]> = if compressed {
         let mut out = Vec::with_capacity(w * h * bpp);

@@ -178,13 +178,17 @@ impl SspiSession {
 
         let mut context_attr: u32 = 0;
         let mut expiry: i64 = 0;
-        // Minimal flag set — dropped MUTUAL_AUTH / REPLAY_DETECT / SEQUENCE_DETECT
-        // / INTEGRITY to see if the SCCM server is strict about any of those.
-        // (Diagnostic mode after observing CmRcViewer succeeds with what we suspect
-        //  is a looser flag set.)
-        let flags = ISC_REQ_ALLOCATE_MEMORY | ISC_REQ_CONFIDENTIALITY | ISC_REQ_CONNECTION;
-        // Suppress unused warning while diagnosing:
-        let _ = (ISC_REQ_INTEGRITY, ISC_REQ_REPLAY_DETECT, ISC_REQ_SEQUENCE_DETECT, ISC_REQ_MUTUAL_AUTH);
+        // Standard SSPI flag set (mirrors mstscax): confidentiality + integrity +
+        // replay/sequence detection + mutual auth. This makes the sealed channel
+        // reject tampered, replayed or reordered frames and proves the server's
+        // identity (Kerberos). ISC_RET_* is verified after the handshake.
+        let flags = ISC_REQ_ALLOCATE_MEMORY
+            | ISC_REQ_CONFIDENTIALITY
+            | ISC_REQ_INTEGRITY
+            | ISC_REQ_REPLAY_DETECT
+            | ISC_REQ_SEQUENCE_DETECT
+            | ISC_REQ_MUTUAL_AUTH
+            | ISC_REQ_CONNECTION;
 
         let ctxt_in: Option<*const SecHandle> = if self.ctxt_initialized {
             Some(self.ctxt.as_mut() as *const _)
@@ -446,6 +450,13 @@ impl SspiSession {
         });
         if status != SEC_E_OK_RAW {
             return Err(Error::Sspi(format!("DecryptMessage failed: 0x{status:08X}")));
+        }
+        // Reject a frame that was only signed, not encrypted: we treat this channel
+        // as confidential, so an on-path attacker must not be able to feed us
+        // unencrypted-but-authenticated data. A properly sealed frame returns qop=0.
+        const SECQOP_WRAP_NO_ENCRYPT: u32 = 0x8000_0001;
+        if qop == SECQOP_WRAP_NO_ENCRYPT {
+            return Err(Error::Sspi("unsealed frame was not encrypted (QOP no-encrypt)".into()));
         }
 
         // Plaintext is in the DATA buffer (decrypted in place).

@@ -2,7 +2,6 @@
 //! from the ARP table after a successful connect (so a later attempt to a powered-
 //! off host can wake it). Cache: `%LOCALAPPDATA%\sccm-rc\macs.txt` (`host=MAC`).
 
-use std::io::Write;
 use std::net::{ToSocketAddrs, UdpSocket};
 
 /// Parse a MAC like `AA-BB-CC-DD-EE-FF` / `aa:bb:...` / `aabbccddeeff`.
@@ -75,8 +74,12 @@ pub fn cache_mac(host: &str, mac: [u8; 6]) {
         .map(|l| l.to_string())
         .collect();
     lines.push(format!("{host}={}", fmt_mac(mac)));
-    if let Ok(mut f) = std::fs::File::create(cache_path()) {
-        let _ = f.write_all(lines.join("\r\n").as_bytes());
+    // Atomic write (temp + rename) so concurrent viewer instances can't clobber
+    // the cache or leave it half-written.
+    let p = cache_path();
+    let tmp = p.with_extension("tmp");
+    if std::fs::write(&tmp, lines.join("\r\n").as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &p);
     }
 }
 

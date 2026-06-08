@@ -87,7 +87,19 @@ impl SccmSession {
                 .to_vec();
         }
         sspi.message_sizes()?; // establishes + caches the sealing sizes
-        info!("SSPI handshake complete");
+        // Fail closed: we requested confidentiality and every RDP frame is sealed.
+        // If the peer did not grant an encrypting context, refuse rather than
+        // silently send "sealed" frames that may not actually be encrypted.
+        if !sspi.confidentiality() {
+            return Err(Error::Protocol(
+                "server did not negotiate an encrypted (confidential) channel".into(),
+            ));
+        }
+        info!(
+            mutual_auth = sspi.mutual_auth(),
+            package = ?sspi.package_name(),
+            "SSPI handshake complete"
+        );
 
         // 3. data-phase control grant
         let grant_frame = conn
@@ -121,15 +133,14 @@ impl SccmSession {
 
     /// Transport security for the UI: `(encrypted, server_verified, package)`.
     /// `encrypted` = the SSPI context negotiated confidentiality (every RDP frame
-    /// is sealed/encrypted). `server_verified` = the package is Kerberos, which
-    /// proves the server holds the target's service key (the SSPI equivalent of a
-    /// valid certificate); NTLM authenticates us to the server but not vice-versa.
+    /// is sealed/encrypted). `server_verified` = mutual authentication succeeded —
+    /// the granted `ISC_RET_MUTUAL_AUTH` bit, which proves the server holds the
+    /// target's service key (the SSPI equivalent of a valid certificate). Kerberos
+    /// grants this; NTLM authenticates us to the server but not vice-versa.
     pub fn security(&self) -> (bool, bool, Option<String>) {
         let encrypted = self.sspi.confidentiality();
+        let verified = self.sspi.mutual_auth();
         let package = self.sspi.package_name();
-        let verified = package
-            .as_deref()
-            .map_or(false, |p| p.eq_ignore_ascii_case("Kerberos"));
         (encrypted, verified, package)
     }
 

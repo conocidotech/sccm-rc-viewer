@@ -32,20 +32,22 @@ impl Rect {
     /// Build from inclusive left/top/right/bottom (RDP bounds use inclusive
     /// right/bottom).
     pub fn from_inclusive(left: i32, top: i32, right: i32, bottom: i32) -> Self {
+        // Saturating: bounds edges are independent wire deltas with no ordering
+        // guarantee; a `right < left` or extreme value must not overflow-panic.
         Self {
             x: left,
             y: top,
-            w: right - left + 1,
-            h: bottom - top + 1,
+            w: right.saturating_sub(left).saturating_add(1),
+            h: bottom.saturating_sub(top).saturating_add(1),
         }
     }
 
     pub fn right(&self) -> i32 {
-        self.x + self.w
+        self.x.saturating_add(self.w)
     }
 
     pub fn bottom(&self) -> i32 {
-        self.y + self.h
+        self.y.saturating_add(self.h)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -61,8 +63,8 @@ impl Rect {
         Rect {
             x,
             y,
-            w: right - x,
-            h: bottom - y,
+            w: right.saturating_sub(x),
+            h: bottom.saturating_sub(y),
         }
     }
 
@@ -158,14 +160,29 @@ impl OrderCanvas {
         (y as usize * self.width as usize + x as usize) * 4
     }
 
+    /// In-bounds guard for `get`/`put`. Defense-in-depth: callers go through
+    /// `clip()`, but if a rect-arithmetic overflow ever broke that invariant,
+    /// `idx()`'s `as usize` cast on a negative/oversized coord would wrap to a
+    /// huge index and write out of bounds. This keeps such a bug a no-op.
+    #[inline]
+    fn in_bounds(&self, x: i32, y: i32) -> bool {
+        x >= 0 && y >= 0 && (x as usize) < self.width as usize && (y as usize) < self.height as usize
+    }
+
     #[inline]
     fn get(&self, x: i32, y: i32) -> [u8; 4] {
+        if !self.in_bounds(x, y) {
+            return [0, 0, 0, 0xff];
+        }
         let i = self.idx(x, y);
         [self.data[i], self.data[i + 1], self.data[i + 2], self.data[i + 3]]
     }
 
     #[inline]
     fn put(&mut self, x: i32, y: i32, c: [u8; 4]) {
+        if !self.in_bounds(x, y) {
+            return;
+        }
         let i = self.idx(x, y);
         self.data[i] = c[0];
         self.data[i + 1] = c[1];

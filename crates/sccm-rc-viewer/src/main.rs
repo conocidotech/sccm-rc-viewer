@@ -1031,9 +1031,13 @@ impl App {
                 // tried but needs a full per-frame copy to erase the client cursor,
                 // costing ~the same; the 60 fps paint cap is the real client win.)
                 let map = |dst: u32, dst_n: u32, src_n: u32| -> (usize, usize, u32) {
+                    // saturating_sub guards a 0-dim source (the `connected` check
+                    // upstream already ensures src_n > 0, but the invariant is
+                    // non-local — don't let it underflow-panic here).
+                    let max_i = (src_n as usize).saturating_sub(1);
                     let s = (((dst as f64 + 0.5) * src_n as f64 / dst_n as f64) - 0.5).max(0.0);
-                    let i0 = (s as usize).min(src_n as usize - 1);
-                    let i1 = (i0 + 1).min(src_n as usize - 1);
+                    let i0 = (s as usize).min(max_i);
+                    let i1 = (i0 + 1).min(max_i);
                     (i0, i1, ((s - i0 as f64) * 256.0) as u32)
                 };
                 let cols: Vec<(usize, usize, u32)> =

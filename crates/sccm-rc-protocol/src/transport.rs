@@ -38,13 +38,27 @@ impl RawConnection {
     pub async fn connect(host: &str) -> Result<Self> {
         let addr = format!("{host}:{SCCM_RC_PORT}");
         debug!(%addr, "TCP connect");
-        let stream = TcpStream::connect(&addr).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::ConnectionRefused {
-                Error::Refused
-            } else {
-                Error::Io(e)
+        // Bound the connect: a dead route (e.g. after a VPN drop) makes
+        // TcpStream::connect hang indefinitely, which would keep a session thread
+        // alive past a host-switch / shutdown. 10 s is far above a healthy
+        // sub-second connect; on timeout the reconnect loop retries cleanly.
+        const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+        let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                return Err(if e.kind() == std::io::ErrorKind::ConnectionRefused {
+                    Error::Refused
+                } else {
+                    Error::Io(e)
+                });
             }
-        })?;
+            Err(_elapsed) => {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("TCP connect to {addr} timed out after {CONNECT_TIMEOUT:?}"),
+                )));
+            }
+        };
         // Disable Nagle: this is an interactive remote-control stream, so small
         // input/ack frames must go out immediately rather than being batched
         // (Nagle adds up to ~40 ms of latency to every keystroke/mouse move).

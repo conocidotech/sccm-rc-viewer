@@ -140,8 +140,12 @@ fn decode_length(br: &mut BitReader) -> u32 {
     let mut n = 0u32;
     while br.read_bit() == 1 {
         n += 1;
-        if n > 30 {
-            break; // guard against a runaway / malformed stream
+        if n >= 30 {
+            // Guard against a runaway / malformed stream. Cap at n=30 so
+            // `bits` never exceeds 31: `1u32 << 32` (and `read(32)`) would
+            // overflow. Valid RDP5/64K match lengths only reach n=14, and an
+            // over-long length is caught by the history bounds checks anyway.
+            break;
         }
     }
     if n == 0 {

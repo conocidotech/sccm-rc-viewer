@@ -888,14 +888,27 @@ pub async fn run_active_session(
     // Dump the first few complete order streams raw, for offline verification
     // of cache-bitmap encoding / compression-header assumptions.
     let mut order_dump_count = 0u32;
-    // Consecutive order-stream decode failures. A handful of genuinely
-    // unsupported orders is fine, but a long run of failures means the order
-    // stream has desynced (e.g. the stateful MPPC history diverged and now
-    // decompresses to garbage) — which never self-heals, so the picture freezes.
-    // Past this many in a row we bail out and let the reconnect loop rebuild the
-    // session, which resets the MPPC history / order state.
+    // Diagnostic env flags, read ONCE here (not per-PDU in the hot loop).
+    let order_dump_cap: u32 = std::env::var("SCCM_RC_DUMP_ORDERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5);
+    let force_paint = std::env::var("SCCM_RC_FORCE_PAINT").as_deref() == Ok("1");
+    // Order-stream decode-failure tracking. A handful of genuinely unsupported
+    // orders is fine, but a sustained run of failures means the order stream has
+    // desynced (e.g. the stateful MPPC history diverged and now decompresses to
+    // garbage) — which never self-heals, so the picture freezes. We bail and let
+    // the reconnect loop rebuild the session (resetting MPPC/order state).
+    //
+    // A desynced stream yields a MIX of Err and the odd stray Ok, so a hard
+    // reset-to-0 on every success could keep the streak pinned below the limit
+    // forever. Instead the streak is only cleared after ORDER_OK_RESET
+    // *consecutive* clean streams; sporadic single successes never reach that,
+    // so the streak still climbs to ORDER_FAIL_RECONNECT and triggers recovery.
     let mut order_fail_streak = 0u32;
+    let mut order_ok_streak = 0u32;
     const ORDER_FAIL_RECONNECT: u32 = 60;
+    const ORDER_OK_RESET: u32 = 8;
 
     // Seed with any PDUs left over from the connection sequence (initial paint).
     let mut buf: Vec<u8> = initial_buf;
@@ -1193,11 +1206,7 @@ pub async fn run_active_session(
                     // Dump order streams to disk for offline replay/debug. Default
                     // 5; SCCM_RC_DUMP_ORDERS=N raises the cap (N up to a few hundred
                     // captures a full desktop paint).
-                    let dump_cap: u32 = std::env::var("SCCM_RC_DUMP_ORDERS")
-                        .ok()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(5);
-                    if order_dump_count < dump_cap {
+                    if order_dump_count < order_dump_cap {
                         order_dump_count += 1;
                         let path = std::env::temp_dir()
                             .join(format!("sccm-orders-{order_dump_count:03}.bin"));
@@ -1223,7 +1232,12 @@ pub async fn run_active_session(
                     }
                     match order_result {
                         Ok(outcome) => {
-                            order_fail_streak = 0; // healthy stream — reset the desync counter
+                            // Healthy stream: clear the desync counter only after a
+                            // run of consecutive clean streams (see ORDER_OK_RESET).
+                            order_ok_streak = order_ok_streak.saturating_add(1);
+                            if order_ok_streak >= ORDER_OK_RESET {
+                                order_fail_streak = 0;
+                            }
                             debug!(
                                 orders = outcome.orders,
                                 skipped = outcome.skipped,
@@ -1233,8 +1247,7 @@ pub async fn run_active_session(
                                 let region = order_region(orders.canvas(), r);
                                 composite.blit(orders.canvas(), region);
                                 pending = union_region(pending, region);
-                            } else if std::env::var("SCCM_RC_FORCE_PAINT").as_deref() == Ok("1")
-                                && pdus % 40 == 0
+                            } else if force_paint && pdus % 40 == 0
                             {
                                 // Diagnostic: flush the whole composite even with no
                                 // dirty region, to see whether pixels are landing.
@@ -1251,6 +1264,7 @@ pub async fn run_active_session(
                             }
                         }
                         Err(e) => {
+                            order_ok_streak = 0;
                             order_fail_streak += 1;
                             warn!(error = %e, streak = order_fail_streak, "order stream decode failed");
                             if order_fail_streak >= ORDER_FAIL_RECONNECT {
@@ -1357,6 +1371,12 @@ pub async fn run_active_session(
                     // history would desync us from its (retained) history. We honor
                     // the on-wire PACKET_FLUSHED / PACKET_AT_FRONT flags instead.
                     decompressed_extra.clear();
+                    // Drop any half-assembled order fragment from the old desktop:
+                    // if reactivation lands mid FIRST..LAST, the leftover bytes would
+                    // be prepended to the first post-reactivation order stream and
+                    // corrupt it.
+                    order_frag.clear();
+                    order_frag_active = false;
                     stage = ActiveStage::new(new_result);
                     sink.on_status("Bureaublad laden...");
                     info!(width, height, share_id, "reactivation complete — active session resumed");
@@ -1907,9 +1927,14 @@ async fn flush_cursor_trail(
     last: &mut std::time::Instant,
 ) -> Result<()> {
     if let Some((left, top, right, bottom)) = trail.take() {
-        let rect = ironrdp_pdu::geometry::InclusiveRectangle { left, top, right, bottom };
-        send_refresh_area(session, user_channel_id, io_channel_id, share_id, rect).await?;
-        *last = std::time::Instant::now();
+        // Skip a degenerate/inverted rect: mouse coordinates beyond the desktop
+        // can make `left > right` (the min corner isn't clamped to the max), which
+        // would be a malformed RefreshRectangle on the wire.
+        if left <= right && top <= bottom {
+            let rect = ironrdp_pdu::geometry::InclusiveRectangle { left, top, right, bottom };
+            send_refresh_area(session, user_channel_id, io_channel_id, share_id, rect).await?;
+            *last = std::time::Instant::now();
+        }
     }
     Ok(())
 }

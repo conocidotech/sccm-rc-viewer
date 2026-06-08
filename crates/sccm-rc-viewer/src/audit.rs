@@ -16,6 +16,20 @@ fn audit_path() -> std::path::PathBuf {
     dir.join("audit.jsonl")
 }
 
+/// Rotate the audit log when it grows past a cap, keeping one previous
+/// generation (`audit.jsonl.1`). Best-effort — failures are ignored. Windows
+/// `rename` won't overwrite, so the stale backup is removed first.
+fn rotate_if_large(path: &std::path::Path) {
+    const MAX_BYTES: u64 = 5 * 1024 * 1024;
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_BYTES {
+            let bak = path.with_extension("jsonl.1");
+            let _ = std::fs::remove_file(&bak);
+            let _ = std::fs::rename(path, &bak);
+        }
+    }
+}
+
 fn epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -67,10 +81,12 @@ pub fn log_event(target: &str, grant: &str, event: &str, duration_s: Option<u64>
         esc(grant),
         dur
     );
+    let path = audit_path();
+    rotate_if_large(&path);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(audit_path())
+        .open(&path)
     {
         let _ = f.write_all(line.as_bytes());
     }

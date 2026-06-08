@@ -1,8 +1,6 @@
 //! Recent connection targets (most-recent-first), persisted to
 //! `%LOCALAPPDATA%\sccm-rc\recent.txt` — one host per line.
 
-use std::io::Write;
-
 const CAP: usize = 12;
 
 fn path() -> std::path::PathBuf {
@@ -36,7 +34,11 @@ pub fn add(host: &str) {
     list.retain(|h| !h.eq_ignore_ascii_case(host));
     list.insert(0, host.to_string());
     list.truncate(CAP);
-    if let Ok(mut f) = std::fs::File::create(path()) {
-        let _ = f.write_all(list.join("\r\n").as_bytes());
+    // Atomic write: a fully-written temp file renamed over the target, so a
+    // crash or a second viewer instance can't clobber it or leave it partial.
+    let p = path();
+    let tmp = p.with_extension("tmp");
+    if std::fs::write(&tmp, list.join("\r\n").as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &p);
     }
 }
