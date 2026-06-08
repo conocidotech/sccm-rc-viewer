@@ -17,6 +17,7 @@ anyhow.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 byteorder.workspace = true
+socket2.workspace = true
 clap.workspace = true
 windows.workspace = true
 

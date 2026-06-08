@@ -20,3 +20,9 @@ anyhow.workspace = true
 clap.workspace = true
 winit = "0.30"
 softbuffer = "0.4"
+# Tiny embedded 8x8 bitmap font — fallback when no system TTF is found.
+font8x8 = "0.3"
+# Anti-aliased proportional text (loads a Windows system font at runtime).
+ab_glyph = "0.2"
+# PNG encoding for session recording.
+image = { version = "0.25", default-features = false, features = ["png"] }

@@ -57,6 +57,10 @@ pub struct SspiSession {
     ctxt_initialized: bool,
     spn_wide: Vec<u16>,
     sizes: Option<MessageSizes>,
+    /// Granted SSPI context attributes (ISC_RET_*) from the last ISC call — used
+    /// to report whether confidentiality (encryption) and mutual auth were
+    /// negotiated.
+    context_attr: u32,
 }
 
 impl std::fmt::Debug for SspiSession {
@@ -131,6 +135,7 @@ impl SspiSession {
             ctxt_initialized: false,
             spn_wide: spn,
             sizes: None,
+            context_attr: 0,
         })
     }
 
@@ -210,6 +215,7 @@ impl SspiSession {
             )
         });
         self.ctxt_initialized = true;
+        self.context_attr = context_attr; // granted ISC_RET_* flags
 
         trace!(status = format!("0x{status:08X}"), output_bytes = out_buf.cbBuffer, "ISC returned");
 
@@ -285,6 +291,63 @@ impl SspiSession {
         } else {
             self.message_sizes()
         }
+    }
+
+    /// Whether the negotiated context encrypts messages (confidentiality).
+    pub fn confidentiality(&self) -> bool {
+        const ISC_RET_CONFIDENTIALITY: u32 = 0x0000_0010;
+        self.context_attr & ISC_RET_CONFIDENTIALITY != 0
+    }
+
+    /// Whether the server's identity was mutually authenticated (Kerberos proves
+    /// the server holds the service key for the SPN).
+    pub fn mutual_auth(&self) -> bool {
+        const ISC_RET_MUTUAL_AUTH: u32 = 0x0000_0002;
+        self.context_attr & ISC_RET_MUTUAL_AUTH != 0
+    }
+
+    /// The security package the Negotiate handshake settled on ("Kerberos" /
+    /// "NTLM"). Best-effort — `None` if the query fails.
+    pub fn package_name(&self) -> Option<String> {
+        if !self.ctxt_initialized {
+            return None;
+        }
+        use windows::Win32::Security::Authentication::Identity::{
+            SecPkgContext_NegotiationInfoW, SECPKG_ATTR_NEGOTIATION_INFO,
+        };
+        let mut info = MaybeUninit::<SecPkgContext_NegotiationInfoW>::zeroed();
+        let status = status_code(unsafe {
+            QueryContextAttributesW(
+                self.ctxt.as_ref() as *const _,
+                SECPKG_ATTR_NEGOTIATION_INFO,
+                info.as_mut_ptr() as *mut _,
+            )
+        });
+        if status != SEC_E_OK_RAW {
+            return None;
+        }
+        let info = unsafe { info.assume_init() };
+        let pkg = info.PackageInfo;
+        if pkg.is_null() {
+            return None;
+        }
+        // `Name` is a NUL-terminated UTF-16 pointer (`*mut u16`).
+        let name = unsafe {
+            let np = (*pkg).Name;
+            if np.is_null() {
+                None
+            } else {
+                let mut len = 0usize;
+                while *np.add(len) != 0 {
+                    len += 1;
+                }
+                Some(String::from_utf16_lossy(std::slice::from_raw_parts(np, len)))
+            }
+        };
+        unsafe {
+            let _ = FreeContextBuffer(pkg as *mut _);
+        }
+        name
     }
 
     /// Seal a plaintext application message for the SCCM data phase.

@@ -284,17 +284,21 @@ scancodes, `0xE000` extended prefix) and mouse (move / button / wheel) events.
 
 ## 12. Open questions / not-yet-captured
 
-- **Sealed-stream desync (`SEC_E_OUT_OF_SEQUENCE`)** ~20 s into busy sessions, around a
-  second reactivation and/or while sending input. Cause not yet captured (suspects:
-  `drive_reactivation` byte handling on the 2nd reactivation, or a server frame whose
-  body our framing mis-sizes under load). Diagnostics in place to capture it.
-- **HostInUse take-over.** How CmRcViewer proceeds to a desktop when the server reports
-  `HostInUse (1)` (lingering/concurrent session) — the take-over arbitration event(s)
-  are not yet captured (CmRcViewer sits on a "host in use" prompt when launched headless).
-- **WLC TLV semantics** (§9) — only partially decoded.
-- **Graceful disconnect / session release** — we currently drop the socket; a proper
-  release event would let the server free the host immediately (avoiding lingering-
-  session `HostInUse`).
+- **Sealed-stream desync (`SEC_E_OUT_OF_SEQUENCE`, "implausibly-large frame body")**
+  ~20 s into busy sessions. PARTLY UNDERSTOOD: `session.recv_rdp()` is **not cancel-safe** —
+  cancelling it mid-frame (e.g. from another `tokio::select!` branch) loses bytes and desyncs
+  the seal. A 150 ms control-timer branch made it reproduce every run; removing it fixed that.
+  A rarer baseline desync may remain around the 2nd reactivation. Rule: never put `recv_rdp`
+  in a `select!` with a frequently-firing branch.
+- ~~HostInUse take-over~~ **RESOLVED** (§7): on `HostInUse (1)` send the sessarb type-5
+  take-over event with the client machine name (1036 bytes) → server grants `HostAllowed (4)`.
+- ~~Graceful disconnect~~ **RESOLVED**: `SccmSession::disconnect()` sends an MCS
+  Disconnect-Provider-Ultimatum so the server releases the host.
+- **WLC TLV semantics** (§9) — still only partially decoded (resolution/desktop control).
+- ~~**MPPC cross-packet corruption** (`#79`)~~ — **RESOLVED 2026-06-05.** The bug was decompressing
+  fragments wrong: each fast-path fragment is an independent byte-aligned MPPC packet that shares the
+  persistent history; reassembly is at the plaintext/order layer (per FreeRDP `fastpath_recv_update_data`),
+  not at the compressed-byte layer. Fixed in `maybe_decompress`; compression now ON by default. See §14.1.
 
 ---
 
@@ -314,3 +318,57 @@ Reverse-engineering artifacts in this repo:
 - `crates/sccm-rc-orders/` — the MS-RDPEGDI order renderer (CBR2 + MemBlt + caches).
 - `crates/sccm-rc-core/src/rdp.rs` — connection, arbitration, WLC, reactivation, composite.
 - `vendor/ironrdp-connector/` — SCCM patches (mstscax Confirm Active, order caps).
+
+---
+
+## 14. Implemented protocol extensions (2026-06-04)
+
+### 14.1 Bulk compression — MPPC RDP5/64K (MS-RDPBCGR 3.1.8.4.2)
+Advertised in the Client Info PDU (`ClientInfoFlags::COMPRESSION` + `CompressionType::K64`,
+gated `SCCM_RC_COMPRESS=1`). The server then sets the fast-path update header compression bits
+(`uh & 0xC0 == 0x80`) and prefixes each update with `compressionFlags` (PACKET_COMPRESSED 0x20,
+PACKET_AT_FRONT 0x40, PACKET_FLUSHED 0x80) + a 2-byte size. Decoder in
+`crates/sccm-rc-protocol/src/mppc.rs`: MSB-first bit reader; literals `0`+7b / `10`+7b;
+CopyOffset `11111`+6b / `11110`+8b+64 / `1110`+11b+320 / `110`+16b+2368; LengthOfMatch
+`n` leading-ones → `2^(n+1)+val`; **circular 64K history** (`& 0xFFFF`, AT_FRONT keeps history).
+A fast-path PDU may concatenate several updates — decompress ALL in order to keep history in
+sync. **Fragmentation (`#79`):** when an update is split across FIRST/NEXT/LAST fast-path
+fragments, each fragment is an INDEPENDENT byte-aligned MPPC packet with its OWN compressionFlags
+that shares only the persistent history — so `maybe_decompress` decompresses each fragment on its
+own and rebuilds it as an uncompressed update *keeping its fragmentation* (`uh & 0x3F`), letting the
+order layer (`reassemble_orders`) join the plaintext. Do NOT reassemble the raw compressed bytes
+first (that splices one fragment's bit-padding into the next → desync). Proven against FreeRDP's
+`bells` + 2835→6496 vectors and a 126-record live capture replay (705 orders, 0 desync).
+
+### 14.2 No modern graphics (RDPEGFX/H.264) — confirmed absent
+The server speaks ONLY legacy orders/bitmaps + MPPC. Proven two ways: (a) advertising
+`drdynvc` + `SUPPORT_DYN_VC_GFX_PROTOCOL` (0x0100) → the server allocates+joins `drdynvc` but
+sends **zero** DVC PDUs (no Capability Request), so no Graphics dynamic channel; (b) the server
+binary `RdpCoreSccm.dll` imports only `gdi32`/`gdiplus` (no Media Foundation/DXVA/D3D) and its
+encoder classes are bitmap/JPEG/NSCodec/legacy — **no H.264/AVC**. So "upgrade RDP" is moot.
+
+### 14.3 Clipboard — MS-RDPECLIP over `cliprdr`
+`cliprdr` is a real distinct-type SVC (`CliprdrChannel`). `CLIPRDR_HEADER` = msgType(2) +
+msgFlags(2) + dataLen(4). Handshake: server `CB_MONITOR_READY` → client `CB_CLIP_CAPS` +
+`CB_FORMAT_LIST`. Remote→local: server `CB_FORMAT_LIST` → client `CB_FORMAT_LIST_RESPONSE` +
+`CB_FORMAT_DATA_REQUEST(CF_UNICODETEXT=13)` → server `CB_FORMAT_DATA_RESPONSE(UTF-16LE)`.
+Local→remote: poll the OS clipboard, send `CB_FORMAT_LIST`, answer `CB_FORMAT_DATA_REQUEST`.
+Short format names (no `CB_USE_LONG_FORMAT_NAMES`). Text only so far.
+
+### 14.4 Curtain (privacy screen-blank) — `curtain` channel
+RE'd from `RdpCoreSccm` `CRDPWLCCurtainVC` (no operator button in CmRcViewer → static RE only;
+`scripts/FindCurtain.java` + `DumpFuncAsm`). The curtain event uses the **same WLC event
+envelope as sessarb** — `[u32 fieldCount][u32 byteLen][fields…]` — here `[1][12][type]`
+(fieldCount 1, 12 bytes, one field = type). ENABLE type = 4+(arg≥0) = **5** (default),
+DISABLE = **6** (override via `SCCM_RC_CURTAIN_ON/OFF`). Sent via the channel COM method
+(`vtable+0x28`, the slot sessarb uses). The server echoes the same envelope (`[1][12][1]` init),
+confirming the format. Blanks the remote's PHYSICAL monitor; the operator view is unchanged.
+
+### 14.5 Ctrl+Alt+Del (SAS)
+Local hotkey **Ctrl+Alt+End** → inject the fast-path scancode batch Ctrl↓(0x1D) Alt↓(0x38)
+Del↓(EXTENDED 0x53) Del↑ Alt↑ Ctrl↑ to the remote (real Ctrl+Alt+Del is caught by the local OS).
+
+### 14.6 Channel registration gotcha
+`ironrdp_svc::StaticChannelSet` is keyed by `TypeId`, so multiple `PassiveChannel` instances
+**collide** — only the last + `ArbitrationChannel` ever joined. Each channel that must actually
+join (cliprdr, curtain, …) needs its **own distinct type**.

@@ -10,17 +10,25 @@ pub const WAITING_LIST_INDEX: usize = 0x7FFF;
 
 /// Bitmap cache: indexed by `(cache_id, cache_index)`. Grown on demand.
 ///
-/// The SCCM RC server paints the desktop as a grid of 64x64 tiles, caching every
-/// tile via Cache Bitmap Rev2 with the waiting-list index (0x7FFF) and then
-/// blitting them with MemBlt — referencing either 0x7FFF (the most-recent tile)
-/// or a real index 0,1,2,… (a previously waiting-listed tile, promoted in send
-/// order). We model that by assigning each waiting-list bitmap the next
-/// sequential real index per `cache_id`, and also remembering the last one.
+/// The SCCM RC server paints the desktop as a grid of 64x64 tiles. Tiles it will
+/// reuse are cached via Cache Bitmap Rev2 with an EXPLICIT, contiguous index
+/// (0,1,2,… per `cache_id`) and later re-blitted by MemBlt with that index. Tiles
+/// it uses only once are cached with the waiting-list index `0x7FFF` and blitted
+/// immediately via MemBlt(0x7FFF).
+///
+/// Critically, the `0x7FFF` (transient) bitmaps must NOT occupy real cache cells:
+/// they share the cell space with the explicitly-indexed tiles, so writing them
+/// into real slots clobbers reusable tiles → MemBlt(real index) later fetches the
+/// wrong bitmap (ghost tiles). Per FreeRDP (`bitmap_cache_get`/`put`: index ==
+/// WAITING_LIST → `cells[id].number`), we map `0x7FFF` to a single dedicated
+/// transient slot per `cache_id`, kept entirely separate from the real cells.
 #[derive(Default)]
 pub struct BitmapCache {
     caches: Vec<Vec<Option<Bitmap>>>,
-    next_seq: Vec<usize>,
-    last_transient: Option<Bitmap>,
+    /// Per-`cache_id` waiting-list (transient) slot for bitmaps cached with the
+    /// `0x7FFF` index. Read back via `get(cache_id, 0x7FFF)`; never aliases a real
+    /// cell, so it cannot corrupt explicitly-indexed tiles.
+    waiting: Vec<Option<Bitmap>>,
 }
 
 impl BitmapCache {
@@ -40,25 +48,22 @@ impl BitmapCache {
     }
 
     pub fn insert(&mut self, cache_id: usize, cache_index: usize, bitmap: Bitmap) {
-        self.last_transient = Some(bitmap.clone());
         *self.slot(cache_id, cache_index) = Some(bitmap);
     }
 
-    /// Store a waiting-list bitmap: assign it the next sequential index for this
-    /// cache and remember it as the last transient. Returns the assigned index.
-    pub fn insert_waiting(&mut self, cache_id: usize, bitmap: Bitmap) -> usize {
-        if cache_id >= self.next_seq.len() {
-            self.next_seq.resize(cache_id + 1, 0);
+    /// Store a bitmap cached with the waiting-list index (`0x7FFF`) in this cache's
+    /// dedicated transient slot — NOT a real cell. Read back via
+    /// `get(cache_id, 0x7FFF)` (the MemBlt that immediately follows).
+    pub fn insert_waiting(&mut self, cache_id: usize, bitmap: Bitmap) {
+        if cache_id >= self.waiting.len() {
+            self.waiting.resize_with(cache_id + 1, || None);
         }
-        let idx = self.next_seq[cache_id];
-        self.next_seq[cache_id] = idx + 1;
-        self.insert(cache_id, idx, bitmap);
-        idx
+        self.waiting[cache_id] = Some(bitmap);
     }
 
     pub fn get(&self, cache_id: usize, cache_index: usize) -> Option<&Bitmap> {
         if cache_index == WAITING_LIST_INDEX {
-            return self.last_transient.as_ref();
+            return self.waiting.get(cache_id)?.as_ref();
         }
         self.caches.get(cache_id)?.get(cache_index)?.as_ref()
     }

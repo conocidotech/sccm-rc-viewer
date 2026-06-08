@@ -29,3 +29,5 @@ ironrdp-session = "0.8"
 ironrdp-graphics = "0.7"
 ironrdp-svc = "0.6"
 image = { version = "0.25", default-features = false, features = ["png"] }
+# Windows OS-clipboard access for clipboard sharing (cliprdr).
+clipboard-win = "5"

@@ -25,6 +25,13 @@ pub const SCCM_RC_PORT: u16 = 2701;
 #[derive(Debug)]
 pub struct RawConnection {
     stream: TcpStream,
+    /// Persistent receive buffer. `recv_frame` parses whole frames out of this and
+    /// tops it up with a SINGLE cancel-safe read. This makes `recv_frame`
+    /// cancel-safe: if its future is dropped (e.g. it loses a `tokio::select!`
+    /// race against an input event in the active session), no partially-read bytes
+    /// are lost — they stay buffered here. (`read_exact` into a local buffer would
+    /// discard them on cancel, desyncing the sealed TPKT framing → session crash.)
+    rxbuf: Vec<u8>,
 }
 
 impl RawConnection {
@@ -38,7 +45,21 @@ impl RawConnection {
                 Error::Io(e)
             }
         })?;
-        Ok(Self { stream })
+        // Disable Nagle: this is an interactive remote-control stream, so small
+        // input/ack frames must go out immediately rather than being batched
+        // (Nagle adds up to ~40 ms of latency to every keystroke/mouse move).
+        let _ = stream.set_nodelay(true);
+        // Enable TCP keepalive so a silently-dropped connection (VPN drop, peer
+        // gone, a long-idle screen) is detected by the OS instead of blocking
+        // recv_rdp forever. Probes start after 10 s idle, every 3 s; once the OS
+        // gives up it errors the socket, which surfaces as a read error → the
+        // active session ends → the viewer's reconnect loop takes over and shows
+        // "reconnecting" status (rather than freezing on a dead link). Best-effort.
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(std::time::Duration::from_secs(10))
+            .with_interval(std::time::Duration::from_secs(3));
+        let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive);
+        Ok(Self { stream, rxbuf: Vec::new() })
     }
 
     /// Write a length-prefixed blob. Used during SSPI handshake to send each
@@ -117,27 +138,46 @@ impl RawConnection {
         Ok(())
     }
 
-    /// Read one complete SCCM frame: parse the 4-byte header, then read
-    /// exactly `body_len` bytes (handling TCP segmentation). Returns
-    /// `Ok(None)` on clean EOF before any header.
+    /// Read one complete SCCM frame: parse the 4-byte header, then `body_len`
+    /// bytes. Cancel-safe — frames are parsed out of a persistent buffer that is
+    /// topped up with a single cancel-safe `read`, so dropping this future (e.g.
+    /// losing a `tokio::select!` race) never loses partially-read bytes. Returns
+    /// `Ok(None)` on clean EOF at a frame boundary.
     pub async fn recv_frame(&mut self) -> Result<Option<Frame>> {
-        let mut hdr_buf = [0u8; 4];
-        match self.stream.read_exact(&mut hdr_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(Error::Io(e)),
+        loop {
+            // Parse a complete frame out of the buffer if one is fully present.
+            if self.rxbuf.len() >= 4 {
+                let MsgHeader { msg_type, body_len } =
+                    framing::parse_header(&self.rxbuf[..4]).expect("4 bytes is always parseable");
+                if body_len > 8 * 1024 * 1024 {
+                    return Err(Error::Protocol(format!(
+                        "implausibly-large frame body: {body_len} bytes"
+                    )));
+                }
+                let total = 4 + body_len;
+                if self.rxbuf.len() >= total {
+                    let body = self.rxbuf[4..total].to_vec();
+                    self.rxbuf.drain(..total);
+                    debug!(msg_type = format!("0x{msg_type:02x}"), body_len, "recv frame");
+                    return Ok(Some(Frame { msg_type, body }));
+                }
+            }
+            // Need more bytes. A SINGLE `read` is cancel-safe: if this future is
+            // dropped mid-await no bytes are consumed, and bytes already buffered
+            // from earlier reads are retained.
+            self.rxbuf.reserve(16 * 1024);
+            let n = self.stream.read_buf(&mut self.rxbuf).await?;
+            if n == 0 {
+                return if self.rxbuf.is_empty() {
+                    Ok(None) // clean EOF on a frame boundary
+                } else {
+                    Err(Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed mid-frame",
+                    )))
+                };
+            }
         }
-        let MsgHeader { msg_type, body_len } =
-            framing::parse_header(&hdr_buf).expect("4 bytes is always parseable");
-        if body_len > 8 * 1024 * 1024 {
-            return Err(Error::Protocol(format!(
-                "implausibly-large frame body: {body_len} bytes"
-            )));
-        }
-        let mut body = vec![0u8; body_len];
-        self.stream.read_exact(&mut body).await?;
-        debug!(msg_type = format!("0x{msg_type:02x}"), body_len, "recv frame");
-        Ok(Some(Frame { msg_type, body }))
     }
 
     /// Gracefully shut down the write half (TCP FIN) so the peer sees a clean

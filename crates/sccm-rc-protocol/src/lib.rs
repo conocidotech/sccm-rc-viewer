@@ -22,6 +22,8 @@ pub mod transport;
 pub mod handshake;
 pub mod framing;
 pub mod error;
+pub mod mppc;
+pub mod cliprdr;
 
 pub use error::{Error, Result};
 

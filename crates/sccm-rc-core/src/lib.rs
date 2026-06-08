@@ -32,6 +32,8 @@ pub struct SccmSession {
     /// Diagnostics: sealed frames sent / unsealed (for desync analysis).
     data_sent: u64,
     data_recvd: u64,
+    /// Total unsealed (plaintext RDP) bytes received — for bandwidth analysis.
+    data_recvd_bytes: u64,
 }
 
 impl std::fmt::Debug for SccmSession {
@@ -109,6 +111,7 @@ impl SccmSession {
             rx_buf: Vec::new(),
             data_sent: 0,
             data_recvd: 0,
+            data_recvd_bytes: 0,
         })
     }
 
@@ -116,9 +119,28 @@ impl SccmSession {
         self.grant
     }
 
+    /// Transport security for the UI: `(encrypted, server_verified, package)`.
+    /// `encrypted` = the SSPI context negotiated confidentiality (every RDP frame
+    /// is sealed/encrypted). `server_verified` = the package is Kerberos, which
+    /// proves the server holds the target's service key (the SSPI equivalent of a
+    /// valid certificate); NTLM authenticates us to the server but not vice-versa.
+    pub fn security(&self) -> (bool, bool, Option<String>) {
+        let encrypted = self.sspi.confidentiality();
+        let package = self.sspi.package_name();
+        let verified = package
+            .as_deref()
+            .map_or(false, |p| p.eq_ignore_ascii_case("Kerberos"));
+        (encrypted, verified, package)
+    }
+
     /// (sealed frames sent, unsealed frames received) — for desync diagnostics.
     pub fn seal_stats(&self) -> (u64, u64) {
         (self.data_sent, self.data_recvd)
+    }
+
+    /// Total unsealed (plaintext RDP) bytes received this session.
+    pub fn recvd_bytes(&self) -> u64 {
+        self.data_recvd_bytes
     }
 
     /// Gracefully tear down the session so the SCCM server releases the shadow /
@@ -175,6 +197,7 @@ impl SccmSession {
             let plain = match self.sspi.unseal(&frame.body) {
                 Ok(p) => {
                     self.data_recvd += 1;
+                    self.data_recvd_bytes += p.len() as u64;
                     p
                 }
                 Err(e) => {

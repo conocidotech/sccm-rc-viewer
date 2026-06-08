@@ -698,6 +698,15 @@ fn create_gcc_blocks<'a>(
                         early_capability_flags |= ClientEarlyCapabilityFlags::WANT_32_BPP_SESSION;
                     }
 
+                    // EGFX probe (SCCM_RC_EGFX=1): advertise support for the
+                    // Graphics Pipeline (RDPEGFX over drdynvc). If the SCCM server
+                    // can do H.264/EGFX it should now wake its DVC/gfx path and
+                    // send a DYNVC Capabilities Request on drdynvc.
+                    if std::env::var("SCCM_RC_EGFX").as_deref() == Ok("1") {
+                        early_capability_flags |=
+                            ClientEarlyCapabilityFlags::SUPPORT_DYN_VC_GFX_PROTOCOL;
+                    }
+
                     Some(early_capability_flags)
                 },
                 dig_product_id: Some(config.dig_product_id.clone()),
@@ -773,6 +782,20 @@ fn create_client_info_pdu(config: &Config, client_addr: &SocketAddr) -> rdp::Cli
         flags |= ClientInfoFlags::NO_AUDIO_PLAYBACK;
     }
 
+    // PATCHED for sccm-rc: advertise bulk compression (RDP 6.1 / XCRUSH) in the
+    // Client Info PDU, like the real CmRcViewer does, so the SCCM server sends a
+    // *compressed* graphics stream instead of raw bitmap tiles. Gated by
+    // SCCM_RC_COMPRESS=1. (Requires a matching decompressor on our side; see
+    // docs/PERFORMANCE.md.)
+    let compression_type = if std::env::var("SCCM_RC_COMPRESS").as_deref() == Ok("1") {
+        flags |= ClientInfoFlags::COMPRESSION;
+        // K64 = RDP 5.0 MPPC (64K history). We cap at this so the server uses
+        // plain MPPC (which we can decompress) rather than NCRUSH/XCRUSH.
+        CompressionType::K64
+    } else {
+        CompressionType::K8 // ignored unless the COMPRESSION flag is set
+    };
+
     let client_info = ClientInfo {
         credentials: Credentials {
             username: config.credentials.username().unwrap_or("").to_owned(),
@@ -781,7 +804,7 @@ fn create_client_info_pdu(config: &Config, client_addr: &SocketAddr) -> rdp::Cli
         },
         code_page: 0, // ignored if the keyboardLayout field of the Client Core Data is set to zero
         flags,
-        compression_type: CompressionType::K8, // ignored if ClientInfoFlags::COMPRESSION is not set
+        compression_type,
         alternate_shell: String::new(),
         work_dir: String::new(),
         extra_info: ExtendedClientInfo {

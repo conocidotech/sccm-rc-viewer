@@ -63,7 +63,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
-    if let Err(e) = rdp::run_active_session(&mut session, result, initial_buf, share_id, &mut sink, &mut input_rx).await {
+    let curtain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let file_offer = std::sync::Arc::new(std::sync::Mutex::new(None));
+    if let Err(e) = rdp::run_active_session(&mut session, result, initial_buf, share_id, &mut sink, &mut input_rx, curtain, file_offer).await {
         error!(error = %e, updates = sink.updates, "active session ended with error");
     }
     info!(updates = sink.updates, nonblack = sink.nonblack_pixels, "active session ended");

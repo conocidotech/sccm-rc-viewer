@@ -191,6 +191,7 @@ fn cache_bitmap_rev2(
     let data = c.bytes(bitmap_length.min(c.remaining()))?;
     let bmp = bitmap::decode(data, width, height, depth, compressed, None)?;
 
+    tracing::debug!(cache_id, cache_index, compressed, "CACHE_BITMAP_REV2");
     if cache_index == crate::cache::WAITING_LIST_INDEX {
         bitmaps.insert_waiting(cache_id, bmp);
     } else {

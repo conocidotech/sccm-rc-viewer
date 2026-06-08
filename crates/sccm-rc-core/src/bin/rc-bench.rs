@@ -122,7 +122,22 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let run = rdp::run_active_session(&mut session, result, initial_buf, share_id, &mut sink, &mut input_rx);
+    let curtain = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Curtain self-test: toggle the privacy screen on at ~6s, off at ~11s, so we
+    // can observe the server's reaction (response / reactivation / no disconnect).
+    if std::env::var("SCCM_RC_CURTAIN_TEST").as_deref() == Ok("1") {
+        let c = curtain.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            tracing::warn!("CURTAIN TEST: enabling");
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            tracing::warn!("CURTAIN TEST: disabling");
+            c.store(false, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+    let file_offer = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let run = rdp::run_active_session(&mut session, result, initial_buf, share_id, &mut sink, &mut input_rx, curtain, file_offer);
     let outcome = tokio::time::timeout(Duration::from_secs(cli.seconds), run).await;
 
     // Graceful teardown so the server releases the host (avoids lingering HostInUse).
@@ -131,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
     let elapsed = t0.elapsed().as_secs_f64();
     let s = stats.lock().unwrap();
     let (sent, recvd) = session.seal_stats();
+    let recvd_mb = session.recvd_bytes() as f64 / (1024.0 * 1024.0);
     let status = match &outcome {
         Ok(Ok(())) => "session ended cleanly".to_string(),
         Ok(Err(e)) => format!("CRASH/ERROR: {e}"),
@@ -147,6 +163,7 @@ async fn main() -> anyhow::Result<()> {
     println!("last update at    : {} ms", s.last_update_ms);
     println!("non-black px       : {}/{} ({:.1}%)", s.nonblack, s.total_px, 100.0 * s.nonblack as f64 / (s.total_px.max(1)) as f64);
     println!("sealed sent/recvd : {sent} / {recvd}");
+    println!("total recvd       : {recvd_mb:.2} MB");
     println!("ran for           : {elapsed:.1} s");
     println!("status            : {status}");
     println!("png               : {png_path}");

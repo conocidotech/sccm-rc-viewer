@@ -25,3 +25,5 @@ frida-frames.txt
 # SSPI hook capture output — decrypted session plaintext, never commit
 /hook-frames.txt
 experiments/captures/*.txt
+# WLC desktop negotiation dumps — decrypted session content, never commit
+experiments/desktop-wlc-*.txt
