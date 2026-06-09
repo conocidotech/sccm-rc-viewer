@@ -268,31 +268,32 @@ pub fn parse(payload: &[u8]) -> Option<ClipPdu> {
 /// True if the Format List body advertises CF_UNICODETEXT (13) or CF_TEXT (1).
 /// Handles both short (4 + 32 bytes/entry) and long (4 + null-terminated UTF-16
 /// name) format-name layouts by just scanning the leading format ids.
-fn scan_for_text_format(data: &[u8], msg_flags: u16) -> bool {
-    // CB_USE_LONG_FORMAT_NAMES was negotiated off on our side, but the peer may
-    // still send long names; detect a text id either way.
-    let long_names = msg_flags & 0x0004 == 0 && data.len() % 36 != 0 && !data.is_empty();
-    if !long_names {
-        // Short format names: fixed 36-byte entries.
-        let mut i = 0;
-        while i + 4 <= data.len() {
-            let id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-            if id == CF_UNICODETEXT || id == 1 {
-                return true;
-            }
-            i += 36;
-        }
-        return false;
-    }
-    // Long format names: formatId(4) + null-terminated UTF-16 name. Walk entries.
+fn scan_for_text_format(data: &[u8], _msg_flags: u16) -> bool {
+    // The format-name layout (short = fixed 36-byte entries, long = formatId +
+    // NUL-terminated UTF-16 name) depends on the negotiated CB_USE_LONG_FORMAT_NAMES
+    // cap, which is awkward to thread here and easy to mis-guess. Both layouts
+    // begin each entry with a 4-byte formatId, so scan BOTH interpretations and
+    // report text if EITHER finds CF_UNICODETEXT (13) or CF_TEXT (1). Biasing
+    // toward detection is safe: a spurious data request just gets a fail reply,
+    // whereas a missed text format silently breaks remote→local paste.
+    let is_text = |id: u32| id == CF_UNICODETEXT || id == 1;
+    let id_at = |i: usize| u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+
+    // Short names: fixed 36-byte stride.
     let mut i = 0;
     while i + 4 <= data.len() {
-        let id = u32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
-        if id == CF_UNICODETEXT || id == 1 {
+        if is_text(id_at(i)) {
+            return true;
+        }
+        i += 36;
+    }
+    // Long names: formatId(4) + NUL-terminated UTF-16 name.
+    let mut i = 0;
+    while i + 4 <= data.len() {
+        if is_text(id_at(i)) {
             return true;
         }
         i += 4;
-        // Skip the UTF-16 name up to and including its 00 00 terminator.
         while i + 2 <= data.len() && !(data[i] == 0 && data[i + 1] == 0) {
             i += 2;
         }

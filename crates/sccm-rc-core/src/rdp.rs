@@ -405,6 +405,10 @@ pub struct CliprdrChannel {
     known: Option<String>,
     /// A local file the operator offered to push to the remote (paste there).
     pending_file: Option<std::path::PathBuf>,
+    /// True once the server sent CB_MONITOR_READY. Before that we must not send a
+    /// FormatList (the periodic poll would otherwise announce out of sequence,
+    /// which a strict server can drop — losing the local→remote path).
+    ready: bool,
 }
 
 impl CliprdrChannel {
@@ -467,6 +471,9 @@ impl CliprdrChannel {
     /// changed (and it isn't a value we just received from the remote), returns
     /// a Format List PDU announcing it to the server.
     pub fn local_changed(&mut self) -> Option<Vec<u8>> {
+        if !self.ready {
+            return None; // CB_MONITOR_READY not seen yet — don't announce early.
+        }
         let cur = Self::read_local();
         if cur != self.known {
             self.known = cur.clone();
@@ -493,8 +500,9 @@ impl ironrdp_svc::SvcProcessor for CliprdrChannel {
         };
         match pdu {
             ClipPdu::MonitorReady => {
-                // Seed `known` so the first local poll doesn't re-announce, then
-                // reply with our (long-name, file-capable) caps + format list.
+                // Handshake is up: future local changes may be announced, and the
+                // format_list below already announces the current clipboard.
+                self.ready = true;
                 self.known = Self::read_local();
                 info!(has_text = self.known.is_some(), "cliprdr: monitor ready — sending caps + format list");
                 Ok(vec![
