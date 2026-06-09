@@ -406,6 +406,7 @@ fn main() -> anyhow::Result<()> {
         window: None,
         surface: None,
         gpu: None,
+        gpu_dump: std::env::var("SCCM_RC_GPU_DUMP").ok(),
         title: format!("SCCM RC {} — {target}", env!("CARGO_PKG_VERSION")),
         last_cursor: (0, 0),
         last_move: std::time::Instant::now(),
@@ -589,6 +590,9 @@ struct App {
     /// Optional GPU renderer (wgpu). `None` = the softbuffer CPU path (default).
     /// Enabled with SCCM_RC_GPU=1; falls back to CPU if init fails.
     gpu: Option<gpu::GpuRenderer>,
+    /// Debug: SCCM_RC_GPU_DUMP=<path> dumps the first connected GPU frame to PNG
+    /// (GDI can't screenshot a Vulkan surface). Cleared after one dump.
+    gpu_dump: Option<String>,
     title: String,
     last_cursor: (u16, u16),
     last_move: std::time::Instant,
@@ -810,6 +814,7 @@ impl ApplicationHandler<UserEvent> for App {
             match gpu::GpuRenderer::new(window.clone(), sz.width.max(1), sz.height.max(1)) {
                 Ok(g) => {
                     info!("GPU renderer (wgpu) active");
+                    g.set_error_handler();
                     self.gpu = Some(g);
                 }
                 Err(e) => warn!(error = %e, "GPU init failed — using softbuffer (CPU)"),
@@ -1014,9 +1019,10 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl App {
-    /// GPU render path (wgpu). Phase A: the desktop quad + a cleared toolbar
-    /// strip. The toolbar overlay and client-cursor quad are follow-ups; until
-    /// then the GPU path is opt-in via SCCM_RC_GPU=1.
+    /// GPU render path (wgpu). Draws the desktop framebuffer as a quad below the
+    /// toolbar, and the toolbar (or the connect/closed splash) as an overlay quad
+    /// rasterised by the existing CPU code into a small buffer. Opt-in via
+    /// SCCM_RC_GPU=1; the client-cursor quad (#87) and dirty uploads are follow-ups.
     fn render_gpu(&mut self) {
         let Some(window) = self.window.clone() else {
             return;
@@ -1026,14 +1032,80 @@ impl App {
         let bar_h = toolbar::TOOLBAR_H.min(win_h);
         let frame = self.shared.lock().unwrap();
         let connected = frame.width != 0 && frame.height != 0 && !frame.rgba.is_empty();
+        let (fb_w, fb_h) = (frame.width, frame.height);
+        let bytes_per_sec = frame.bytes_per_sec;
+        let status_msg = frame.status.clone();
+        let security = frame.security.clone();
+        let secure = frame.secure;
         if let Some(rec) = self.recorder.as_mut() {
             rec.maybe_capture(frame.width, frame.height, &frame.rgba);
         }
-        let gpu = self.gpu.as_mut().unwrap();
-        if connected {
-            gpu.render_desktop(win_w, win_h, bar_h, frame.width, frame.height, &frame.rgba);
+
+        // Rasterise the overlay into a CPU u32 buffer with the existing drawing
+        // code: the toolbar strip when connected, else the full-window splash.
+        let (ov_w, ov_h, dest) = if connected {
+            (win_w, bar_h, gpu::OverlayDest::TopStrip(bar_h))
         } else {
-            gpu.render_splash(win_w, win_h);
+            (win_w, win_h, gpu::OverlayDest::Full)
+        };
+        let mut ov = vec![0u32; (ov_w * ov_h) as usize];
+        if connected {
+            let status = toolbar::Status {
+                host: &self.host,
+                mode: if self.view_only { "View Only" } else { "Control" },
+                state: "Connected",
+                connected,
+                fps: self.fps,
+                bytes_per_sec,
+                recording: self.recorder.is_some(),
+                curtain: self.curtain.load(Ordering::Relaxed),
+                security: &security,
+                secure,
+            };
+            toolbar::draw(&mut ov, ov_w, ov_h, &status, self.font.as_ref());
+        } else {
+            let fill = if self.closed.is_some() { 0x0040_0000 } else { 0x0020_2020 };
+            for px in ov.iter_mut() {
+                *px = fill;
+            }
+            let msg = if let Some(reason) = &self.closed {
+                format!("Verbinding verbroken — {reason}")
+            } else if status_msg.is_empty() {
+                "Verbinden...".to_string()
+            } else {
+                status_msg
+            };
+            let (cx, cy) = (ov_w / 2, ov_h / 2);
+            if self.closed.is_none() {
+                draw_spinner(&mut ov, ov_w, ov_h, cx, cy.saturating_sub(72), self.connect_start.elapsed());
+            }
+            if let Some(f) = self.font.as_ref() {
+                f.draw_centered(&mut ov, ov_w, ov_h, cy as f32 + 4.0, &self.host, 0x00FF_FFFF, 34.0);
+                f.draw_centered(&mut ov, ov_w, ov_h, cy as f32 + 38.0, &msg, 0x00B0_C0D0, 19.0);
+            } else {
+                toolbar::draw_text_centered(&mut ov, ov_w, ov_h, cy.saturating_sub(28), &self.host, 0x00FF_FFFF, 3);
+                toolbar::draw_text_centered(&mut ov, ov_w, ov_h, cy + 8, &msg, 0x00B0_C0D0, 2);
+            }
+        }
+        // Pack 0x00RRGGBB -> RGBA bytes (opaque).
+        let mut ov_rgba = vec![0u8; (ov_w * ov_h * 4) as usize];
+        for (i, &px) in ov.iter().enumerate() {
+            let o = i * 4;
+            ov_rgba[o] = ((px >> 16) & 0xff) as u8;
+            ov_rgba[o + 1] = ((px >> 8) & 0xff) as u8;
+            ov_rgba[o + 2] = (px & 0xff) as u8;
+            ov_rgba[o + 3] = 0xff;
+        }
+
+        let desktop = if connected { Some((fb_w, fb_h, frame.rgba.as_slice())) } else { None };
+        let dump = if connected { self.gpu_dump.take() } else { None };
+        let gpu = self.gpu.as_mut().unwrap();
+        gpu.render(win_w, win_h, bar_h, desktop, Some((ov_w, ov_h, &ov_rgba, dest)));
+        if let Some(p) = dump {
+            match gpu.dump_png(&p) {
+                Ok(()) => info!(path = %p, "GPU frame dumped"),
+                Err(e) => warn!(error = %e, "GPU dump failed"),
+            }
         }
     }
 

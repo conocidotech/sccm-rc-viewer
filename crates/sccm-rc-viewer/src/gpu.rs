@@ -1,27 +1,40 @@
 //! Optional GPU renderer (wgpu). Uploads the remote desktop framebuffer as a
-//! texture and draws it as a bilinear-sampled fullscreen quad below the toolbar
-//! strip — moving the per-frame scaling off the CPU. The softbuffer path stays
-//! as the default/fallback (see `main.rs`); this is enabled with `SCCM_RC_GPU=1`.
+//! texture and draws it as a bilinear-sampled quad below the toolbar strip —
+//! moving the per-frame scaling off the CPU. A second quad draws the toolbar (or
+//! the connect/closed splash) as an overlay texture: the toolbar is still
+//! rasterised by `toolbar.rs`/`text.rs` into a small CPU buffer, then uploaded.
 //!
-//! Phase A (here): the desktop quad. Follow-ups layer a toolbar overlay texture
-//! and a client-cursor quad (the clean #87 fix) on top.
+//! The softbuffer path stays as the default/fallback (see `main.rs`); the GPU
+//! path is enabled with `SCCM_RC_GPU=1`. Follow-ups: a client-cursor quad (the
+//! clean #87 fix) and dirty-region uploads.
 
 use std::sync::Arc;
 use winit::window::Window;
 
-/// Toolbar strip background (matches `toolbar::BAR_BG` 0x2D2D30), as linear RGBA
-/// for the render-pass clear (the surface is sRGB, so approximate is fine).
+/// Toolbar strip background (matches `toolbar::BAR_BG`), linear-ish for the clear.
 const BAR_CLEAR: wgpu::Color = wgpu::Color { r: 0.027, g: 0.027, b: 0.028, a: 1.0 };
-/// Connect/closed splash background while not yet streaming.
-const SPLASH_CLEAR: wgpu::Color = wgpu::Color { r: 0.012, g: 0.012, b: 0.012, a: 1.0 };
 
-/// NDC destination rectangle for the desktop quad (min = bottom-left,
-/// max = top-right), written to the uniform buffer each frame.
+/// NDC destination rectangle for a quad (min = bottom-left, max = top-right).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RectUniform {
     min: [f32; 2],
     max: [f32; 2],
+}
+
+/// A texture + its bind group + the pixel size it was created for.
+struct Layer {
+    texture: wgpu::Texture,
+    bind: wgpu::BindGroup,
+    w: u32,
+    h: u32,
+}
+
+/// Where an overlay quad is drawn. `TopStrip(h)` covers the top `h` pixels (the
+/// toolbar); `Full` covers the whole window (the connect/closed splash).
+pub enum OverlayDest {
+    TopStrip(u32),
+    Full,
 }
 
 pub struct GpuRenderer {
@@ -32,12 +45,10 @@ pub struct GpuRenderer {
     pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
     bind_layout: wgpu::BindGroupLayout,
-    uniform: wgpu::Buffer,
-    /// The desktop texture + its bind group, recreated when the framebuffer size
-    /// changes. `None` until the first frame is uploaded.
-    desktop: Option<(wgpu::Texture, wgpu::BindGroup)>,
-    tex_w: u32,
-    tex_h: u32,
+    uniform_desktop: wgpu::Buffer,
+    uniform_overlay: wgpu::Buffer,
+    desktop: Option<Layer>,
+    overlay: Option<Layer>,
 }
 
 impl GpuRenderer {
@@ -66,7 +77,6 @@ impl GpuRenderer {
         .map_err(|e| format!("request_device: {e}"))?;
 
         let caps = surface.get_capabilities(&adapter);
-        // Prefer an sRGB surface so the texture (also sRGB) round-trips visually.
         let format = caps
             .formats
             .iter()
@@ -86,7 +96,7 @@ impl GpuRenderer {
         surface.configure(&device, &config);
 
         let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("desktop bind layout"),
+            label: Some("quad bind layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
@@ -153,17 +163,19 @@ impl GpuRenderer {
         });
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("desktop sampler"),
+            label: Some("quad sampler"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        let uniform_desc = wgpu::BufferDescriptor {
             label: Some("rect uniform"),
             size: std::mem::size_of::<RectUniform>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
-        });
+        };
+        let uniform_desktop = device.create_buffer(&uniform_desc);
+        let uniform_overlay = device.create_buffer(&uniform_desc);
 
         Ok(Self {
             surface,
@@ -173,34 +185,37 @@ impl GpuRenderer {
             pipeline,
             sampler,
             bind_layout,
-            uniform,
+            uniform_desktop,
+            uniform_overlay,
             desktop: None,
-            tex_w: 0,
-            tex_h: 0,
+            overlay: None,
         })
     }
 
-    /// Reconfigure the surface to a new window size.
-    pub fn resize(&mut self, width: u32, height: u32) {
+    fn resize(&mut self, width: u32, height: u32) {
         self.config.width = width.max(1);
         self.config.height = height.max(1);
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn ensure_size(&mut self, win_w: u32, win_h: u32) {
-        if win_w != self.config.width || win_h != self.config.height {
-            self.resize(win_w, win_h);
+    /// (Re)create a layer's texture + bind group when its pixel size changes.
+    fn ensure_layer(
+        device: &wgpu::Device,
+        bind_layout: &wgpu::BindGroupLayout,
+        sampler: &wgpu::Sampler,
+        uniform: &wgpu::Buffer,
+        slot: &mut Option<Layer>,
+        w: u32,
+        h: u32,
+    ) {
+        if let Some(l) = slot {
+            if l.w == w && l.h == h {
+                return;
+            }
         }
-    }
-
-    /// (Re)create the desktop texture + bind group when the framebuffer size changes.
-    fn ensure_texture(&mut self, fb_w: u32, fb_h: u32) {
-        if self.desktop.is_some() && fb_w == self.tex_w && fb_h == self.tex_h {
-            return;
-        }
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("desktop texture"),
-            size: wgpu::Extent3d { width: fb_w, height: fb_h, depth_or_array_layers: 1 },
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("quad texture"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -209,67 +224,82 @@ impl GpuRenderer {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("desktop bind group"),
-            layout: &self.bind_layout,
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("quad bind group"),
+            layout: bind_layout,
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: self.uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() },
             ],
         });
-        self.desktop = Some((texture, bind));
-        self.tex_w = fb_w;
-        self.tex_h = fb_h;
+        *slot = Some(Layer { texture, bind, w, h });
     }
 
-    /// Draw the desktop framebuffer scaled into the window region below `bar_h`.
-    pub fn render_desktop(&mut self, win_w: u32, win_h: u32, bar_h: u32, fb_w: u32, fb_h: u32, rgba: &[u8]) {
-        if fb_w == 0 || fb_h == 0 || rgba.len() < (fb_w * fb_h * 4) as usize {
-            return self.render_clear(win_w, win_h, BAR_CLEAR);
+    fn write_layer(queue: &wgpu::Queue, layer: &Layer, rgba: &[u8]) {
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &layer.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * layer.w),
+                rows_per_image: Some(layer.h),
+            },
+            wgpu::Extent3d { width: layer.w, height: layer.h, depth_or_array_layers: 1 },
+        );
+    }
+
+    /// Render one frame: an optional desktop quad (drawn below `bar_h`) and an
+    /// optional overlay quad (toolbar strip or full-window splash).
+    pub fn render(
+        &mut self,
+        win_w: u32,
+        win_h: u32,
+        bar_h: u32,
+        desktop: Option<(u32, u32, &[u8])>,
+        overlay: Option<(u32, u32, &[u8], OverlayDest)>,
+    ) {
+        if win_w != self.config.width || win_h != self.config.height {
+            self.resize(win_w, win_h);
         }
-        self.ensure_size(win_w, win_h);
-        self.ensure_texture(fb_w, fb_h);
+        let top_ndc = |px: u32| 1.0 - 2.0 * (px as f32) / (win_h as f32);
 
-        // Upload the whole framebuffer (dirty-region uploads are a follow-up).
-        if let Some((texture, _)) = &self.desktop {
-            self.queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                rgba,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * fb_w),
-                    rows_per_image: Some(fb_h),
-                },
-                wgpu::Extent3d { width: fb_w, height: fb_h, depth_or_array_layers: 1 },
-            );
+        // Desktop: fills y in [bar_h, win_h].
+        let mut draw_desktop = false;
+        if let Some((fb_w, fb_h, rgba)) = desktop {
+            if fb_w > 0 && fb_h > 0 && rgba.len() >= (fb_w * fb_h * 4) as usize {
+                Self::ensure_layer(&self.device, &self.bind_layout, &self.sampler, &self.uniform_desktop, &mut self.desktop, fb_w, fb_h);
+                if let Some(l) = &self.desktop {
+                    Self::write_layer(&self.queue, l, rgba);
+                }
+                let rect = RectUniform { min: [-1.0, -1.0], max: [1.0, top_ndc(bar_h)] };
+                self.queue.write_buffer(&self.uniform_desktop, 0, bytemuck::bytes_of(&rect));
+                draw_desktop = true;
+            }
         }
 
-        // The desktop occupies y in [bar_h, win_h] (pixels from the top). Convert
-        // to NDC (y up): top edge = 1 - 2*bar_h/win_h, bottom edge = -1.
-        let top_ndc = 1.0 - 2.0 * (bar_h as f32) / (win_h as f32);
-        let rect = RectUniform { min: [-1.0, -1.0], max: [1.0, top_ndc] };
-        self.queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&rect));
+        // Overlay: toolbar strip or full-window splash.
+        let mut draw_overlay = false;
+        if let Some((ov_w, ov_h, rgba, dest)) = overlay {
+            if ov_w > 0 && ov_h > 0 && rgba.len() >= (ov_w * ov_h * 4) as usize {
+                Self::ensure_layer(&self.device, &self.bind_layout, &self.sampler, &self.uniform_overlay, &mut self.overlay, ov_w, ov_h);
+                if let Some(l) = &self.overlay {
+                    Self::write_layer(&self.queue, l, rgba);
+                }
+                let rect = match dest {
+                    OverlayDest::Full => RectUniform { min: [-1.0, -1.0], max: [1.0, 1.0] },
+                    OverlayDest::TopStrip(h) => RectUniform { min: [-1.0, top_ndc(h)], max: [1.0, 1.0] },
+                };
+                self.queue.write_buffer(&self.uniform_overlay, 0, bytemuck::bytes_of(&rect));
+                draw_overlay = true;
+            }
+        }
 
-        self.present(BAR_CLEAR, true);
-    }
-
-    /// Clear the whole window (used while not streaming).
-    pub fn render_splash(&mut self, win_w: u32, win_h: u32) {
-        self.ensure_size(win_w, win_h);
-        self.render_clear(win_w, win_h, SPLASH_CLEAR);
-    }
-
-    fn render_clear(&mut self, _win_w: u32, _win_h: u32, color: wgpu::Color) {
-        self.present(color, false);
-    }
-
-    fn present(&mut self, clear: wgpu::Color, draw_desktop: bool) {
         let surface_tex = match self.surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -289,7 +319,7 @@ impl GpuRenderer {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear),
+                        load: wgpu::LoadOp::Clear(BAR_CLEAR),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -297,10 +327,16 @@ impl GpuRenderer {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
+            pass.set_pipeline(&self.pipeline);
             if draw_desktop {
-                if let Some((_, bind)) = &self.desktop {
-                    pass.set_pipeline(&self.pipeline);
-                    pass.set_bind_group(0, bind, &[]);
+                if let Some(l) = &self.desktop {
+                    pass.set_bind_group(0, &l.bind, &[]);
+                    pass.draw(0..6, 0..1);
+                }
+            }
+            if draw_overlay {
+                if let Some(l) = &self.overlay {
+                    pass.set_bind_group(0, &l.bind, &[]);
                     pass.draw(0..6, 0..1);
                 }
             }
@@ -308,11 +344,112 @@ impl GpuRenderer {
         self.queue.submit(Some(encoder.finish()));
         surface_tex.present();
     }
+
+    /// Debug: render the current layers into an offscreen texture and save it as
+    /// a PNG (GDI can't screenshot a Vulkan swapchain). Used for self-verification
+    /// via SCCM_RC_GPU_DUMP=<path>. Reuses the bind groups from the last render().
+    pub fn dump_png(&self, path: &str) -> Result<(), String> {
+        let (w, h) = (self.config.width, self.config.height);
+        // The offscreen target MUST use the surface format the pipeline was built
+        // for (e.g. Bgra8UnormSrgb), or wgpu rejects the render pass as incompatible.
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dump target"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let bpr = (4 * w).div_ceil(align) * align;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dump readback"),
+            size: (bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dump") });
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("dump pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(BAR_CLEAR), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            if let Some(l) = &self.desktop {
+                pass.set_bind_group(0, &l.bind, &[]);
+                pass.draw(0..6, 0..1);
+            }
+            if let Some(l) = &self.overlay {
+                pass.set_bind_group(0, &l.bind, &[]);
+                pass.draw(0..6, 0..1);
+            }
+        }
+        enc.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::ImageCopyBuffer {
+                buffer: &buf,
+                layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(enc.finish()));
+
+        let slice = buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv().map_err(|e| e.to_string())?.map_err(|e| format!("map: {e:?}"))?;
+        let data = slice.get_mapped_range();
+        let mut img = vec![0u8; (4 * w * h) as usize];
+        let row = (4 * w) as usize;
+        for y in 0..h as usize {
+            let src = y * bpr as usize;
+            let dst = y * row;
+            img[dst..dst + row].copy_from_slice(&data[src..src + row]);
+        }
+        drop(data);
+        buf.unmap();
+        // The surface is typically BGRA; PNG wants RGBA, so swap R/B.
+        if matches!(
+            self.config.format,
+            wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm
+        ) {
+            for px in img.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        image::RgbaImage::from_raw(w, h, img)
+            .ok_or_else(|| "from_raw".to_string())?
+            .save(path)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Install a non-panicking device error handler so a wgpu validation error
+    /// logs instead of aborting the process (and poisoning the shared frame lock).
+    pub fn set_error_handler(&self) {
+        self.device.on_uncaptured_error(Box::new(|e| {
+            tracing::error!(error = %e, "wgpu uncaptured error");
+        }));
+    }
 }
 
-/// Fullscreen-quad shader: 6 vertices, positioned into the NDC `rect` uniform,
-/// sampling the desktop texture. uv.y is flipped because the texture is top-down
-/// while NDC y points up.
+/// Fullscreen-quad shader: 6 vertices positioned into the NDC `rect` uniform,
+/// sampling the texture. uv.y is flipped because the textures are top-down while
+/// NDC y points up.
 const SHADER: &str = r#"
 struct Rect { min: vec2<f32>, max: vec2<f32> };
 @group(0) @binding(0) var tex: texture_2d<f32>;
