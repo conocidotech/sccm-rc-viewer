@@ -38,9 +38,10 @@ pub type InputSender = tokio::sync::mpsc::Sender<Vec<FastPathInputEvent>>;
 
 /// Build a Config for an SCCM RC session: standard RDP security (no TLS,
 /// no CredSSP) since the outer SecurityFilter already encrypts everything.
-pub fn sccm_rdp_config(width: u16, height: u16) -> Config {
+pub fn sccm_rdp_config(width: u16, height: u16, monitors: Vec<ironrdp_pdu::gcc::Monitor>) -> Config {
     Config {
         desktop_size: DesktopSize { width, height },
+        monitors,
         desktop_scale_factor: 0,
         enable_tls: false,
         enable_credssp: false,
@@ -74,6 +75,76 @@ pub fn sccm_rdp_config(width: u16, height: u16) -> Config {
 
 fn whoami_user() -> String {
     std::env::var("USERNAME").unwrap_or_else(|_| "user".to_string())
+}
+
+/// Re-exported so the viewer can build a monitor layout without taking a direct
+/// dependency on ironrdp-pdu.
+pub use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
+
+/// Parse a `--monitor` geometry string `WIDTHxHEIGHT+LEFT+TOP` (e.g.
+/// `1920x1080+0+0`; the `+LEFT+TOP` is optional and defaults to `+0+0`) into a
+/// [`Monitor`] with inclusive right/bottom edges. `primary` marks it as the
+/// layout's primary monitor.
+pub fn parse_monitor(s: &str, primary: bool) -> Option<Monitor> {
+    let (size, pos) = match s.split_once('+') {
+        Some((sz, rest)) => (sz, Some(rest)),
+        None => (s, None),
+    };
+    let (w, h) = size.split_once('x')?;
+    let w: i32 = w.trim().parse().ok()?;
+    let h: i32 = h.trim().parse().ok()?;
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let (left, top) = match pos {
+        Some(p) => {
+            let (l, t) = p.split_once('+')?;
+            (l.trim().parse().ok()?, t.trim().parse().ok()?)
+        }
+        None => (0, 0),
+    };
+    Some(Monitor {
+        left,
+        top,
+        right: left + w - 1,
+        bottom: top + h - 1,
+        flags: if primary { MonitorFlags::PRIMARY } else { MonitorFlags::empty() },
+    })
+}
+
+/// Bounding-box size `(width, height)` of a monitor layout — the value the RDP
+/// `desktop_size` must be set to when advertising the layout (else the server
+/// silently drops the monitor block). `None` for an empty layout.
+pub fn monitors_bounding_size(monitors: &[Monitor]) -> Option<(u16, u16)> {
+    let left = monitors.iter().map(|m| m.left).min()?;
+    let top = monitors.iter().map(|m| m.top).min()?;
+    let right = monitors.iter().map(|m| m.right).max()?;
+    let bottom = monitors.iter().map(|m| m.bottom).max()?;
+    let w = (right - left + 1).clamp(1, u16::MAX as i32) as u16;
+    let h = (bottom - top + 1).clamp(1, u16::MAX as i32) as u16;
+    Some((w, h))
+}
+
+#[cfg(test)]
+mod monitor_tests {
+    use super::{monitors_bounding_size, parse_monitor, MonitorFlags};
+
+    #[test]
+    fn monitor_layout_parses_and_bboxes() {
+        let m0 = parse_monitor("1920x1080+0+0", true).unwrap();
+        let m1 = parse_monitor("1280x1024+1920+0", false).unwrap();
+        assert_eq!((m0.right, m0.bottom), (1919, 1079));
+        assert!(m0.flags.contains(MonitorFlags::PRIMARY));
+        assert!(!m1.flags.contains(MonitorFlags::PRIMARY));
+        assert_eq!(m1.left, 1920);
+        // Bounding box spans both side-by-side monitors.
+        assert_eq!(monitors_bounding_size(&[m0, m1]), Some((3200, 1080)));
+        assert_eq!(monitors_bounding_size(&[]), None);
+        // Defaulted origin + rejected garbage.
+        assert_eq!(parse_monitor("800x600", false).unwrap().left, 0);
+        assert!(parse_monitor("garbage", true).is_none());
+        assert!(parse_monitor("0x600", true).is_none());
+    }
 }
 
 fn map_err(e: ConnectorError) -> Error {
@@ -548,12 +619,13 @@ pub async fn connect_rdp(
     session: &mut SccmSession,
     width: u16,
     height: u16,
+    monitors: &[ironrdp_pdu::gcc::Monitor],
 ) -> Result<(ConnectionResult, Vec<u8>, u32)> {
     if session.grant() == Grant::ViewOnly {
         debug!("session is view-only — input will be rejected by the server");
     }
 
-    let config = sccm_rdp_config(width, height);
+    let config = sccm_rdp_config(width, height, monitors.to_vec());
     // Client address is only used to fill the Client Info PDU; a placeholder
     // is fine since the real transport is our sealed channel.
     let client_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));

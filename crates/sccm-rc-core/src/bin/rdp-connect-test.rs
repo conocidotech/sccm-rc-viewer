@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     let mut session = SccmSession::connect(&cli.target).await?;
     info!(grant = ?session.grant(), "session established");
 
-    let (result, initial_buf, share_id) = match rdp::connect_rdp(&mut session, cli.width, cli.height).await {
+    let (result, initial_buf, share_id) = match rdp::connect_rdp(&mut session, cli.width, cli.height, &[]).await {
         Ok(r) => {
             info!(
                 desktop = format!("{}x{}", r.0.desktop_size.width, r.0.desktop_size.height),

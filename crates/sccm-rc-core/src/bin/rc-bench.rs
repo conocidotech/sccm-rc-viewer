@@ -93,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let mut session = SccmSession::connect(&cli.target).await?;
     let t_connect = t0.elapsed();
-    let (result, initial_buf, share_id) = rdp::connect_rdp(&mut session, cli.width, cli.height).await?;
+    let (result, initial_buf, share_id) = rdp::connect_rdp(&mut session, cli.width, cli.height, &[]).await?;
     let t_active = t0.elapsed();
     info!(grant = ?session.grant(), connect_ms = t_connect.as_millis(), active_ms = t_active.as_millis(), "connected + RDP active");
 

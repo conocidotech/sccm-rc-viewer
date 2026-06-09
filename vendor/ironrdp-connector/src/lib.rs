@@ -143,6 +143,11 @@ impl Credentials {
 pub struct Config {
     /// The initial desktop size to request
     pub desktop_size: DesktopSize,
+    /// Monitor layout to advertise as TS_UD_CS_MONITOR. Empty = single-monitor
+    /// (today's behaviour). When non-empty, `desktop_size` MUST equal the
+    /// bounding rectangle of all monitors or the server silently drops the block.
+    #[cfg_attr(feature = "arbitrary", arbitrary(default))]
+    pub monitors: Vec<ironrdp_pdu::gcc::Monitor>,
     /// The initial desktop scale factor to request.
     ///
     /// This becomes the `desktop_scale_factor` in the [`TS_UD_CS_CORE`](gcc::ClientCoreOptionalData) structure.

@@ -34,6 +34,14 @@ Gated on `SCCM_RC_ORDERS=1` (default off — leave off for plain bitmap mode):
 Also note `SCCM_RC_LEGACY_GFX=1` (separate gate) drops Surface Commands +
 RemoteFx codec caps to force slow-path bitmaps.
 
+## Multi-monitor advertise (`src/lib.rs` + `src/connection.rs`)
+
+5. `Config` gained a `monitors: Vec<gcc::Monitor>` field (default empty =
+   single-monitor, today's behaviour). `create_gcc_blocks` emits the
+   `TS_UD_CS_MONITOR` block (`ClientMonitorData`) when it is non-empty. The
+   caller (`sccm_rdp_config`) sets `desktop_size` to the monitors' bounding box,
+   which the block requires. Driven by the viewer's `--monitor` flag.
+
 ## Version
 
 Pinned to the IronRDP 0.8 release set: connector 0.8.0, session 0.8.0,

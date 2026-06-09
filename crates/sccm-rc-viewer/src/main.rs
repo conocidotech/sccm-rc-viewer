@@ -52,6 +52,11 @@ struct Cli {
     /// --mac address for the target).
     #[arg(long)]
     wake: bool,
+    /// Advertise a multi-monitor layout (repeatable). Geometry per monitor:
+    /// WIDTHxHEIGHT+LEFT+TOP, e.g. `--monitor 1920x1080+0+0 --monitor 1280x1024+1920+0`.
+    /// The first `--monitor` is the primary; omit for a single monitor.
+    #[arg(long = "monitor")]
+    monitors: Vec<String>,
 }
 
 /// Ask for the target hostname via a native Windows input box (used when no
@@ -352,7 +357,27 @@ fn main() -> anyhow::Result<()> {
     let curtain = Arc::new(AtomicBool::new(false));
     // A file the operator picked to push to the remote (Send File button).
     let file_offer: Arc<Mutex<Option<std::path::PathBuf>>> = Arc::new(Mutex::new(None));
-    let (w, h) = (cli.width, cli.height);
+    // Parse any advertised monitor layout; the first --monitor is primary. When
+    // a layout is given, the requested desktop size becomes its bounding box.
+    let monitors: Vec<rdp::Monitor> = cli
+        .monitors
+        .iter()
+        .enumerate()
+        .filter_map(|(i, s)| {
+            let m = rdp::parse_monitor(s, i == 0);
+            if m.is_none() {
+                warn!(spec = %s, "ignoring invalid --monitor geometry (want WIDTHxHEIGHT+LEFT+TOP)");
+            }
+            m
+        })
+        .collect();
+    let (w, h) = match rdp::monitors_bounding_size(&monitors) {
+        Some((bw, bh)) => {
+            info!(count = monitors.len(), width = bw, height = bh, "advertising multi-monitor layout");
+            (bw, bh)
+        }
+        None => (cli.width, cli.height),
+    };
 
     // Start the first session. `spawn_session` owns the per-host reconnect loop
     // and returns the `running` flag + input sender; the Disconnect button stops
@@ -366,6 +391,7 @@ fn main() -> anyhow::Result<()> {
         proxy.clone(),
         curtain.clone(),
         file_offer.clone(),
+        monitors.clone(),
     );
 
     let mut app = App {
@@ -375,6 +401,7 @@ fn main() -> anyhow::Result<()> {
         proxy,
         width: w,
         height: h,
+        monitors,
         done_rx,
         window: None,
         surface: None,
@@ -428,6 +455,7 @@ fn spawn_session(
     proxy: EventLoopProxy<UserEvent>,
     curtain: Arc<AtomicBool>,
     file_offer: Arc<Mutex<Option<std::path::PathBuf>>>,
+    monitors: Vec<rdp::Monitor>,
 ) -> (Arc<AtomicBool>, InputSender, std::sync::mpsc::Receiver<()>) {
     let running = Arc::new(AtomicBool::new(true));
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<Vec<FastPathInputEvent>>(256);
@@ -448,7 +476,7 @@ fn spawn_session(
             // the window, reconnect and resume — the status overlay shows progress.
             let mut input_rx = input_rx;
             while running_thread.load(Ordering::Relaxed) {
-                match run_session(&target, w, h, shared.clone(), cursor.clone(), proxy.clone(), &mut input_rx, curtain.clone(), file_offer.clone()).await {
+                match run_session(&target, w, h, shared.clone(), cursor.clone(), proxy.clone(), &mut input_rx, curtain.clone(), file_offer.clone(), &monitors).await {
                     Ok(()) => info!("session ended"),
                     Err(e) => warn!(error = %e, "session error"),
                 }
@@ -475,6 +503,7 @@ async fn run_session(
     input_rx: &mut rdp::InputReceiver,
     curtain: Arc<AtomicBool>,
     file_offer: Arc<Mutex<Option<std::path::PathBuf>>>,
+    monitors: &[rdp::Monitor],
 ) -> anyhow::Result<()> {
     shared.lock().unwrap().status = format!("Verbinden met {target}...");
     let _ = proxy.send_event(UserEvent::Frame);
@@ -523,7 +552,7 @@ async fn run_session(
     // every exit path (including a failed RDP negotiation) — otherwise the host is
     // left occupied and the next connect trips "existing session".
     let res = async {
-        let (result, initial_buf, share_id) = rdp::connect_rdp(&mut session, w, h).await?;
+        let (result, initial_buf, share_id) = rdp::connect_rdp(&mut session, w, h, monitors).await?;
         info!("RDP active — streaming");
         let mut sink = FrameSink {
             shared,
@@ -549,6 +578,8 @@ struct App {
     proxy: EventLoopProxy<UserEvent>,
     width: u16,
     height: u16,
+    /// Monitor layout to advertise on (re)connect; empty = single monitor.
+    monitors: Vec<rdp::Monitor>,
     /// Signalled when the current session thread has finished its graceful
     /// disconnect; the UI waits on it before exiting / reconnecting.
     done_rx: std::sync::mpsc::Receiver<()>,
@@ -674,6 +705,7 @@ impl App {
             self.proxy.clone(),
             self.curtain.clone(),
             self.file_offer.clone(),
+            self.monitors.clone(),
         );
         self.running = running;
         self.input_tx = Some(input_tx);
