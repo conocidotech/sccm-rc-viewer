@@ -2,7 +2,6 @@
 //! over the pure-Rust SCCM transport, with mouse + keyboard forwarding.
 
 use std::num::NonZeroU32;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +26,7 @@ mod record;
 mod text;
 mod toolbar;
 mod wol;
+mod gpu;
 use toolbar::ToolbarAction;
 
 /// Full version string for `--version`: package version + embedded git hash
@@ -405,6 +405,7 @@ fn main() -> anyhow::Result<()> {
         done_rx,
         window: None,
         surface: None,
+        gpu: None,
         title: format!("SCCM RC {} — {target}", env!("CARGO_PKG_VERSION")),
         last_cursor: (0, 0),
         last_move: std::time::Instant::now(),
@@ -583,8 +584,11 @@ struct App {
     /// Signalled when the current session thread has finished its graceful
     /// disconnect; the UI waits on it before exiting / reconnecting.
     done_rx: std::sync::mpsc::Receiver<()>,
-    window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    window: Option<Arc<Window>>,
+    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// Optional GPU renderer (wgpu). `None` = the softbuffer CPU path (default).
+    /// Enabled with SCCM_RC_GPU=1; falls back to CPU if init fails.
+    gpu: Option<gpu::GpuRenderer>,
     title: String,
     last_cursor: (u16, u16),
     last_move: std::time::Instant,
@@ -796,10 +800,21 @@ impl ApplicationHandler<UserEvent> for App {
         let attrs = Window::default_attributes()
             .with_title(&self.title)
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
-        let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface = softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
         self.surface = Some(surface);
+        // Optional GPU renderer (SCCM_RC_GPU=1). On any failure, keep the CPU path.
+        if std::env::var("SCCM_RC_GPU").as_deref() == Ok("1") {
+            let sz = window.inner_size();
+            match gpu::GpuRenderer::new(window.clone(), sz.width.max(1), sz.height.max(1)) {
+                Ok(g) => {
+                    info!("GPU renderer (wgpu) active");
+                    self.gpu = Some(g);
+                }
+                Err(e) => warn!(error = %e, "GPU init failed — using softbuffer (CPU)"),
+            }
+        }
         self.window = Some(window);
     }
 
@@ -999,7 +1014,34 @@ impl ApplicationHandler<UserEvent> for App {
 }
 
 impl App {
+    /// GPU render path (wgpu). Phase A: the desktop quad + a cleared toolbar
+    /// strip. The toolbar overlay and client-cursor quad are follow-ups; until
+    /// then the GPU path is opt-in via SCCM_RC_GPU=1.
+    fn render_gpu(&mut self) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let size = window.inner_size();
+        let (win_w, win_h) = (size.width.max(1), size.height.max(1));
+        let bar_h = toolbar::TOOLBAR_H.min(win_h);
+        let frame = self.shared.lock().unwrap();
+        let connected = frame.width != 0 && frame.height != 0 && !frame.rgba.is_empty();
+        if let Some(rec) = self.recorder.as_mut() {
+            rec.maybe_capture(frame.width, frame.height, &frame.rgba);
+        }
+        let gpu = self.gpu.as_mut().unwrap();
+        if connected {
+            gpu.render_desktop(win_w, win_h, bar_h, frame.width, frame.height, &frame.rgba);
+        } else {
+            gpu.render_splash(win_w, win_h);
+        }
+    }
+
     fn render(&mut self) {
+        if self.gpu.is_some() {
+            self.render_gpu();
+            return;
+        }
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
             return;
         };

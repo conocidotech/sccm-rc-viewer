@@ -26,3 +26,8 @@ font8x8 = "0.3"
 ab_glyph = "0.2"
 # PNG encoding for session recording.
 image = { version = "0.25", default-features = false, features = ["png"] }
+# GPU rendering (optional path; softbuffer stays as the fallback). wgpu 22 uses
+# raw-window-handle 0.6, matching winit 0.30.
+wgpu = "22"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.3"
