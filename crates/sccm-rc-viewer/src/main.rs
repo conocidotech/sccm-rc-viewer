@@ -29,8 +29,12 @@ mod toolbar;
 mod wol;
 use toolbar::ToolbarAction;
 
+/// Full version string for `--version`: package version + embedded git hash
+/// (set by build.rs). The window title shows just the package version.
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
+
 #[derive(Parser)]
-#[command(name = "sccm-rc-viewer", about = "SCCM Remote Control viewer", version)]
+#[command(name = "sccm-rc-viewer", about = "SCCM Remote Control viewer", version = VERSION)]
 struct Cli {
     /// Target hostname or IP (like CmRcViewer). If omitted, a prompt is shown.
     target: Option<String>,
@@ -374,7 +378,7 @@ fn main() -> anyhow::Result<()> {
         done_rx,
         window: None,
         surface: None,
-        title: format!("SCCM RC — {target}"),
+        title: format!("SCCM RC {} — {target}", env!("CARGO_PKG_VERSION")),
         last_cursor: (0, 0),
         last_move: std::time::Instant::now(),
         cursor,
@@ -648,7 +652,7 @@ impl App {
         let _ = self.done_rx.recv_timeout(std::time::Duration::from_secs(3));
         recent::add(&new_target);
         self.host = new_target.clone();
-        self.title = format!("SCCM RC — {new_target}");
+        self.title = format!("SCCM RC {} — {new_target}", env!("CARGO_PKG_VERSION"));
         if let Some(w) = &self.window {
             w.set_title(&self.title);
         }

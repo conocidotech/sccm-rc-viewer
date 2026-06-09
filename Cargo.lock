@@ -3138,7 +3138,7 @@ dependencies = [
 
 [[package]]
 name = "sccm-rc-core"
-version = "0.0.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3162,7 +3162,7 @@ dependencies = [
 
 [[package]]
 name = "sccm-rc-diag"
-version = "0.0.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3176,7 +3176,7 @@ dependencies = [
 
 [[package]]
 name = "sccm-rc-orders"
-version = "0.0.1"
+version = "0.9.0"
 dependencies = [
  "ironrdp-graphics",
  "thiserror 2.0.18",
@@ -3185,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "sccm-rc-protocol"
-version = "0.0.1"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -3203,7 +3203,7 @@ dependencies = [
 
 [[package]]
 name = "sccm-rc-viewer"
-version = "0.0.1"
+version = "0.9.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
