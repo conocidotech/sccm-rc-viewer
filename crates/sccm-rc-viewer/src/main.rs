@@ -288,7 +288,11 @@ impl SessionSink for FrameSink {
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sccm_rc_core=info")))
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+            // wgpu/naga log Device::maintain etc. at INFO every frame — quiet them
+            // by default so the GPU path doesn't flood the log. RUST_LOG overrides.
+            EnvFilter::new("info,sccm_rc_core=info,wgpu_core=warn,wgpu_hal=warn,naga=warn")
+        }))
         .init();
     let cli = Cli::parse();
 
@@ -1097,10 +1101,30 @@ impl App {
             ov_rgba[o + 3] = 0xff;
         }
 
+        // Client cursor as a GPU quad at the live mouse position — the clean #87
+        // fix (no CPU cursor-box-fill). Same conditions as the softbuffer path.
+        let cursor = {
+            let cur = self.cursor.lock().unwrap();
+            let show = connected
+                && cur.draw
+                && !cur.rgba.is_empty()
+                && self.cursor_inside
+                && self.mouse_win.1 >= toolbar::TOOLBAR_H as f64;
+            window.set_cursor_visible(!show);
+            if show {
+                let dx = self.mouse_win.0 as i32 - cur.hotspot_x as i32;
+                let dy = self.mouse_win.1 as i32 - cur.hotspot_y as i32;
+                Some((cur.width as u32, cur.height as u32, cur.rgba.clone(), dx, dy))
+            } else {
+                None
+            }
+        };
+
         let desktop = if connected { Some((fb_w, fb_h, frame.rgba.as_slice())) } else { None };
+        let cursor_ref = cursor.as_ref().map(|(w, h, r, x, y)| (*w, *h, r.as_slice(), *x, *y));
         let dump = if connected { self.gpu_dump.take() } else { None };
         let gpu = self.gpu.as_mut().unwrap();
-        gpu.render(win_w, win_h, bar_h, desktop, Some((ov_w, ov_h, &ov_rgba, dest)));
+        gpu.render(win_w, win_h, bar_h, desktop, Some((ov_w, ov_h, &ov_rgba, dest)), cursor_ref);
         if let Some(p) = dump {
             match gpu.dump_png(&p) {
                 Ok(()) => info!(path = %p, "GPU frame dumped"),

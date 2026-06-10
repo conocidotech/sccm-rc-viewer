@@ -44,11 +44,14 @@ pub struct GpuRenderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     sampler: wgpu::Sampler,
+    nearest_sampler: wgpu::Sampler,
     bind_layout: wgpu::BindGroupLayout,
     uniform_desktop: wgpu::Buffer,
     uniform_overlay: wgpu::Buffer,
+    uniform_cursor: wgpu::Buffer,
     desktop: Option<Layer>,
     overlay: Option<Layer>,
+    cursor: Option<Layer>,
 }
 
 impl GpuRenderer {
@@ -168,6 +171,13 @@ impl GpuRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        // Crisp (un-smoothed) sampling for the client cursor quad.
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("cursor sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
         let uniform_desc = wgpu::BufferDescriptor {
             label: Some("rect uniform"),
             size: std::mem::size_of::<RectUniform>() as u64,
@@ -176,6 +186,7 @@ impl GpuRenderer {
         };
         let uniform_desktop = device.create_buffer(&uniform_desc);
         let uniform_overlay = device.create_buffer(&uniform_desc);
+        let uniform_cursor = device.create_buffer(&uniform_desc);
 
         Ok(Self {
             surface,
@@ -184,11 +195,14 @@ impl GpuRenderer {
             config,
             pipeline,
             sampler,
+            nearest_sampler,
             bind_layout,
             uniform_desktop,
             uniform_overlay,
+            uniform_cursor,
             desktop: None,
             overlay: None,
+            cursor: None,
         })
     }
 
@@ -263,6 +277,7 @@ impl GpuRenderer {
         bar_h: u32,
         desktop: Option<(u32, u32, &[u8])>,
         overlay: Option<(u32, u32, &[u8], OverlayDest)>,
+        cursor: Option<(u32, u32, &[u8], i32, i32)>,
     ) {
         if win_w != self.config.width || win_h != self.config.height {
             self.resize(win_w, win_h);
@@ -300,6 +315,27 @@ impl GpuRenderer {
             }
         }
 
+        // Cursor: an alpha-blended quad at the live mouse position (window pixels,
+        // nearest sampling). Composited over the desktop — this is the clean #87
+        // fix: no CPU cursor-box-fill, the GPU just draws our cursor on top.
+        let mut draw_cursor = false;
+        if let Some((cw, ch, rgba, dx, dy)) = cursor {
+            if cw > 0 && ch > 0 && rgba.len() >= (cw * ch * 4) as usize {
+                Self::ensure_layer(&self.device, &self.bind_layout, &self.nearest_sampler, &self.uniform_cursor, &mut self.cursor, cw, ch);
+                if let Some(l) = &self.cursor {
+                    Self::write_layer(&self.queue, l, rgba);
+                }
+                let nx = |x: f32| 2.0 * x / win_w as f32 - 1.0;
+                let ny = |y: f32| 1.0 - 2.0 * y / win_h as f32;
+                let rect = RectUniform {
+                    min: [nx(dx as f32), ny((dy + ch as i32) as f32)],
+                    max: [nx((dx + cw as i32) as f32), ny(dy as f32)],
+                };
+                self.queue.write_buffer(&self.uniform_cursor, 0, bytemuck::bytes_of(&rect));
+                draw_cursor = true;
+            }
+        }
+
         let surface_tex = match self.surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -330,6 +366,13 @@ impl GpuRenderer {
             pass.set_pipeline(&self.pipeline);
             if draw_desktop {
                 if let Some(l) = &self.desktop {
+                    pass.set_bind_group(0, &l.bind, &[]);
+                    pass.draw(0..6, 0..1);
+                }
+            }
+            // Cursor under the toolbar so any bleed into the strip is covered.
+            if draw_cursor {
+                if let Some(l) = &self.cursor {
                     pass.set_bind_group(0, &l.bind, &[]);
                     pass.draw(0..6, 0..1);
                 }
@@ -388,6 +431,10 @@ impl GpuRenderer {
             });
             pass.set_pipeline(&self.pipeline);
             if let Some(l) = &self.desktop {
+                pass.set_bind_group(0, &l.bind, &[]);
+                pass.draw(0..6, 0..1);
+            }
+            if let Some(l) = &self.cursor {
                 pass.set_bind_group(0, &l.bind, &[]);
                 pass.draw(0..6, 0..1);
             }
