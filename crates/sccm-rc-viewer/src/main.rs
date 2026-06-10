@@ -186,6 +186,12 @@ struct SharedFrame {
     /// True when the link is encrypted AND the server is verified (Kerberos) — the
     /// toolbar shows a green lock; otherwise amber/red.
     secure: bool,
+    /// GPU path: accumulated dirty region since the last paint (union of all
+    /// updates). `None` = nothing changed. The CPU path ignores these.
+    dirty: Option<UpdateRegion>,
+    /// GPU path: a full-frame copy happened since the last paint (first frame,
+    /// size change, or periodic resync) — the whole texture must be re-uploaded.
+    full_resync: bool,
 }
 
 /// The remote cursor shape, drawn client-side at the local mouse position so it
@@ -232,6 +238,7 @@ impl SessionSink for FrameSink {
                 f.rgba.clear();
                 f.rgba.extend_from_slice(src);
                 self.last_full = std::time::Instant::now();
+                f.full_resync = true; // GPU path: re-upload the whole texture.
             } else {
                 // Copy only the dirty region's rows.
                 let w = iw as usize;
@@ -246,6 +253,22 @@ impl SessionSink for FrameSink {
                         f.rgba[a..b].copy_from_slice(&src[a..b]);
                     }
                 }
+                // GPU path: accumulate the dirty band (union) since the last paint.
+                let acc = UpdateRegion {
+                    left: left as u16,
+                    top: top as u16,
+                    right: right as u16,
+                    bottom: bottom as u16,
+                };
+                f.dirty = Some(match f.dirty.take() {
+                    Some(d) => UpdateRegion {
+                        left: d.left.min(acc.left),
+                        top: d.top.min(acc.top),
+                        right: d.right.max(acc.right),
+                        bottom: d.bottom.max(acc.bottom),
+                    },
+                    None => acc,
+                });
             }
             f.frames = f.frames.wrapping_add(1);
             f.status.clear(); // first/any frame painted — hide the progress text
@@ -1034,9 +1057,20 @@ impl App {
         let size = window.inner_size();
         let (win_w, win_h) = (size.width.max(1), size.height.max(1));
         let bar_h = toolbar::TOOLBAR_H.min(win_h);
-        let frame = self.shared.lock().unwrap();
+        let mut frame = self.shared.lock().unwrap();
         let connected = frame.width != 0 && frame.height != 0 && !frame.rgba.is_empty();
         let (fb_w, fb_h) = (frame.width, frame.height);
+        // Dirty-region upload: full on resync/size-change, else just the changed
+        // row band, else nothing (the GPU texture persists across frames).
+        let desktop_upload = if frame.full_resync {
+            frame.full_resync = false;
+            frame.dirty = None;
+            gpu::DesktopUpload::Full
+        } else if let Some(d) = frame.dirty.take() {
+            gpu::DesktopUpload::Rows(d.top as u32, d.bottom as u32)
+        } else {
+            gpu::DesktopUpload::Skip
+        };
         let bytes_per_sec = frame.bytes_per_sec;
         let status_msg = frame.status.clone();
         let security = frame.security.clone();
@@ -1120,7 +1154,11 @@ impl App {
             }
         };
 
-        let desktop = if connected { Some((fb_w, fb_h, frame.rgba.as_slice())) } else { None };
+        let desktop = if connected {
+            Some((fb_w, fb_h, frame.rgba.as_slice(), desktop_upload))
+        } else {
+            None
+        };
         let cursor_ref = cursor.as_ref().map(|(w, h, r, x, y)| (*w, *h, r.as_slice(), *x, *y));
         let dump = if connected { self.gpu_dump.take() } else { None };
         let gpu = self.gpu.as_mut().unwrap();

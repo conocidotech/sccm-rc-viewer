@@ -37,6 +37,16 @@ pub enum OverlayDest {
     Full,
 }
 
+/// How much of the desktop texture to (re)upload this frame.
+pub enum DesktopUpload {
+    /// Texture unchanged since the last paint — draw the existing one, no upload.
+    Skip,
+    /// Re-upload the whole framebuffer (first frame, size change, periodic resync).
+    Full,
+    /// Upload only rows `[top..=bottom]` (inclusive, in framebuffer pixels).
+    Rows(u32, u32),
+}
+
 pub struct GpuRenderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -221,10 +231,10 @@ impl GpuRenderer {
         slot: &mut Option<Layer>,
         w: u32,
         h: u32,
-    ) {
+    ) -> bool {
         if let Some(l) = slot {
             if l.w == w && l.h == h {
-                return;
+                return false;
             }
         }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -248,6 +258,7 @@ impl GpuRenderer {
             ],
         });
         *slot = Some(Layer { texture, bind, w, h });
+        true
     }
 
     fn write_layer(queue: &wgpu::Queue, layer: &Layer, rgba: &[u8]) {
@@ -268,6 +279,33 @@ impl GpuRenderer {
         );
     }
 
+    /// Upload only rows `[top..=bottom]` of `rgba` (the full-frame buffer) into the
+    /// matching rows of the texture — the dirty-region fast path.
+    fn write_layer_rows(queue: &wgpu::Queue, layer: &Layer, rgba: &[u8], top: u32, bottom: u32) {
+        let top = top.min(layer.h.saturating_sub(1));
+        let bottom = bottom.min(layer.h.saturating_sub(1));
+        if bottom < top {
+            return;
+        }
+        let rows = bottom - top + 1;
+        let offset = (top as u64) * (layer.w as u64) * 4;
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &layer.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: top, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::ImageDataLayout {
+                offset,
+                bytes_per_row: Some(4 * layer.w),
+                rows_per_image: Some(rows),
+            },
+            wgpu::Extent3d { width: layer.w, height: rows, depth_or_array_layers: 1 },
+        );
+    }
+
     /// Render one frame: an optional desktop quad (drawn below `bar_h`) and an
     /// optional overlay quad (toolbar strip or full-window splash).
     pub fn render(
@@ -275,7 +313,7 @@ impl GpuRenderer {
         win_w: u32,
         win_h: u32,
         bar_h: u32,
-        desktop: Option<(u32, u32, &[u8])>,
+        desktop: Option<(u32, u32, &[u8], DesktopUpload)>,
         overlay: Option<(u32, u32, &[u8], OverlayDest)>,
         cursor: Option<(u32, u32, &[u8], i32, i32)>,
     ) {
@@ -286,11 +324,18 @@ impl GpuRenderer {
 
         // Desktop: fills y in [bar_h, win_h].
         let mut draw_desktop = false;
-        if let Some((fb_w, fb_h, rgba)) = desktop {
+        if let Some((fb_w, fb_h, rgba, upload)) = desktop {
             if fb_w > 0 && fb_h > 0 && rgba.len() >= (fb_w * fb_h * 4) as usize {
-                Self::ensure_layer(&self.device, &self.bind_layout, &self.sampler, &self.uniform_desktop, &mut self.desktop, fb_w, fb_h);
+                let recreated = Self::ensure_layer(&self.device, &self.bind_layout, &self.sampler, &self.uniform_desktop, &mut self.desktop, fb_w, fb_h);
                 if let Some(l) = &self.desktop {
-                    Self::write_layer(&self.queue, l, rgba);
+                    // A freshly (re)created texture must be fully uploaded.
+                    match if recreated { DesktopUpload::Full } else { upload } {
+                        DesktopUpload::Skip => {}
+                        DesktopUpload::Full => Self::write_layer(&self.queue, l, rgba),
+                        DesktopUpload::Rows(top, bottom) => {
+                            Self::write_layer_rows(&self.queue, l, rgba, top, bottom)
+                        }
+                    }
                 }
                 let rect = RectUniform { min: [-1.0, -1.0], max: [1.0, top_ndc(bar_h)] };
                 self.queue.write_buffer(&self.uniform_desktop, 0, bytemuck::bytes_of(&rect));
