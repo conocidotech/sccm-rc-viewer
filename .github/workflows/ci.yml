@@ -18,10 +18,18 @@ jobs:
       # Match the local toolchain: x86_64-pc-windows-gnu + a recent MinGW-w64.
       # The `windows` crate's gnu target needs a working dlltool to generate
       # import libraries, which the stock rustup-bundled one lacks (see env.ps1).
-      - name: Install MinGW-w64
-        uses: egor-tensin/setup-mingw@v2
-        with:
-          platform: x64
+      # Use the MSYS2 mingw64 toolchain preinstalled on the runner (MSVCRT-based,
+      # which is exactly what the gnu target links) instead of the egor-tensin
+      # action, whose hardcoded post-install pthread cleanup breaks on the current
+      # Chocolatey mingw package layout.
+      - name: Add MinGW-w64 (preinstalled MSYS2) to PATH
+        shell: pwsh
+        run: |
+          $mingw = "C:\msys64\mingw64\bin"
+          if (-not (Test-Path "$mingw\gcc.exe")) { throw "MinGW gcc not found at $mingw" }
+          Add-Content -Path $env:GITHUB_PATH -Value $mingw
+          & "$mingw\gcc.exe" --version
+          & "$mingw\dlltool.exe" --version
 
       - name: Install Rust (gnu host) + components
         shell: pwsh
