@@ -69,7 +69,17 @@ pub fn sccm_rdp_config(width: u16, height: u16, monitors: Vec<ironrdp_pdu::gcc::
         license_cache: None,
         timezone_info: Default::default(),
         enable_server_pointer: true,
-        pointer_software_rendering: true,
+        // #87 fix: when TRUE, ironrdp-session composites the cursor *into* our
+        // framebuffer (`image.update_pointer`, fast_path.rs) — that is the grey
+        // "blokje" baked into `frame.rgba`, and no `PointerBitmap` is emitted.
+        // FALSE makes the session emit the cursor as a separate PointerBitmap/
+        // Position/Hidden/Default update, which the viewer already draws as a
+        // clean GPU cursor-quad at the live mouse position (main.rs render_gpu).
+        // Override with `SCCM_RC_PTR_SW=1` to restore the old baking behaviour
+        // (useful for an A/B live comparison of the cursor box).
+        pointer_software_rendering: std::env::var("SCCM_RC_PTR_SW")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
     }
 }
 
