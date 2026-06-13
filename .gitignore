@@ -12,8 +12,10 @@ captures/*.pcap
 *.pcapng
 experiments/capture.*
 
-# Live-test logs (transient)
+# Build / live-test logs (transient)
 rc-*.log
+build.log
+*.log
 
 # Frida capture artifacts (transient)
 frida-frames.txt
