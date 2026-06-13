@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Match the local toolchain: x86_64-pc-windows-gnu + a recent MinGW-w64.
+      # The `windows` crate's gnu target needs a working dlltool to generate
+      # import libraries, which the stock rustup-bundled one lacks (see env.ps1).
+      - name: Install MinGW-w64
+        uses: egor-tensin/setup-mingw@v2
+        with:
+          platform: x64
+
+      - name: Install Rust (gnu host) + components
+        shell: pwsh
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+          rustup default stable-x86_64-pc-windows-gnu
+          rustup component add rustfmt clippy
+          rustc -V
+          cargo -V
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Gating checks: the build must succeed and the test suite must pass.
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Test
+        run: cargo test --workspace
+
+      # Advisory checks: the codebase predates fmt/clippy gating. These run for
+      # visibility but do not fail the build yet (see the cleanup follow-up).
+      - name: Format check (advisory)
+        run: cargo fmt --all -- --check
+        continue-on-error: true
+
+      - name: Clippy (advisory)
+        run: cargo clippy --workspace --all-targets
+        continue-on-error: true
