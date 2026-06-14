@@ -11,6 +11,11 @@
   <img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License: MIT OR Apache-2.0">
   <img src="https://img.shields.io/badge/rust-1.96%2B-orange?logo=rust" alt="Rust 1.96+">
   <img src="https://img.shields.io/badge/platform-Windows-0078D6?logo=windows" alt="Platform: Windows">
+  <a href="https://github.com/conocidotech/sccm-rc-viewer/releases/latest"><img src="https://img.shields.io/github/v/release/conocidotech/sccm-rc-viewer?label=release" alt="Latest release"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/conocidotech/sccm-rc-viewer/releases/latest"><img src="https://img.shields.io/badge/Download-Windows%20x64-2ea44f?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows"></a>
 </p>
 
 ---
@@ -95,6 +100,10 @@ The on-wire format is documented in [`docs/SPEC.md`](docs/SPEC.md) and
 session. `experiments/` holds the reverse-engineering tooling used to derive it.
 
 ## Quick start
+
+**Just want to run it?** Download the prebuilt Windows binary from the
+[latest release](https://github.com/conocidotech/sccm-rc-viewer/releases/latest),
+extract, and run `sccm-rc-viewer.exe <host>`. To build from source:
 
 Targets the `x86_64-pc-windows-gnu` toolchain (no admin / MSVC Build Tools needed).
 The MinGW-w64 linker/`dlltool` comes from [WinLibs](https://winlibs.com/).
