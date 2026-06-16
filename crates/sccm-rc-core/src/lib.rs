@@ -10,7 +10,7 @@
 use sccm_rc_protocol::framing::{self, MSG_TYPE_CONTROL, MSG_TYPE_DATA};
 use sccm_rc_protocol::handshake::SspiSession;
 use sccm_rc_protocol::transport::RawConnection;
-use sccm_rc_protocol::{Error, Result};
+pub use sccm_rc_protocol::{Error, Result};
 use tracing::{debug, info, warn};
 
 pub mod rdp;
@@ -59,6 +59,13 @@ impl SccmSession {
             .ok_or_else(|| Error::Protocol("closed before greeting".into()))?;
         let g = framing::decode_control_string(&greeting.body).unwrap_or_default();
         debug!(greeting = %g, "server greeting");
+        if g == "ERROR_EXISTING_SESSION" {
+            // The host still holds an active RC session — very often our own
+            // previous session that wasn't released (e.g. the app was closed
+            // before the graceful disconnect ran). Surface it as a typed error so
+            // the UI can show a clear message instead of a generic retry.
+            return Err(Error::ExistingSession);
+        }
         if g != "START_HANDSHAKE" {
             return Err(Error::Protocol(format!("unexpected greeting: {g}")));
         }

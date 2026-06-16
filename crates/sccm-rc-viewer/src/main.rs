@@ -546,7 +546,19 @@ async fn run_session(
     )
     .await
     {
-        Ok(r) => r?,
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            // Show a clear, actionable status for the common "existing session"
+            // case (usually our own session that wasn't released) instead of
+            // silently re-showing "Verbinden..." on every retry.
+            if matches!(e, sccm_rc_core::Error::ExistingSession) {
+                shared.lock().unwrap().status = format!(
+                    "Al een actieve sessie op {target} (mogelijk je vorige sessie). Opnieuw proberen\u{2026}"
+                );
+                let _ = proxy.send_event(UserEvent::Frame);
+            }
+            return Err(e.into());
+        }
         Err(_) => anyhow::bail!("verbinden met {target} duurde te lang (time-out)"),
     };
     shared.lock().unwrap().status = "Beeldverbinding opzetten...".to_string();
@@ -902,7 +914,13 @@ impl ApplicationHandler<UserEvent> for App {
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
+                // Stop the session and WAIT for its graceful disconnect (the MCS
+                // Disconnect-Provider-Ultimatum, signalled via done_rx) before
+                // exiting — otherwise the SCCM host keeps the session and the next
+                // connect trips ERROR_EXISTING_SESSION. Same teardown contract as
+                // switch_host; bounded so a wedged session thread can't hang exit.
                 self.begin_shutdown();
+                let _ = self.done_rx.recv_timeout(std::time::Duration::from_secs(3));
                 event_loop.exit();
             }
             WindowEvent::Resized(_) => {

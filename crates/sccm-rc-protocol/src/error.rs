@@ -19,6 +19,9 @@ pub enum Error {
 
     #[error("session arbitration timed out (no response from remote user)")]
     ArbitrationTimeout,
+
+    #[error("a remote-control session is already active on the target (possibly a previous session of yours that was not released)")]
+    ExistingSession,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
