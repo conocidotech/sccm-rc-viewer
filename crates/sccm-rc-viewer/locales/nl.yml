@@ -1,0 +1,33 @@
+_version: 2
+
+status:
+  connecting_to: "Verbinden met %{target}…"
+  connecting: "Verbinden…"
+  existing_session: "Er is al een actieve sessie op %{target} (mogelijk je vorige sessie). Opnieuw proberen…"
+  connect_timeout: "verbinden met %{target} duurde te lang (time-out)"
+  setting_up_display: "Beeldverbinding opzetten…"
+  connected: "Verbonden"
+  disconnected: "Verbinding verbroken"
+  disconnected_reason: "Verbinding verbroken — %{reason}"
+
+security:
+  encrypted: "versleuteld"
+  unencrypted: "ONVERSLEUTELD"
+
+mode:
+  view_only: "Alleen kijken"
+  control: "Besturen"
+
+toolbar:
+  disconnect: "Verbreken"
+  fullscreen: "Volledig scherm"
+  record: "Opnemen"
+  view_only: "Alleen kijken"
+  curtain: "Gordijn"
+  send_file: "Bestand sturen"
+  ctrl_alt_del: "Ctrl+Alt+Del"
+
+prompt:
+  label: "Computernaam of IP-adres:"
+  connect: "Verbinden"
+  cancel: "Annuleren"

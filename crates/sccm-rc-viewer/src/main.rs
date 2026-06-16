@@ -29,6 +29,27 @@ mod wol;
 mod gpu;
 use toolbar::ToolbarAction;
 
+// Localization: embeds locales/*.yml at compile time. `t!()` resolves against the
+// locale chosen by `init_locale()` at startup (the Windows UI language, or --lang).
+rust_i18n::i18n!("locales", fallback = "en");
+use rust_i18n::t;
+
+/// Pick and activate the UI locale: `--lang`/`SCCM_RC_LANG` override, else the
+/// Windows UI language, else English. Only en/nl/de are supported.
+fn init_locale(cli_lang: Option<&str>) {
+    let raw = cli_lang
+        .map(str::to_string)
+        .or_else(|| std::env::var("SCCM_RC_LANG").ok())
+        .or_else(sys_locale::get_locale);
+    let lang = match raw.as_deref().unwrap_or("en").get(0..2).unwrap_or("en").to_ascii_lowercase().as_str() {
+        "nl" => "nl",
+        "de" => "de",
+        _ => "en",
+    };
+    rust_i18n::set_locale(lang);
+    info!(locale = lang, source = ?raw, "UI language");
+}
+
 /// Full version string for `--version`: package version + embedded git hash
 /// (set by build.rs). The window title shows just the package version.
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")");
@@ -57,6 +78,9 @@ struct Cli {
     /// The first `--monitor` is the primary; omit for a single monitor.
     #[arg(long = "monitor")]
     monitors: Vec<String>,
+    /// UI language: en, nl or de. Default: follow the Windows UI language.
+    #[arg(long)]
+    lang: Option<String>,
 }
 
 /// Ask for the target hostname via a native Windows input box (used when no
@@ -76,18 +100,21 @@ fn prompt_hostname() -> Option<String> {
          $f=New-Object Windows.Forms.Form; $f.Text='SCCM Remote Control'; \
          $f.ClientSize=New-Object Drawing.Size(360,120); $f.StartPosition='CenterScreen'; \
          $f.FormBorderStyle='FixedDialog'; $f.MaximizeBox=$false; $f.MinimizeBox=$false; \
-         $l=New-Object Windows.Forms.Label; $l.Text='Computernaam of IP-adres:'; \
+         $l=New-Object Windows.Forms.Label; $l.Text='{label}'; \
          $l.AutoSize=$true; $l.Location=New-Object Drawing.Point(12,14); $f.Controls.Add($l); \
          $cb=New-Object Windows.Forms.ComboBox; $cb.Location=New-Object Drawing.Point(12,38); \
          $cb.Size=New-Object Drawing.Size(336,24); $cb.DropDownStyle='DropDown'; \
          @({items})|ForEach-Object{{[void]$cb.Items.Add($_)}}; \
          if($cb.Items.Count -gt 0){{$cb.SelectedIndex=0}}; $f.Controls.Add($cb); \
-         $ok=New-Object Windows.Forms.Button; $ok.Text='Verbinden'; $ok.DialogResult='OK'; \
+         $ok=New-Object Windows.Forms.Button; $ok.Text='{connect}'; $ok.DialogResult='OK'; \
          $ok.Location=New-Object Drawing.Point(192,76); $f.Controls.Add($ok); $f.AcceptButton=$ok; \
-         $cx=New-Object Windows.Forms.Button; $cx.Text='Annuleren'; $cx.DialogResult='Cancel'; \
+         $cx=New-Object Windows.Forms.Button; $cx.Text='{cancel}'; $cx.DialogResult='Cancel'; \
          $cx.Location=New-Object Drawing.Point(273,76); $f.Controls.Add($cx); $f.CancelButton=$cx; \
          $cb.Select(); if($f.ShowDialog() -eq 'OK'){{Write-Output $cb.Text.Trim()}}",
-        items = items
+        items = items,
+        label = t!("prompt.label"),
+        connect = t!("prompt.connect"),
+        cancel = t!("prompt.cancel"),
     );
     let out = std::process::Command::new("powershell")
         .creation_flags(CREATE_NO_WINDOW)
@@ -186,6 +213,10 @@ struct SharedFrame {
     /// True when the link is encrypted AND the server is verified (Kerberos) — the
     /// toolbar shows a green lock; otherwise amber/red.
     secure: bool,
+    /// True when the link is encrypted (regardless of verification). Drives the
+    /// red (unencrypted) vs amber (encrypted-but-unverified) toolbar lock colour
+    /// without string-matching the localized security label.
+    encrypted: bool,
     /// GPU path: accumulated dirty region since the last paint (union of all
     /// updates). `None` = nothing changed. The CPU path ignores these.
     dirty: Option<UpdateRegion>,
@@ -318,6 +349,7 @@ fn main() -> anyhow::Result<()> {
         }))
         .init();
     let cli = Cli::parse();
+    init_locale(cli.lang.as_deref());
 
     // Enable the proven feature set by default so the GUI works out of the box
     // (graphics handshake, take-over, compression, clipboard). Each can still be
@@ -534,7 +566,7 @@ async fn run_session(
     file_offer: Arc<Mutex<Option<std::path::PathBuf>>>,
     monitors: &[rdp::Monitor],
 ) -> anyhow::Result<()> {
-    shared.lock().unwrap().status = format!("Verbinden met {target}...");
+    shared.lock().unwrap().status = t!("status.connecting_to", target => target).to_string();
     let _ = proxy.send_event(UserEvent::Frame);
     // Bound the WHOLE bring-up (TCP connect + SSPI handshake + grant), not just
     // the TCP connect: a peer that completes the TCP handshake but then stalls
@@ -552,16 +584,15 @@ async fn run_session(
             // case (usually our own session that wasn't released) instead of
             // silently re-showing "Verbinden..." on every retry.
             if matches!(e, sccm_rc_core::Error::ExistingSession) {
-                shared.lock().unwrap().status = format!(
-                    "Al een actieve sessie op {target} (mogelijk je vorige sessie). Opnieuw proberen\u{2026}"
-                );
+                shared.lock().unwrap().status =
+                    t!("status.existing_session", target => target).to_string();
                 let _ = proxy.send_event(UserEvent::Frame);
             }
             return Err(e.into());
         }
-        Err(_) => anyhow::bail!("verbinden met {target} duurde te lang (time-out)"),
+        Err(_) => anyhow::bail!("{}", t!("status.connect_timeout", target => target)),
     };
-    shared.lock().unwrap().status = "Beeldverbinding opzetten...".to_string();
+    shared.lock().unwrap().status = t!("status.setting_up_display").to_string();
     let _ = proxy.send_event(UserEvent::Frame);
     // Best-effort: remember this host's MAC (from the ARP table now that we've
     // contacted it) so a later Wake-on-LAN can boot it if it's powered off.
@@ -582,10 +613,11 @@ async fn run_session(
         info!(encrypted, verified, package = ?package, "transport security");
         let mut f = shared.lock().unwrap();
         f.secure = encrypted && verified;
+        f.encrypted = encrypted;
         f.security = match (encrypted, package) {
-            (true, Some(p)) => format!("{p} \u{00b7} versleuteld"),
-            (true, None) => "versleuteld".to_string(),
-            (false, _) => "ONVERSLEUTELD".to_string(),
+            (true, Some(p)) => format!("{p} \u{00b7} {}", t!("security.encrypted")),
+            (true, None) => t!("security.encrypted").to_string(),
+            (false, _) => t!("security.unencrypted").to_string(),
         };
     }
     let started = std::time::Instant::now();
@@ -720,7 +752,7 @@ impl App {
         let Some(new_target) = prompt_hostname() else {
             // No host chosen — close the app (after the teardown completes).
             let _ = self.done_rx.recv_timeout(std::time::Duration::from_secs(3));
-            self.closed = Some("Verbinding verbroken".into());
+            self.closed = Some(t!("status.disconnected").to_string());
             event_loop.exit();
             return;
         };
@@ -739,7 +771,7 @@ impl App {
         {
             let mut f = self.shared.lock().unwrap();
             *f = SharedFrame::default();
-            f.status = format!("Verbinden met {new_target}...");
+            f.status = t!("status.connecting_to", target => new_target).to_string();
         }
         self.closed = None;
         self.connect_start = std::time::Instant::now();
@@ -1093,6 +1125,7 @@ impl App {
         let status_msg = frame.status.clone();
         let security = frame.security.clone();
         let secure = frame.secure;
+        let encrypted = frame.encrypted;
         if let Some(rec) = self.recorder.as_mut() {
             rec.maybe_capture(frame.width, frame.height, &frame.rgba);
         }
@@ -1106,10 +1139,12 @@ impl App {
         };
         let mut ov = vec![0u32; (ov_w * ov_h) as usize];
         if connected {
+            let mode = if self.view_only { t!("mode.view_only") } else { t!("mode.control") }.to_string();
+            let state = t!("status.connected").to_string();
             let status = toolbar::Status {
                 host: &self.host,
-                mode: if self.view_only { "View Only" } else { "Control" },
-                state: "Connected",
+                mode: &mode,
+                state: &state,
                 connected,
                 fps: self.fps,
                 bytes_per_sec,
@@ -1117,6 +1152,8 @@ impl App {
                 curtain: self.curtain.load(Ordering::Relaxed),
                 security: &security,
                 secure,
+                view_only: self.view_only,
+                encrypted,
             };
             toolbar::draw(&mut ov, ov_w, ov_h, &status, self.font.as_ref());
         } else {
@@ -1125,9 +1162,9 @@ impl App {
                 *px = fill;
             }
             let msg = if let Some(reason) = &self.closed {
-                format!("Verbinding verbroken — {reason}")
+                t!("status.disconnected_reason", reason => reason).to_string()
             } else if status_msg.is_empty() {
-                "Verbinden...".to_string()
+                t!("status.connecting").to_string()
             } else {
                 status_msg
             };
@@ -1220,6 +1257,7 @@ impl App {
         let status = frame.status.clone();
         let security = frame.security.clone();
         let secure = frame.secure;
+        let encrypted = frame.encrypted;
         // Session recording: queue the current desktop (throttled internally).
         if let Some(rec) = self.recorder.as_mut() {
             rec.maybe_capture(frame.width, frame.height, &frame.rgba);
@@ -1231,9 +1269,9 @@ impl App {
             }
             // Connection-progress overlay: host title + current phase + a spinner.
             let msg = if let Some(reason) = &self.closed {
-                format!("Verbinding verbroken — {reason}")
+                t!("status.disconnected_reason", reason => reason).to_string()
             } else if status.is_empty() {
-                "Verbinden...".to_string()
+                t!("status.connecting").to_string()
             } else {
                 status
             };
@@ -1402,16 +1440,18 @@ impl App {
 
         // Overlay toolbar/status bar on top.
         let state = if connected {
-            "Connected"
+            t!("status.connected")
         } else if self.closed.is_some() {
-            "Disconnected"
+            t!("status.disconnected")
         } else {
-            "Connecting..."
-        };
+            t!("status.connecting")
+        }
+        .to_string();
+        let mode = if self.view_only { t!("mode.view_only") } else { t!("mode.control") }.to_string();
         let status = toolbar::Status {
             host: &self.host,
-            mode: if self.view_only { "View Only" } else { "Control" },
-            state,
+            mode: &mode,
+            state: &state,
             connected,
             fps: self.fps,
             bytes_per_sec,
@@ -1419,6 +1459,8 @@ impl App {
             curtain: self.curtain.load(Ordering::Relaxed),
             security: if connected { &security } else { "" },
             secure,
+            view_only: self.view_only,
+            encrypted,
         };
         toolbar::draw(&mut buffer[..], win_w, win_h, &status, self.font.as_ref());
 

@@ -1,0 +1,33 @@
+_version: 2
+
+status:
+  connecting_to: "Connecting to %{target}…"
+  connecting: "Connecting…"
+  existing_session: "A remote-control session is already active on %{target} (possibly your previous session). Retrying…"
+  connect_timeout: "connecting to %{target} took too long (timeout)"
+  setting_up_display: "Setting up display connection…"
+  connected: "Connected"
+  disconnected: "Disconnected"
+  disconnected_reason: "Disconnected — %{reason}"
+
+security:
+  encrypted: "encrypted"
+  unencrypted: "UNENCRYPTED"
+
+mode:
+  view_only: "View Only"
+  control: "Control"
+
+toolbar:
+  disconnect: "Disconnect"
+  fullscreen: "Fullscreen"
+  record: "Record"
+  view_only: "View-Only"
+  curtain: "Curtain"
+  send_file: "Send File"
+  ctrl_alt_del: "Ctrl+Alt+Del"
+
+prompt:
+  label: "Computer name or IP address:"
+  connect: "Connect"
+  cancel: "Cancel"

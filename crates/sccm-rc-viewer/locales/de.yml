@@ -1,0 +1,33 @@
+_version: 2
+
+status:
+  connecting_to: "Verbinde mit %{target}…"
+  connecting: "Verbinde…"
+  existing_session: "Auf %{target} ist bereits eine Remotesteuerungssitzung aktiv (möglicherweise deine vorherige Sitzung). Erneuter Versuch…"
+  connect_timeout: "Verbindung zu %{target} hat zu lange gedauert (Zeitüberschreitung)"
+  setting_up_display: "Bildverbindung wird aufgebaut…"
+  connected: "Verbunden"
+  disconnected: "Verbindung getrennt"
+  disconnected_reason: "Verbindung getrennt — %{reason}"
+
+security:
+  encrypted: "verschlüsselt"
+  unencrypted: "UNVERSCHLÜSSELT"
+
+mode:
+  view_only: "Nur ansehen"
+  control: "Steuern"
+
+toolbar:
+  disconnect: "Trennen"
+  fullscreen: "Vollbild"
+  record: "Aufnahme"
+  view_only: "Nur ansehen"
+  curtain: "Sichtschutz"
+  send_file: "Datei senden"
+  ctrl_alt_del: "Strg+Alt+Entf"
+
+prompt:
+  label: "Computername oder IP-Adresse:"
+  connect: "Verbinden"
+  cancel: "Abbrechen"

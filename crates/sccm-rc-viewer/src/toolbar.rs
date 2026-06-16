@@ -4,6 +4,7 @@
 
 use crate::text::TextRenderer;
 use font8x8::UnicodeFonts;
+use rust_i18n::t;
 
 /// Height of the toolbar strip in pixels. The remote desktop renders below it.
 pub const TOOLBAR_H: u32 = 30;
@@ -63,6 +64,12 @@ pub struct Status<'a> {
     pub security: &'a str,
     /// True = encrypted AND server verified (green lock); false = amber/red.
     pub secure: bool,
+    /// True = the link is encrypted (red when false, amber when true-but-unverified)
+    /// — drives the lock colour without string-matching the localized label.
+    pub encrypted: bool,
+    /// True = view-only mode — drives the View-Only button's active tint without
+    /// string-matching the localized mode label.
+    pub view_only: bool,
 }
 
 /// Human-readable bandwidth (e.g. "1.4 MB/s", "320 KB/s").
@@ -76,16 +83,30 @@ fn fmt_bw(bps: u64) -> String {
     }
 }
 
-/// The buttons, right-to-left (rightmost first), with labels.
-const BUTTONS: &[(ToolbarAction, &str)] = &[
-    (ToolbarAction::Disconnect, "Disconnect"),
-    (ToolbarAction::ToggleFullscreen, "Fullscreen"),
-    (ToolbarAction::ToggleRecord, "Record"),
-    (ToolbarAction::ToggleViewOnly, "View-Only"),
-    (ToolbarAction::ToggleCurtain, "Curtain"),
-    (ToolbarAction::SendFile, "Send File"),
-    (ToolbarAction::CtrlAltDel, "Ctrl+Alt+Del"),
+/// The buttons, right-to-left (rightmost first). Labels are resolved per-locale.
+const BUTTONS: &[ToolbarAction] = &[
+    ToolbarAction::Disconnect,
+    ToolbarAction::ToggleFullscreen,
+    ToolbarAction::ToggleRecord,
+    ToolbarAction::ToggleViewOnly,
+    ToolbarAction::ToggleCurtain,
+    ToolbarAction::SendFile,
+    ToolbarAction::CtrlAltDel,
 ];
+
+/// Localized label for a toolbar button.
+fn button_label(action: ToolbarAction) -> String {
+    match action {
+        ToolbarAction::Disconnect => t!("toolbar.disconnect"),
+        ToolbarAction::ToggleFullscreen => t!("toolbar.fullscreen"),
+        ToolbarAction::ToggleRecord => t!("toolbar.record"),
+        ToolbarAction::ToggleViewOnly => t!("toolbar.view_only"),
+        ToolbarAction::ToggleCurtain => t!("toolbar.curtain"),
+        ToolbarAction::SendFile => t!("toolbar.send_file"),
+        ToolbarAction::CtrlAltDel => t!("toolbar.ctrl_alt_del"),
+    }
+    .to_string()
+}
 
 const PAD: u32 = 11; // horizontal padding inside a button
 
@@ -93,8 +114,9 @@ const PAD: u32 = 11; // horizontal padding inside a button
 fn layout(win_w: u32, font: Option<&TextRenderer>) -> Vec<(ToolbarAction, u32, u32, u32, u32)> {
     let mut out = Vec::with_capacity(BUTTONS.len());
     let mut right = win_w.saturating_sub(4);
-    for (action, label) in BUTTONS {
-        let w = measure(font, label) + PAD * 2;
+    for action in BUTTONS {
+        let label = button_label(*action);
+        let w = measure(font, &label) + PAD * 2;
         let x = right.saturating_sub(w);
         out.push((*action, x, 3, w, TOOLBAR_H - 6));
         right = x.saturating_sub(6);
@@ -151,7 +173,7 @@ pub fn draw(buf: &mut [u32], win_w: u32, win_h: u32, status: &Status, font: Opti
     if !status.security.is_empty() {
         let col = if status.secure {
             ACCENT_OK
-        } else if status.security.eq_ignore_ascii_case("onversleuteld") {
+        } else if !status.encrypted {
             REC_RED
         } else {
             ACCENT_BUSY
@@ -166,7 +188,7 @@ pub fn draw(buf: &mut [u32], win_w: u32, win_h: u32, status: &Status, font: Opti
     let lay = layout(win_w, font);
     for (action, bx, by, bw, bh) in &lay {
         let active = (*action == ToolbarAction::ToggleCurtain && status.curtain)
-            || (*action == ToolbarAction::ToggleViewOnly && status.mode == "View Only");
+            || (*action == ToolbarAction::ToggleViewOnly && status.view_only);
         let bg = if *action == ToolbarAction::ToggleRecord && status.recording {
             REC_RED
         } else if active {
@@ -177,9 +199,10 @@ pub fn draw(buf: &mut [u32], win_w: u32, win_h: u32, status: &Status, font: Opti
         fill_rect(buf, win_w, win_h, *bx, *by, *bw, *bh, bg);
     }
     let _ = TEXT_DIM; // reserved for a future hover state
-    for ((_, label), (_, bx, _by, bw, _bh)) in BUTTONS.iter().zip(&lay) {
-        let tx = bx + (bw.saturating_sub(measure(font, label))) / 2;
-        put_text(buf, win_w, win_h, tx, label, BTN_TEXT, font);
+    for (action, (_, bx, _by, bw, _bh)) in BUTTONS.iter().zip(&lay) {
+        let label = button_label(*action);
+        let tx = bx + (bw.saturating_sub(measure(font, &label))) / 2;
+        put_text(buf, win_w, win_h, tx, &label, BTN_TEXT, font);
     }
 }
 

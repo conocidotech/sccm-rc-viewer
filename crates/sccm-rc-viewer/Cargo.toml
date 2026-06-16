@@ -31,3 +31,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 wgpu = "22"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
+# Localization (EN/NL/DE) with compile-time embedded YAML catalogs.
+rust-i18n = "3"
+# Detect the Windows UI language at startup (reads the user locale).
+sys-locale = "0.3"
