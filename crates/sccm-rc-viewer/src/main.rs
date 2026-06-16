@@ -1371,36 +1371,13 @@ impl App {
             && self.mouse_win.1 >= toolbar::TOOLBAR_H as f64;
         window.set_cursor_visible(!draw_remote);
         if draw_remote {
-            // The server bakes its own cursor (a black box) into the desktop at
-            // the live position; a refresh can't remove it (the cursor IS there).
-            // Hide it: fill the box with the background colour sampled just outside
-            // it (clean thanks to the cursor-trail refresh), then draw our own
-            // cursor over the fill. Near-invisible on the wallpaper; a small flat
-            // patch over busy content instead of a stark black square.
-            {
-                let mx = self.mouse_win.0 as i32;
-                let my = self.mouse_win.1 as i32;
-                let half = 16i32;
-                let cx = |x: i32| x.clamp(0, win_w as i32 - 1) as u32;
-                let cy = |y: i32| y.clamp(bar_h as i32, win_h as i32 - 1) as u32;
-                let s1 = buffer[(cy(my) * win_w + cx(mx - half - 6)) as usize];
-                let s2 = buffer[(cy(my) * win_w + cx(mx + half + 6)) as usize];
-                let s3 = buffer[(cy(my - half - 6) * win_w + cx(mx)) as usize];
-                let s4 = buffer[(cy(my + half + 6) * win_w + cx(mx)) as usize];
-                let (mut r, mut g, mut b) = (0u32, 0u32, 0u32);
-                for c in [s1, s2, s3, s4] {
-                    r += (c >> 16) & 0xff;
-                    g += (c >> 8) & 0xff;
-                    b += c & 0xff;
-                }
-                let bg = ((r / 4) << 16) | ((g / 4) << 8) | (b / 4);
-                for y in cy(my - half)..=cy(my + half) {
-                    let row = y * win_w;
-                    for x in cx(mx - half)..=cx(mx + half) {
-                        buffer[(row + x) as usize] = bg;
-                    }
-                }
-            }
+            // The remote cursor arrives as a separate Pointer PDU (the host sends it
+            // out-of-band, NOT baked into the desktop bitmap — see
+            // pointer_software_rendering=false + the FullControl grant), so the
+            // desktop underneath the cursor is already clean. We just alpha-blend our
+            // cursor bitmap on top. RRCV-18: the old background-fill patch that hid a
+            // (no-longer-present) server-baked cursor is removed — that flat patch was
+            // itself visible as a block over non-uniform backgrounds.
             let (cw, ch) = (cur.width as i32, cur.height as i32);
             let ox = self.mouse_win.0 as i32 - cur.hotspot_x as i32;
             let oy = self.mouse_win.1 as i32 - cur.hotspot_y as i32;
