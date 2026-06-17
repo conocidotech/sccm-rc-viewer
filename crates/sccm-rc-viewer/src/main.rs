@@ -658,8 +658,8 @@ struct App {
     done_rx: std::sync::mpsc::Receiver<()>,
     window: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
-    /// Optional GPU renderer (wgpu). `None` = the softbuffer CPU path (default).
-    /// Enabled with SCCM_RC_GPU=1; falls back to CPU if init fails.
+    /// GPU renderer (wgpu), used by default. `None` = the softbuffer CPU fallback
+    /// (forced with SCCM_RC_GPU=0, or when GPU init fails).
     gpu: Option<gpu::GpuRenderer>,
     /// Debug: SCCM_RC_GPU_DUMP=<path> dumps the first connected GPU frame to PNG
     /// (GDI can't screenshot a Vulkan surface). Cleared after one dump.
@@ -879,8 +879,10 @@ impl ApplicationHandler<UserEvent> for App {
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
         let surface = softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
         self.surface = Some(surface);
-        // Optional GPU renderer (SCCM_RC_GPU=1). On any failure, keep the CPU path.
-        if std::env::var("SCCM_RC_GPU").as_deref() == Ok("1") {
+        // GPU renderer (wgpu) by default; the softbuffer CPU path stays as the
+        // fallback. Force CPU with SCCM_RC_GPU=0 (jump-boxes / nested RDP / weak GPU);
+        // on any GPU-init failure we fall back to CPU automatically.
+        if std::env::var("SCCM_RC_GPU").as_deref() != Ok("0") {
             let sz = window.inner_size();
             match gpu::GpuRenderer::new(window.clone(), sz.width.max(1), sz.height.max(1)) {
                 Ok(g) => {
@@ -890,6 +892,8 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 Err(e) => warn!(error = %e, "GPU init failed — using softbuffer (CPU)"),
             }
+        } else {
+            info!("GPU disabled (SCCM_RC_GPU=0) — using softbuffer (CPU)");
         }
         self.window = Some(window);
     }
@@ -1098,8 +1102,8 @@ impl ApplicationHandler<UserEvent> for App {
 impl App {
     /// GPU render path (wgpu). Draws the desktop framebuffer as a quad below the
     /// toolbar, and the toolbar (or the connect/closed splash) as an overlay quad
-    /// rasterised by the existing CPU code into a small buffer. Opt-in via
-    /// SCCM_RC_GPU=1; the client-cursor quad (#87) and dirty uploads are follow-ups.
+    /// rasterised by the existing CPU code into a small buffer. Used by default;
+    /// SCCM_RC_GPU=0 forces the softbuffer CPU fallback.
     fn render_gpu(&mut self) {
         let Some(window) = self.window.clone() else {
             return;
