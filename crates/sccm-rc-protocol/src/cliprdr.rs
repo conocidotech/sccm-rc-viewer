@@ -50,12 +50,21 @@ pub enum ClipPdu {
     Capabilities,
     /// Peer announced its available formats; `has_text` is true if it offers
     /// `CF_UNICODETEXT` (or `CF_TEXT`).
-    FormatList { has_text: bool },
-    FormatListResponse { ok: bool },
+    FormatList {
+        has_text: bool,
+    },
+    FormatListResponse {
+        ok: bool,
+    },
     /// Peer wants the data for `format_id` (we should reply with a data response).
-    FormatDataRequest { format_id: u32 },
+    FormatDataRequest {
+        format_id: u32,
+    },
     /// Peer sent the requested data; `text` is decoded if it was Unicode text.
-    FormatDataResponse { ok: bool, text: Option<String> },
+    FormatDataResponse {
+        ok: bool,
+        text: Option<String>,
+    },
     /// Peer requested a chunk of a file we offered (for file transfer).
     FileContentsRequest {
         stream_id: u32,
@@ -65,7 +74,9 @@ pub enum ClipPdu {
         requested: u32,
     },
     /// Any other message type we don't handle.
-    Other { msg_type: u16 },
+    Other {
+        msg_type: u16,
+    },
 }
 
 /// True if the Format List in `pdu` (a `FormatList`) advertised files.
@@ -90,7 +101,7 @@ pub fn capabilities() -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&1u16.to_le_bytes()); // cCapabilitiesSets
     body.extend_from_slice(&0u16.to_le_bytes()); // pad
-    // General Capability Set.
+                                                 // General Capability Set.
     body.extend_from_slice(&1u16.to_le_bytes()); // capabilitySetType = CB_CAPSTYPE_GENERAL
     body.extend_from_slice(&12u16.to_le_bytes()); // lengthCapability
     body.extend_from_slice(&2u32.to_le_bytes()); // version = CB_CAPS_VERSION_2
@@ -178,7 +189,7 @@ pub fn file_group_descriptor(name: &str, size: u64) -> Vec<u8> {
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
     let mut v = Vec::with_capacity(4 + 592);
     v.extend_from_slice(&1u32.to_le_bytes()); // cItems = 1
-    // CLIPRDR_FILEDESCRIPTOR
+                                              // CLIPRDR_FILEDESCRIPTOR
     v.extend_from_slice(&(FD_ATTRIBUTES | FD_FILESIZE).to_le_bytes()); // flags
     v.extend_from_slice(&[0u8; 32]); // reserved1
     v.extend_from_slice(&FILE_ATTRIBUTE_NORMAL.to_le_bytes()); // fileAttributes
@@ -186,7 +197,7 @@ pub fn file_group_descriptor(name: &str, size: u64) -> Vec<u8> {
     v.extend_from_slice(&[0u8; 8]); // lastWriteTime
     v.extend_from_slice(&((size >> 32) as u32).to_le_bytes()); // fileSizeHigh
     v.extend_from_slice(&(size as u32).to_le_bytes()); // fileSizeLow
-    // fileName: 260 WCHAR (520 bytes), null-padded.
+                                                       // fileName: 260 WCHAR (520 bytes), null-padded.
     let mut fname = [0u8; 520];
     for (i, u) in name.encode_utf16().take(259).enumerate() {
         fname[i * 2..i * 2 + 2].copy_from_slice(&u.to_le_bytes());
@@ -213,7 +224,11 @@ pub fn file_contents_response_range(stream_id: u32, bytes: &[u8]) -> Vec<u8> {
 
 /// Failed FileContents response.
 pub fn file_contents_response_fail(stream_id: u32) -> Vec<u8> {
-    header(CB_FILECONTENTS_RESPONSE, CB_RESPONSE_FAIL, &stream_id.to_le_bytes())
+    header(
+        CB_FILECONTENTS_RESPONSE,
+        CB_RESPONSE_FAIL,
+        &stream_id.to_le_bytes(),
+    )
 }
 
 /// Parse one inbound clipboard PDU. Returns `None` if the buffer is too short.
@@ -360,7 +375,7 @@ mod tests {
         let fgd = file_group_descriptor("tool.exe", 0x1_0000_0042);
         assert_eq!(fgd.len(), 4 + 592);
         assert_eq!(&fgd[0..4], &1u32.to_le_bytes()); // cItems = 1
-        // fileSizeHigh/Low at offset 4 + flags(4)+resv1(32)+attr(4)+resv2(16)+time(8) = 68/72.
+                                                     // fileSizeHigh/Low at offset 4 + flags(4)+resv1(32)+attr(4)+resv2(16)+time(8) = 68/72.
         assert_eq!(&fgd[68..72], &1u32.to_le_bytes()); // high
         assert_eq!(&fgd[72..76], &0x42u32.to_le_bytes()); // low
     }

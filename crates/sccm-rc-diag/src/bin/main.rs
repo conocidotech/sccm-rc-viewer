@@ -6,7 +6,7 @@ use sccm_rc_diag::{checks, Severity};
     name = "sccm-rc-diag",
     about = "Pre-flight diagnostics for SCCM Remote Control targets.\n\
              Run this BEFORE CmRcViewer to see which prerequisite is missing.",
-    version,
+    version
 )]
 struct Cli {
     /// Target hostname or IP

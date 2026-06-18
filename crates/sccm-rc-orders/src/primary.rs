@@ -3,8 +3,8 @@
 //! renders into the canvas. Field order / bit assignment mirrors FreeRDP's
 //! `update_read_*_order`.
 
-use crate::canvas::{OrderCanvas, Rect};
 use crate::cache::{BitmapCache, Glyph, GlyphCache};
+use crate::canvas::{OrderCanvas, Rect};
 use crate::color::colorref;
 use crate::cursor::Cursor;
 use crate::header::{coord, field};
@@ -39,7 +39,11 @@ impl DstBlt {
     }
 
     pub fn draw(&self, canvas: &mut OrderCanvas, clip: Option<Rect>) -> Rect {
-        canvas.dst_rop(Rect::from_ltwh(self.x, self.y, self.w, self.h), clip, Rop3(self.rop))
+        canvas.dst_rop(
+            Rect::from_ltwh(self.x, self.y, self.w, self.h),
+            clip,
+            Rop3(self.rop),
+        )
     }
 }
 
@@ -67,7 +71,11 @@ impl OpaqueRect {
     }
 
     pub fn draw(&self, canvas: &mut OrderCanvas, clip: Option<Rect>) -> Rect {
-        canvas.fill_rect(Rect::from_ltwh(self.x, self.y, self.w, self.h), clip, self.color)
+        canvas.fill_rect(
+            Rect::from_ltwh(self.x, self.y, self.w, self.h),
+            clip,
+            self.color,
+        )
     }
 }
 
@@ -191,7 +199,7 @@ impl PatBlt {
         // approximate with a fill so something is drawn.
         let rect = Rect::from_ltwh(self.x, self.y, self.w, self.h);
         match self.rop {
-            0x00 => canvas.fill_rect(rect, clip, [0, 0, 0, 0xff]),       // BLACKNESS
+            0x00 => canvas.fill_rect(rect, clip, [0, 0, 0, 0xff]), // BLACKNESS
             0xFF => canvas.fill_rect(rect, clip, [0xff, 0xff, 0xff, 0xff]), // WHITENESS
             _ => canvas.fill_rect(rect, clip, self.fore_color),
         }
@@ -321,18 +329,42 @@ fn process_glyph_bytes(
                     0
                 };
                 if let Some(frag) = cache.fragment(id).map(|f| f.to_vec()) {
-                    process_glyph_bytes(canvas, clip, cache, cache_id, ul_char_inc, fore, &frag, gx, y, dirty, depth + 1);
+                    process_glyph_bytes(
+                        canvas,
+                        clip,
+                        cache,
+                        cache_id,
+                        ul_char_inc,
+                        fore,
+                        &frag,
+                        gx,
+                        y,
+                        dirty,
+                        depth + 1,
+                    );
                 }
                 *gx += delta;
             }
             idx => {
                 let mut adv = 0;
                 if let Some(g) = cache.get(cache_id, idx as usize) {
-                    let r = canvas.blit_glyph(*gx + g.x as i32, y + g.y as i32, g.cx, g.cy, &g.aj, clip, fore);
+                    let r = canvas.blit_glyph(
+                        *gx + g.x as i32,
+                        y + g.y as i32,
+                        g.cx,
+                        g.cy,
+                        &g.aj,
+                        clip,
+                        fore,
+                    );
                     if !r.is_empty() {
                         *dirty = if dirty.is_empty() { r } else { dirty.union(&r) };
                     }
-                    adv = if ul_char_inc != 0 { ul_char_inc as i32 } else { read_glyph_delta(data, &mut i) };
+                    adv = if ul_char_inc != 0 {
+                        ul_char_inc as i32
+                    } else {
+                        read_glyph_delta(data, &mut i)
+                    };
                 } else if ul_char_inc == 0 {
                     let _ = read_glyph_delta(data, &mut i);
                 }
@@ -356,13 +388,33 @@ fn draw_glyph_run(
 ) -> Rect {
     let mut gx = x;
     let mut dirty = Rect::new(0, 0, 0, 0);
-    process_glyph_bytes(canvas, clip, cache, cache_id, ul_char_inc, fore, data, &mut gx, y, &mut dirty, 0);
+    process_glyph_bytes(
+        canvas,
+        clip,
+        cache,
+        cache_id,
+        ul_char_inc,
+        fore,
+        data,
+        &mut gx,
+        y,
+        &mut dirty,
+        0,
+    );
     dirty
 }
 
 /// Fill the text background box with `back_color` (inclusive coords), then return
 /// it as a dirty seed. A zero/empty box is ignored.
-fn fill_text_bg(canvas: &mut OrderCanvas, clip: Option<Rect>, l: i32, t: i32, r: i32, b: i32, color: [u8; 4]) -> Rect {
+fn fill_text_bg(
+    canvas: &mut OrderCanvas,
+    clip: Option<Rect>,
+    l: i32,
+    t: i32,
+    r: i32,
+    b: i32,
+    color: [u8; 4],
+) -> Rect {
     if r > l && b > t {
         canvas.fill_rect(Rect::from_inclusive(l, t, r, b), clip, color)
     } else {
@@ -420,10 +472,39 @@ impl GlyphIndex {
         Ok(())
     }
 
-    pub fn draw(&self, canvas: &mut OrderCanvas, clip: Option<Rect>, glyphs: &mut GlyphCache) -> Rect {
-        let bg = fill_text_bg(canvas, clip, self.bk[0], self.bk[1], self.bk[2], self.bk[3], self.back_color);
-        let fg = draw_glyph_run(canvas, clip, glyphs, self.cache_id as usize, self.ul_char_inc, &self.data, self.x, self.y, self.fore_color);
-        if bg.is_empty() { fg } else if fg.is_empty() { bg } else { bg.union(&fg) }
+    pub fn draw(
+        &self,
+        canvas: &mut OrderCanvas,
+        clip: Option<Rect>,
+        glyphs: &mut GlyphCache,
+    ) -> Rect {
+        let bg = fill_text_bg(
+            canvas,
+            clip,
+            self.bk[0],
+            self.bk[1],
+            self.bk[2],
+            self.bk[3],
+            self.back_color,
+        );
+        let fg = draw_glyph_run(
+            canvas,
+            clip,
+            glyphs,
+            self.cache_id as usize,
+            self.ul_char_inc,
+            &self.data,
+            self.x,
+            self.y,
+            self.fore_color,
+        );
+        if bg.is_empty() {
+            fg
+        } else if fg.is_empty() {
+            bg
+        } else {
+            bg.union(&fg)
+        }
     }
 }
 
@@ -467,10 +548,39 @@ impl FastIndex {
         Ok(())
     }
 
-    pub fn draw(&self, canvas: &mut OrderCanvas, clip: Option<Rect>, glyphs: &mut GlyphCache) -> Rect {
-        let bg = fill_text_bg(canvas, clip, self.bk[0], self.bk[1], self.bk[2], self.bk[3], self.back_color);
-        let fg = draw_glyph_run(canvas, clip, glyphs, self.cache_id as usize, self.ul_char_inc, &self.data, self.x, self.y, self.fore_color);
-        if bg.is_empty() { fg } else if fg.is_empty() { bg } else { bg.union(&fg) }
+    pub fn draw(
+        &self,
+        canvas: &mut OrderCanvas,
+        clip: Option<Rect>,
+        glyphs: &mut GlyphCache,
+    ) -> Rect {
+        let bg = fill_text_bg(
+            canvas,
+            clip,
+            self.bk[0],
+            self.bk[1],
+            self.bk[2],
+            self.bk[3],
+            self.back_color,
+        );
+        let fg = draw_glyph_run(
+            canvas,
+            clip,
+            glyphs,
+            self.cache_id as usize,
+            self.ul_char_inc,
+            &self.data,
+            self.x,
+            self.y,
+            self.fore_color,
+        );
+        if bg.is_empty() {
+            fg
+        } else if fg.is_empty() {
+            bg
+        } else {
+            bg.union(&fg)
+        }
     }
 }
 
@@ -516,10 +626,23 @@ impl FastGlyph {
 
     /// Draws (and caches) the inline glyph. `data` = cacheIndex(u8) then, if more
     /// bytes follow, a TS_CACHE_GLYPH_DATA (x,y,cx,cy,aj) to cache + draw.
-    pub fn draw(&self, canvas: &mut OrderCanvas, clip: Option<Rect>, glyphs: &mut GlyphCache) -> Rect {
-        let bg = fill_text_bg(canvas, clip, self.bk[0], self.bk[1], self.bk[2], self.bk[3], self.back_color);
+    pub fn draw(
+        &self,
+        canvas: &mut OrderCanvas,
+        clip: Option<Rect>,
+        glyphs: &mut GlyphCache,
+    ) -> Rect {
+        let bg = fill_text_bg(
+            canvas,
+            clip,
+            self.bk[0],
+            self.bk[1],
+            self.bk[2],
+            self.bk[3],
+            self.back_color,
+        );
         let mut dirty = bg;
-        if self.data.len() >= 1 {
+        if !self.data.is_empty() {
             let cache_index = self.data[0] as usize;
             if self.data.len() >= 9 {
                 // inline TS_CACHE_GLYPH_DATA
@@ -528,14 +651,36 @@ impl FastGlyph {
                 let cx = u16::from_le_bytes([self.data[5], self.data[6]]);
                 let cy = u16::from_le_bytes([self.data[7], self.data[8]]);
                 let aj = self.data.get(9..).unwrap_or(&[]).to_vec();
-                let glyph = Glyph { x: gx, y: gy, cx, cy, aj };
-                let r = canvas.blit_glyph(self.x + gx as i32, self.y + gy as i32, cx, cy, &glyph.aj, clip, self.fore_color);
+                let glyph = Glyph {
+                    x: gx,
+                    y: gy,
+                    cx,
+                    cy,
+                    aj,
+                };
+                let r = canvas.blit_glyph(
+                    self.x + gx as i32,
+                    self.y + gy as i32,
+                    cx,
+                    cy,
+                    &glyph.aj,
+                    clip,
+                    self.fore_color,
+                );
                 glyphs.insert(self.cache_id as usize, cache_index, glyph);
                 if !r.is_empty() {
                     dirty = if dirty.is_empty() { r } else { dirty.union(&r) };
                 }
             } else if let Some(g) = glyphs.get(self.cache_id as usize, cache_index) {
-                let r = canvas.blit_glyph(self.x + g.x as i32, self.y + g.y as i32, g.cx, g.cy, &g.aj, clip, self.fore_color);
+                let r = canvas.blit_glyph(
+                    self.x + g.x as i32,
+                    self.y + g.y as i32,
+                    g.cx,
+                    g.cy,
+                    &g.aj,
+                    clip,
+                    self.fore_color,
+                );
                 if !r.is_empty() {
                     dirty = if dirty.is_empty() { r } else { dirty.union(&r) };
                 }
@@ -579,4 +724,3 @@ fn draw_line(
     }
     dirty
 }
-

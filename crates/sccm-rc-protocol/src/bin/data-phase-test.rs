@@ -16,7 +16,11 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "data-phase-test", about = "Test SecurityFilter seal/unseal against an SCCM RC target", version)]
+#[command(
+    name = "data-phase-test",
+    about = "Test SecurityFilter seal/unseal against an SCCM RC target",
+    version
+)]
 struct Cli {
     target: String,
 }
@@ -24,7 +28,10 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sccm_rc_protocol=debug")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,sccm_rc_protocol=debug")),
+        )
         .init();
     let cli = Cli::parse();
 
@@ -32,7 +39,10 @@ async fn main() -> anyhow::Result<()> {
     info!("TCP connected");
 
     // greeting
-    let g = conn.recv_frame().await?.ok_or_else(|| anyhow::anyhow!("no greeting"))?;
+    let g = conn
+        .recv_frame()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no greeting"))?;
     info!(greeting = %framing::decode_control_string(&g.body).unwrap_or_default(), "greeting");
 
     // handshake
@@ -48,12 +58,22 @@ async fn main() -> anyhow::Result<()> {
         if step.done {
             break;
         }
-        let f = conn.recv_frame().await?.ok_or_else(|| anyhow::anyhow!("closed mid-handshake"))?;
+        let f = conn
+            .recv_frame()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("closed mid-handshake"))?;
         if f.msg_type == MSG_TYPE_CONTROL {
-            anyhow::bail!("server rejected: {}", framing::decode_control_string(&f.body).unwrap_or_default());
+            anyhow::bail!(
+                "server rejected: {}",
+                framing::decode_control_string(&f.body).unwrap_or_default()
+            );
         }
-        peer = framing::decode_handshake_body(&f.body).ok_or_else(|| anyhow::anyhow!("bad token"))?.to_vec();
-        if round >= 10 { anyhow::bail!("no convergence"); }
+        peer = framing::decode_handshake_body(&f.body)
+            .ok_or_else(|| anyhow::anyhow!("bad token"))?
+            .to_vec();
+        if round >= 10 {
+            anyhow::bail!("no convergence");
+        }
     }
     info!("handshake complete");
     let sizes = sspi.message_sizes()?;
@@ -84,17 +104,21 @@ async fn main() -> anyhow::Result<()> {
     // --- 2. send a minimal RDP X.224 Connection Request, observe reply -----
     let x224_cr: &[u8] = &[
         0x03, 0x00, 0x00, 0x13, // TPKT header, total len 19
-        0x0e,                   // X.224 LI = 14
-        0xe0,                   // CR
-        0x00, 0x00,             // dst-ref
-        0x00, 0x00,             // src-ref
-        0x00,                   // class 0
+        0x0e, // X.224 LI = 14
+        0xe0, // CR
+        0x00, 0x00, // dst-ref
+        0x00, 0x00, // src-ref
+        0x00, // class 0
         0x01, 0x00, 0x08, 0x00, // RDP_NEG_REQ: type=1, flags=0, len=8
         0x00, 0x00, 0x00, 0x00, // requestedProtocols = PROTOCOL_RDP (standard)
     ];
     let sealed_cr = sspi.seal(x224_cr)?;
     let frame = make_data_frame(&sealed_cr);
-    info!(plain = x224_cr.len(), wire = frame.len(), "sending sealed X.224 Connection Request");
+    info!(
+        plain = x224_cr.len(),
+        wire = frame.len(),
+        "sending sealed X.224 Connection Request"
+    );
     conn.send_raw(&frame).await?;
 
     match conn.recv_frame().await? {
@@ -103,7 +127,10 @@ async fn main() -> anyhow::Result<()> {
             warn!(control = %s, "server replied with control message (not a sealed data frame)");
         }
         Some(f) if f.msg_type == MSG_TYPE_DATA => {
-            info!(body_len = f.body.len(), "server replied with a DATA frame — attempting unseal");
+            info!(
+                body_len = f.body.len(),
+                "server replied with a DATA frame — attempting unseal"
+            );
             match sspi.unseal(&f.body) {
                 Ok(plain) => {
                     info!(plain_len = plain.len(), "✓ UNSEAL SUCCEEDED");
@@ -116,13 +143,19 @@ async fn main() -> anyhow::Result<()> {
                     if plain.starts_with(&[0x03, 0x00]) {
                         info!("plaintext is a TPKT/X.224 PDU — RDP handshake engaged!");
                     } else if as_str.is_none() {
-                        info!(head = format!("{:02x?}", &plain[..plain.len().min(24)]), "plaintext (not string/TPKT)");
+                        info!(
+                            head = format!("{:02x?}", &plain[..plain.len().min(24)]),
+                            "plaintext (not string/TPKT)"
+                        );
                     }
                 }
                 Err(e) => error!(error = %e, "unseal failed — our codec or key direction is off"),
             }
         }
-        Some(f) => warn!(msg_type = format!("0x{:02x}", f.msg_type), "unexpected frame type"),
+        Some(f) => warn!(
+            msg_type = format!("0x{:02x}", f.msg_type),
+            "unexpected frame type"
+        ),
         None => warn!("server closed connection without replying"),
     }
 

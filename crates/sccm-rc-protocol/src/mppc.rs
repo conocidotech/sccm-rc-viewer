@@ -22,6 +22,7 @@ const HISTORY_CAP: usize = HISTORY_SIZE * 2;
 /// a copy whose source index is masked to the 64K window only at its START. An
 /// earlier circular variant (wrapping every byte) diverged from the server's
 /// compressor deep into long sessions, corrupting the order stream.
+#[derive(Debug)]
 pub struct MppcDecompressor {
     history: Vec<u8>,
     /// HistoryPtr index: grows linearly, reset to 0 on AT_FRONT/FLUSHED.
@@ -44,7 +45,17 @@ impl MppcDecompressor {
 
     /// Decompress one update's payload. `compressed`/`at_front`/`flushed` come
     /// from the fast-path compression flags. Returns the plaintext bytes.
-    pub fn decompress(&mut self, data: &[u8], compressed: bool, at_front: bool, flushed: bool) -> Vec<u8> {
+    // The copy loop advances two independent indices (read `src`, write `offset`)
+    // and mutates `history` in place to mirror FreeRDP's mppc_decompress exactly
+    // (see #82); enumerate/zip would obscure that, so allow the explicit counter.
+    #[allow(clippy::explicit_counter_loop)]
+    pub fn decompress(
+        &mut self,
+        data: &[u8],
+        compressed: bool,
+        at_front: bool,
+        flushed: bool,
+    ) -> Vec<u8> {
         if flushed {
             for b in self.history[..HISTORY_SIZE].iter_mut() {
                 *b = 0;
@@ -165,7 +176,11 @@ struct BitReader<'a> {
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, byte: 0, bit: 0 }
+        Self {
+            data,
+            byte: 0,
+            bit: 0,
+        }
     }
 
     #[inline]
@@ -214,7 +229,11 @@ mod tests {
         // PACKET_COMPRESSED.
         let mut d = MppcDecompressor::new();
         let out = d.decompress(mppc_vectors::RDP5_COMPRESSED, true, true, false);
-        assert_eq!(out.len(), mppc_vectors::RDP5_UNCOMPRESSED.len(), "size mismatch");
+        assert_eq!(
+            out.len(),
+            mppc_vectors::RDP5_UNCOMPRESSED.len(),
+            "size mismatch"
+        );
         // Find the first differing byte for a useful failure message.
         if let Some((i, (a, b))) = out
             .iter()
@@ -249,7 +268,12 @@ mod tests {
             }
             let data = &raw[i + 4..i + 4 + size];
             i += 4 + size;
-            let d = dec.decompress(data, cflags & 0x20 != 0, cflags & 0x40 != 0, cflags & 0x80 != 0);
+            let d = dec.decompress(
+                data,
+                cflags & 0x20 != 0,
+                cflags & 0x40 != 0,
+                cflags & 0x80 != 0,
+            );
             out.extend_from_slice(&d);
             recs += 1;
         }
@@ -290,11 +314,9 @@ mod tests {
         let mut d = MppcDecompressor::new();
         let out = d.decompress(&compressed, true, true, false);
         assert_eq!(
-            out,
-            expected,
+            out, expected,
             "\n got: {:02x?}\nwant: {:02x?}",
-            out,
-            expected
+            out, expected
         );
     }
 

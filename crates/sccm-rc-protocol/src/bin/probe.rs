@@ -12,7 +12,11 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "probe", about = "Connect to TCP/2701 and hexdump the server's reply", version)]
+#[command(
+    name = "probe",
+    about = "Connect to TCP/2701 and hexdump the server's reply",
+    version
+)]
 struct Cli {
     /// Target hostname or IP
     target: String,
@@ -62,7 +66,10 @@ fn parse_hex_u8(s: &str) -> Result<u8, String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sccm_rc_protocol=debug")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,sccm_rc_protocol=debug")),
+        )
         .init();
     let cli = Cli::parse();
 
@@ -81,7 +88,10 @@ async fn main() -> anyhow::Result<()> {
     if !cli.connect_only {
         let mut sspi = SspiSession::new_for_target(&cli.target)?;
         let step = sspi.step(&[])?;
-        info!(token_bytes = step.output.len(), "got initial NEGOTIATE token from SSPI");
+        info!(
+            token_bytes = step.output.len(),
+            "got initial NEGOTIATE token from SSPI"
+        );
 
         hexdump("→ NEGOTIATE token", &step.output);
 
@@ -140,7 +150,13 @@ fn hexdump(label: &str, bytes: &[u8]) {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
         let ascii: String = chunk
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         let hex_str = hex.join(" ");
         println!("  {:04x}  {:<48}  {ascii}", i * 16, hex_str);

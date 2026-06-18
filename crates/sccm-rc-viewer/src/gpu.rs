@@ -12,14 +12,24 @@ use std::sync::Arc;
 use winit::window::Window;
 
 /// Toolbar strip background (matches `toolbar::BAR_BG`), linear-ish for the clear.
-const BAR_CLEAR: wgpu::Color = wgpu::Color { r: 0.027, g: 0.027, b: 0.028, a: 1.0 };
+const BAR_CLEAR: wgpu::Color = wgpu::Color {
+    r: 0.027,
+    g: 0.027,
+    b: 0.028,
+    a: 1.0,
+};
 
-/// NDC destination rectangle for a quad (min = bottom-left, max = top-right).
+/// NDC destination rectangle for a quad (`min` = bottom-left, `max` = top-right)
+/// plus the source UV sub-rect to sample (`uv_min`/`uv_max`, 0..1). Full-texture
+/// quads pass uv_min=[0,0]/uv_max=[1,1]; the desktop quad narrows the UV range to
+/// crop to a single monitor of the combined All-Screens framebuffer (RRCV-20).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RectUniform {
     min: [f32; 2],
     max: [f32; 2],
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
 }
 
 /// A texture + its bind group + the pixel size it was created for.
@@ -78,11 +88,18 @@ impl GpuRenderer {
         }))
         .ok_or_else(|| "no compatible GPU adapter".to_string())?;
 
+        // Keep conservative downlevel limits for broad GPU compatibility, but raise
+        // the max 2D texture dimension to the adapter's real capability. SCCM RC
+        // "All Screens" streams the combined multi-monitor desktop as ONE framebuffer
+        // (e.g. 3840×1080 for two side-by-side 1080p monitors), which exceeds the
+        // downlevel 2048 cap and would otherwise fail texture creation.
+        let mut required_limits = wgpu::Limits::downlevel_defaults();
+        required_limits.max_texture_dimension_2d = adapter.limits().max_texture_dimension_2d;
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("sccm-rc device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults(),
+                required_limits,
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
@@ -129,7 +146,9 @@ impl GpuRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    // VERTEX positions the quad (rect.min/max); FRAGMENT now also
+                    // reads rect.uv_min/uv_max for the monitor-crop UV (RRCV-20).
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -239,7 +258,11 @@ impl GpuRenderer {
         }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("quad texture"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -252,12 +275,26 @@ impl GpuRenderer {
             label: Some("quad bind group"),
             layout: bind_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                wgpu::BindGroupEntry { binding: 2, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                },
             ],
         });
-        *slot = Some(Layer { texture, bind, w, h });
+        *slot = Some(Layer {
+            texture,
+            bind,
+            w,
+            h,
+        });
         true
     }
 
@@ -275,7 +312,11 @@ impl GpuRenderer {
                 bytes_per_row: Some(4 * layer.w),
                 rows_per_image: Some(layer.h),
             },
-            wgpu::Extent3d { width: layer.w, height: layer.h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: layer.w,
+                height: layer.h,
+                depth_or_array_layers: 1,
+            },
         );
     }
 
@@ -302,7 +343,11 @@ impl GpuRenderer {
                 bytes_per_row: Some(4 * layer.w),
                 rows_per_image: Some(rows),
             },
-            wgpu::Extent3d { width: layer.w, height: rows, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: layer.w,
+                height: rows,
+                depth_or_array_layers: 1,
+            },
         );
     }
 
@@ -316,6 +361,10 @@ impl GpuRenderer {
         desktop: Option<(u32, u32, &[u8], DesktopUpload)>,
         overlay: Option<(u32, u32, &[u8], OverlayDest)>,
         cursor: Option<(u32, u32, &[u8], i32, i32)>,
+        // Source UV sub-rect to sample from the desktop texture: [u0, v0, u1, v1]
+        // (0..1). [0,0,1,1] = the whole framebuffer; a narrowed range crops to one
+        // monitor of the combined All-Screens desktop (RRCV-20 view switcher).
+        desktop_uv: [f32; 4],
     ) {
         if win_w != self.config.width || win_h != self.config.height {
             self.resize(win_w, win_h);
@@ -326,10 +375,22 @@ impl GpuRenderer {
         let mut draw_desktop = false;
         if let Some((fb_w, fb_h, rgba, upload)) = desktop {
             if fb_w > 0 && fb_h > 0 && rgba.len() >= (fb_w * fb_h * 4) as usize {
-                let recreated = Self::ensure_layer(&self.device, &self.bind_layout, &self.sampler, &self.uniform_desktop, &mut self.desktop, fb_w, fb_h);
+                let recreated = Self::ensure_layer(
+                    &self.device,
+                    &self.bind_layout,
+                    &self.sampler,
+                    &self.uniform_desktop,
+                    &mut self.desktop,
+                    fb_w,
+                    fb_h,
+                );
                 if let Some(l) = &self.desktop {
                     // A freshly (re)created texture must be fully uploaded.
-                    match if recreated { DesktopUpload::Full } else { upload } {
+                    match if recreated {
+                        DesktopUpload::Full
+                    } else {
+                        upload
+                    } {
                         DesktopUpload::Skip => {}
                         DesktopUpload::Full => Self::write_layer(&self.queue, l, rgba),
                         DesktopUpload::Rows(top, bottom) => {
@@ -337,8 +398,14 @@ impl GpuRenderer {
                         }
                     }
                 }
-                let rect = RectUniform { min: [-1.0, -1.0], max: [1.0, top_ndc(bar_h)] };
-                self.queue.write_buffer(&self.uniform_desktop, 0, bytemuck::bytes_of(&rect));
+                let rect = RectUniform {
+                    min: [-1.0, -1.0],
+                    max: [1.0, top_ndc(bar_h)],
+                    uv_min: [desktop_uv[0], desktop_uv[1]],
+                    uv_max: [desktop_uv[2], desktop_uv[3]],
+                };
+                self.queue
+                    .write_buffer(&self.uniform_desktop, 0, bytemuck::bytes_of(&rect));
                 draw_desktop = true;
             }
         }
@@ -347,15 +414,34 @@ impl GpuRenderer {
         let mut draw_overlay = false;
         if let Some((ov_w, ov_h, rgba, dest)) = overlay {
             if ov_w > 0 && ov_h > 0 && rgba.len() >= (ov_w * ov_h * 4) as usize {
-                Self::ensure_layer(&self.device, &self.bind_layout, &self.sampler, &self.uniform_overlay, &mut self.overlay, ov_w, ov_h);
+                Self::ensure_layer(
+                    &self.device,
+                    &self.bind_layout,
+                    &self.sampler,
+                    &self.uniform_overlay,
+                    &mut self.overlay,
+                    ov_w,
+                    ov_h,
+                );
                 if let Some(l) = &self.overlay {
                     Self::write_layer(&self.queue, l, rgba);
                 }
                 let rect = match dest {
-                    OverlayDest::Full => RectUniform { min: [-1.0, -1.0], max: [1.0, 1.0] },
-                    OverlayDest::TopStrip(h) => RectUniform { min: [-1.0, top_ndc(h)], max: [1.0, 1.0] },
+                    OverlayDest::Full => RectUniform {
+                        min: [-1.0, -1.0],
+                        max: [1.0, 1.0],
+                        uv_min: [0.0, 0.0],
+                        uv_max: [1.0, 1.0],
+                    },
+                    OverlayDest::TopStrip(h) => RectUniform {
+                        min: [-1.0, top_ndc(h)],
+                        max: [1.0, 1.0],
+                        uv_min: [0.0, 0.0],
+                        uv_max: [1.0, 1.0],
+                    },
                 };
-                self.queue.write_buffer(&self.uniform_overlay, 0, bytemuck::bytes_of(&rect));
+                self.queue
+                    .write_buffer(&self.uniform_overlay, 0, bytemuck::bytes_of(&rect));
                 draw_overlay = true;
             }
         }
@@ -366,7 +452,15 @@ impl GpuRenderer {
         let mut draw_cursor = false;
         if let Some((cw, ch, rgba, dx, dy)) = cursor {
             if cw > 0 && ch > 0 && rgba.len() >= (cw * ch * 4) as usize {
-                Self::ensure_layer(&self.device, &self.bind_layout, &self.nearest_sampler, &self.uniform_cursor, &mut self.cursor, cw, ch);
+                Self::ensure_layer(
+                    &self.device,
+                    &self.bind_layout,
+                    &self.nearest_sampler,
+                    &self.uniform_cursor,
+                    &mut self.cursor,
+                    cw,
+                    ch,
+                );
                 if let Some(l) = &self.cursor {
                     Self::write_layer(&self.queue, l, rgba);
                 }
@@ -375,8 +469,11 @@ impl GpuRenderer {
                 let rect = RectUniform {
                     min: [nx(dx as f32), ny((dy + ch as i32) as f32)],
                     max: [nx((dx + cw as i32) as f32), ny(dy as f32)],
+                    uv_min: [0.0, 0.0],
+                    uv_max: [1.0, 1.0],
                 };
-                self.queue.write_buffer(&self.uniform_cursor, 0, bytemuck::bytes_of(&rect));
+                self.queue
+                    .write_buffer(&self.uniform_cursor, 0, bytemuck::bytes_of(&rect));
                 draw_cursor = true;
             }
         }
@@ -389,10 +486,14 @@ impl GpuRenderer {
             }
             Err(_) => return,
         };
-        let view = surface_tex.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = surface_tex
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame"),
+            });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("frame pass"),
@@ -442,7 +543,11 @@ impl GpuRenderer {
         // for (e.g. Bgra8UnormSrgb), or wgpu rejects the render pass as incompatible.
         let tex = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("dump target"),
-            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -461,14 +566,19 @@ impl GpuRenderer {
         });
         let mut enc = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("dump") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("dump"),
+            });
         {
             let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("dump pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(BAR_CLEAR), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(BAR_CLEAR),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
@@ -489,12 +599,25 @@ impl GpuRenderer {
             }
         }
         enc.copy_texture_to_buffer(
-            wgpu::ImageCopyTexture { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::ImageCopyTexture {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             wgpu::ImageCopyBuffer {
                 buffer: &buf,
-                layout: wgpu::ImageDataLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(h) },
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(h),
+                },
             },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
         self.queue.submit(Some(enc.finish()));
 
@@ -504,7 +627,9 @@ impl GpuRenderer {
             let _ = tx.send(r);
         });
         self.device.poll(wgpu::Maintain::Wait);
-        rx.recv().map_err(|e| e.to_string())?.map_err(|e| format!("map: {e:?}"))?;
+        rx.recv()
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("map: {e:?}"))?;
         let data = slice.get_mapped_range();
         let mut img = vec![0u8; (4 * w * h) as usize];
         let row = (4 * w) as usize;
@@ -543,7 +668,7 @@ impl GpuRenderer {
 /// sampling the texture. uv.y is flipped because the textures are top-down while
 /// NDC y points up.
 const SHADER: &str = r#"
-struct Rect { min: vec2<f32>, max: vec2<f32> };
+struct Rect { min: vec2<f32>, max: vec2<f32>, uv_min: vec2<f32>, uv_max: vec2<f32> };
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
 @group(0) @binding(2) var<uniform> rect: Rect;
@@ -570,6 +695,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(tex, samp, in.uv);
+    let uv = mix(rect.uv_min, rect.uv_max, in.uv);
+    return textureSample(tex, samp, uv);
 }
 "#;

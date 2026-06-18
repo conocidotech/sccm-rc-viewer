@@ -18,12 +18,12 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 #![warn(missing_debug_implementations)]
 
-pub mod transport;
-pub mod handshake;
-pub mod framing;
-pub mod error;
-pub mod mppc;
 pub mod cliprdr;
+pub mod error;
+pub mod framing;
+pub mod handshake;
+pub mod mppc;
+pub mod transport;
 
 pub use error::{Error, Result};
 

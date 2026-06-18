@@ -102,7 +102,11 @@ pub struct Bitmap {
 impl Bitmap {
     pub fn new(width: u16, height: u16, data: Vec<u8>) -> Self {
         debug_assert_eq!(data.len(), width as usize * height as usize * 4);
-        Self { width, height, data }
+        Self {
+            width,
+            height,
+            data,
+        }
     }
 
     #[inline]
@@ -166,7 +170,10 @@ impl OrderCanvas {
     /// huge index and write out of bounds. This keeps such a bug a no-op.
     #[inline]
     fn in_bounds(&self, x: i32, y: i32) -> bool {
-        x >= 0 && y >= 0 && (x as usize) < self.width as usize && (y as usize) < self.height as usize
+        x >= 0
+            && y >= 0
+            && (x as usize) < self.width as usize
+            && (y as usize) < self.height as usize
     }
 
     #[inline]
@@ -175,7 +182,12 @@ impl OrderCanvas {
             return [0, 0, 0, 0xff];
         }
         let i = self.idx(x, y);
-        [self.data[i], self.data[i + 1], self.data[i + 2], self.data[i + 3]]
+        [
+            self.data[i],
+            self.data[i + 1],
+            self.data[i + 2],
+            self.data[i + 3],
+        ]
     }
 
     #[inline]
@@ -218,6 +230,7 @@ impl OrderCanvas {
     /// `ceil(cx/8)` bytes per row, MSB-first (bit 7 = leftmost pixel); set bits
     /// are painted `color`, clear bits are left unchanged. Clipped to the canvas
     /// and the optional bounds rect. Returns the touched (clipped) rect.
+    #[allow(clippy::too_many_arguments)]
     pub fn blit_glyph(
         &mut self,
         x: i32,
@@ -233,7 +246,7 @@ impl OrderCanvas {
         if r.is_empty() {
             return r;
         }
-        let row_bytes = (cx as usize + 7) / 8;
+        let row_bytes = (cx as usize).div_ceil(8);
         for py in r.y..r.bottom() {
             let gy = (py - y) as usize;
             let row = gy * row_bytes;
@@ -357,7 +370,7 @@ mod tests {
         let b = Rect::from_ltwh(i32::MIN, i32::MIN, i32::MAX, i32::MAX);
         let _ = a.intersect(&b); // must not panic
         let _ = a.union(&b); // must not panic
-        // A normal intersection is still computed correctly.
+                             // A normal intersection is still computed correctly.
         let i = Rect::from_ltwh(0, 0, 100, 100).intersect(&Rect::from_ltwh(50, 50, 100, 100));
         assert_eq!((i.x, i.y, i.w, i.h), (50, 50, 50, 50));
     }
@@ -369,8 +382,15 @@ mod tests {
         let mut c = OrderCanvas::new(4, 4);
         c.put(1_000_000, 1_000_000, [1, 2, 3, 4]);
         c.put(-5, -5, [1, 2, 3, 4]);
-        assert!(c.data().iter().all(|&b| b == 0), "OOB put must not modify the buffer");
-        assert_eq!(c.get(-1, -1), [0, 0, 0, 0xff], "OOB get returns the opaque fallback");
+        assert!(
+            c.data().iter().all(|&b| b == 0),
+            "OOB put must not modify the buffer"
+        );
+        assert_eq!(
+            c.get(-1, -1),
+            [0, 0, 0, 0xff],
+            "OOB get returns the opaque fallback"
+        );
         assert_eq!(c.get(4, 4), [0, 0, 0, 0xff]);
         // In-bounds round-trip still works (alpha forced opaque).
         c.put(2, 2, [10, 20, 30, 0]);

@@ -38,7 +38,9 @@ SCCM-patched [IronRDP](https://github.com/Devolutions/IronRDP).
 
 **🖥️ Productivity**
 - Bidirectional **clipboard** (MS-RDPECLIP `cliprdr`) and **file transfer**.
-- **Multi-monitor** advertising (per-monitor geometry).
+- **Multi-monitor**: view *all screens* of a multi-monitor target as one combined
+  desktop (SCCM "All Screens", `--all-screens`), then switch to an individual screen
+  on the fly from the toolbar or with **Ctrl+Tab** — instantly, no reconnect.
 - Full keyboard/mouse control incl. Win-key passthrough, or **view-only**.
 
 **🛠️ Operations**
@@ -122,9 +124,9 @@ cargo build --release
 # Connect the viewer to a target (prompts for a host if omitted)
 cargo run --release -p sccm-rc-viewer -- TARGET-HOST
 
-# Multi-monitor advertise, Wake-on-LAN, custom size
-cargo run --release -p sccm-rc-viewer -- TARGET-HOST --wake --mac AA-BB-CC-DD-EE-FF `
-  --monitor 1920x1080+0+0 --monitor 1280x1024+1920+0
+# All Screens (combined multi-monitor desktop; switch screens with Ctrl+Tab),
+# plus Wake-on-LAN
+cargo run --release -p sccm-rc-viewer -- TARGET-HOST --all-screens --wake --mac AA-BB-CC-DD-EE-FF
 
 # Pre-flight prerequisite check (exit 0 = clear, 2 = blocker found)
 cargo run -p sccm-rc-diag -- TARGET-HOST --json

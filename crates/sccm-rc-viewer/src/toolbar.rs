@@ -21,9 +21,27 @@ fn measure(font: Option<&TextRenderer>, s: &str) -> u32 {
 
 /// Draw `s` vertically centered in the toolbar band at `x` (proportional font
 /// if available, else the 8x8 bitmap fallback).
-fn put_text(buf: &mut [u32], win_w: u32, win_h: u32, x: u32, s: &str, color: u32, font: Option<&TextRenderer>) {
+fn put_text(
+    buf: &mut [u32],
+    win_w: u32,
+    win_h: u32,
+    x: u32,
+    s: &str,
+    color: u32,
+    font: Option<&TextRenderer>,
+) {
     match font {
-        Some(f) => f.draw_vcenter(buf, win_w, win_h, x as f32, 0.0, TOOLBAR_H as f32, s, color, FONT_PX),
+        Some(f) => f.draw_vcenter(
+            buf,
+            win_w,
+            win_h,
+            x as f32,
+            0.0,
+            TOOLBAR_H as f32,
+            s,
+            color,
+            FONT_PX,
+        ),
         None => draw_text(buf, win_w, win_h, x, (TOOLBAR_H - 8) / 2, s, color),
     }
 }
@@ -48,6 +66,9 @@ pub enum ToolbarAction {
     ToggleRecord,
     ToggleFullscreen,
     Disconnect,
+    /// Cycle the shown monitor of an All-Screens target (All → 1 → 2 → …). Only
+    /// present when the target is multi-monitor; its label is dynamic.
+    MonitorCycle,
 }
 
 /// Dynamic status shown on the left of the bar.
@@ -70,6 +91,9 @@ pub struct Status<'a> {
     /// True = view-only mode — drives the View-Only button's active tint without
     /// string-matching the localized mode label.
     pub view_only: bool,
+    /// Dynamic label for the monitor switcher (e.g. "Screen: All" / "Screen: 1").
+    /// `None` = single-monitor target, so the switcher button is hidden.
+    pub monitor: Option<&'a str>,
 }
 
 /// Human-readable bandwidth (e.g. "1.4 MB/s", "320 KB/s").
@@ -104,33 +128,59 @@ fn button_label(action: ToolbarAction) -> String {
         ToolbarAction::ToggleCurtain => t!("toolbar.curtain"),
         ToolbarAction::SendFile => t!("toolbar.send_file"),
         ToolbarAction::CtrlAltDel => t!("toolbar.ctrl_alt_del"),
+        // Dynamic label supplied via Status.monitor / buttons_with; never resolved
+        // here, but the match must be exhaustive.
+        ToolbarAction::MonitorCycle => t!("monitor.all"),
     }
     .to_string()
 }
 
 const PAD: u32 = 11; // horizontal padding inside a button
 
-/// Compute button rectangles `(action, x, y, w, h)` laid out from the right edge.
-fn layout(win_w: u32, font: Option<&TextRenderer>) -> Vec<(ToolbarAction, u32, u32, u32, u32)> {
-    let mut out = Vec::with_capacity(BUTTONS.len());
+/// The button row with resolved labels. The monitor switcher is appended (→
+/// leftmost, since the row lays out right-to-left) only when `monitor` is set.
+fn buttons_with(monitor: Option<&str>) -> Vec<(ToolbarAction, String)> {
+    let mut v: Vec<(ToolbarAction, String)> =
+        BUTTONS.iter().map(|a| (*a, button_label(*a))).collect();
+    if let Some(m) = monitor {
+        v.push((ToolbarAction::MonitorCycle, m.to_string()));
+    }
+    v
+}
+
+/// Compute button rectangles `(action, label, x, y, w, h)` laid out from the
+/// right edge. Includes the monitor switcher when `monitor` is `Some`.
+fn layout(
+    win_w: u32,
+    font: Option<&TextRenderer>,
+    monitor: Option<&str>,
+) -> Vec<(ToolbarAction, String, u32, u32, u32, u32)> {
+    let buttons = buttons_with(monitor);
+    let mut out = Vec::with_capacity(buttons.len());
     let mut right = win_w.saturating_sub(4);
-    for action in BUTTONS {
-        let label = button_label(*action);
+    for (action, label) in buttons {
         let w = measure(font, &label) + PAD * 2;
         let x = right.saturating_sub(w);
-        out.push((*action, x, 3, w, TOOLBAR_H - 6));
+        out.push((action, label, x, 3, w, TOOLBAR_H - 6));
         right = x.saturating_sub(6);
     }
     out
 }
 
-/// Hit-test a window-space click against the toolbar buttons.
-pub fn hit_test(x: f64, y: f64, win_w: u32, font: Option<&TextRenderer>) -> Option<ToolbarAction> {
+/// Hit-test a window-space click against the toolbar buttons. `monitor` must
+/// match what `draw` was given so the (optional) switcher button is hit-tested.
+pub fn hit_test(
+    x: f64,
+    y: f64,
+    win_w: u32,
+    font: Option<&TextRenderer>,
+    monitor: Option<&str>,
+) -> Option<ToolbarAction> {
     if y < 0.0 || y >= TOOLBAR_H as f64 {
         return None;
     }
     let (xi, yi) = (x as u32, y as u32);
-    for (action, bx, by, bw, bh) in layout(win_w, font) {
+    for (action, _label, bx, by, bw, bh) in layout(win_w, font, monitor) {
         if xi >= bx && xi < bx + bw && yi >= by && yi < by + bh {
             return Some(action);
         }
@@ -149,7 +199,11 @@ pub fn draw(buf: &mut [u32], win_w: u32, win_h: u32, status: &Status, font: Opti
     fill_rect(buf, win_w, win_h, 0, TOOLBAR_H - 1, win_w, 1, 0x0020_2022);
 
     // Status line (left): a connection dot + "host  ·  mode  ·  state  ·  N fps".
-    let dot = if status.connected { ACCENT_OK } else { ACCENT_BUSY };
+    let dot = if status.connected {
+        ACCENT_OK
+    } else {
+        ACCENT_BUSY
+    };
     fill_rect(buf, win_w, win_h, 10, TOOLBAR_H / 2 - 4, 8, 8, dot);
     let text = format!(
         "{}   \u{00b7}   {}   \u{00b7}   {}   \u{00b7}   {} fps   \u{00b7}   {}",
@@ -185,8 +239,8 @@ pub fn draw(buf: &mut [u32], win_w: u32, win_h: u32, status: &Status, font: Opti
     }
 
     // Buttons (right). Active toggles are tinted; Record is red.
-    let lay = layout(win_w, font);
-    for (action, bx, by, bw, bh) in &lay {
+    let lay = layout(win_w, font, status.monitor);
+    for (action, _label, bx, by, bw, bh) in &lay {
         let active = (*action == ToolbarAction::ToggleCurtain && status.curtain)
             || (*action == ToolbarAction::ToggleViewOnly && status.view_only);
         let bg = if *action == ToolbarAction::ToggleRecord && status.recording {
@@ -199,10 +253,9 @@ pub fn draw(buf: &mut [u32], win_w: u32, win_h: u32, status: &Status, font: Opti
         fill_rect(buf, win_w, win_h, *bx, *by, *bw, *bh, bg);
     }
     let _ = TEXT_DIM; // reserved for a future hover state
-    for (action, (_, bx, _by, bw, _bh)) in BUTTONS.iter().zip(&lay) {
-        let label = button_label(*action);
-        let tx = bx + (bw.saturating_sub(measure(font, &label))) / 2;
-        put_text(buf, win_w, win_h, tx, &label, BTN_TEXT, font);
+    for (_action, label, bx, _by, bw, _bh) in &lay {
+        let tx = bx + (bw.saturating_sub(measure(font, label))) / 2;
+        put_text(buf, win_w, win_h, tx, label, BTN_TEXT, font);
     }
 }
 
@@ -257,7 +310,15 @@ pub fn draw_text_scaled(
 }
 
 /// Draw `s` horizontally centered at vertical position `y`, scaled.
-pub fn draw_text_centered(buf: &mut [u32], win_w: u32, win_h: u32, y: u32, s: &str, color: u32, scale: u32) {
+pub fn draw_text_centered(
+    buf: &mut [u32],
+    win_w: u32,
+    win_h: u32,
+    y: u32,
+    s: &str,
+    color: u32,
+    scale: u32,
+) {
     let w = s.chars().count() as u32 * 8 * scale;
     let x = win_w.saturating_sub(w) / 2;
     draw_text_scaled(buf, win_w, win_h, x, y, s, color, scale);

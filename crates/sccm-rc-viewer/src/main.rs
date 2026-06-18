@@ -1,6 +1,10 @@
 //! SCCM Remote Control viewer — winit window rendering the remote desktop
 //! over the pure-Rust SCCM transport, with mouse + keyboard forwarding.
 
+// Drawing/render/protocol helpers take many positional params (x, y, w, h,
+// color, scale, …); bundling them into structs would hurt readability here.
+#![allow(clippy::too_many_arguments)]
+
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,12 +25,12 @@ use winit::platform::scancode::PhysicalKeyExtScancode;
 use winit::window::{Window, WindowId};
 
 mod audit;
+mod gpu;
 mod recent;
 mod record;
 mod text;
 mod toolbar;
 mod wol;
-mod gpu;
 use toolbar::ToolbarAction;
 
 // Localization: embeds locales/*.yml at compile time. `t!()` resolves against the
@@ -41,7 +45,14 @@ fn init_locale(cli_lang: Option<&str>) {
         .map(str::to_string)
         .or_else(|| std::env::var("SCCM_RC_LANG").ok())
         .or_else(sys_locale::get_locale);
-    let lang = match raw.as_deref().unwrap_or("en").get(0..2).unwrap_or("en").to_ascii_lowercase().as_str() {
+    let lang = match raw
+        .as_deref()
+        .unwrap_or("en")
+        .get(0..2)
+        .unwrap_or("en")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "nl" => "nl",
         "de" => "de",
         _ => "en",
@@ -81,6 +92,13 @@ struct Cli {
     /// UI language: en, nl or de. Default: follow the Windows UI language.
     #[arg(long)]
     lang: Option<String>,
+    /// Capture ALL of a multi-monitor target's screens as one combined desktop
+    /// (SCCM "All Screens"), instead of only the primary. Once connected you can
+    /// switch between individual screens from the toolbar (or Ctrl+Tab). Note:
+    /// this persistently sets UseAllMonitors=1 in the target's registry, so it
+    /// also affects later remote-control sessions to that machine.
+    #[arg(long = "all-screens")]
+    all_screens: bool,
 }
 
 /// Ask for the target hostname via a native Windows input box (used when no
@@ -163,7 +181,14 @@ fn pick_file() -> Option<std::path::PathBuf> {
 
 /// Draw an animated "rotating dots" spinner centered at (cx, cy). A bright head
 /// dot advances around the ring over time with a fading trail.
-fn draw_spinner(buf: &mut [u32], win_w: u32, win_h: u32, cx: u32, cy: u32, elapsed: std::time::Duration) {
+fn draw_spinner(
+    buf: &mut [u32],
+    win_w: u32,
+    win_h: u32,
+    cx: u32,
+    cy: u32,
+    elapsed: std::time::Duration,
+) {
     const N: usize = 12;
     let r = 24.0f32;
     let head = ((elapsed.as_millis() / 70) as usize) % N;
@@ -193,6 +218,7 @@ fn draw_spinner(buf: &mut [u32], win_w: u32, win_h: u32, cx: u32, cy: u32, elaps
 #[derive(Debug, Clone)]
 enum UserEvent {
     Frame,
+    #[allow(dead_code)] // retained for an alternate teardown path
     Closed(String),
 }
 
@@ -376,6 +402,14 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // --all-screens opts into SCCM "All Screens" (the combined multi-monitor
+    // desktop). sccm-rc-core reads SCCM_RC_ALLMON when building the connect
+    // config; the flag just sets it so the feature stays a deliberate opt-in.
+    // Set here (before the session thread spawns) so the env read is race-free.
+    if cli.all_screens {
+        std::env::set_var("SCCM_RC_ALLMON", "1");
+    }
+
     // Target: CLI arg (like CmRcViewer) or, if absent, a prompt.
     let target = match cli.target {
         Some(t) => t,
@@ -432,7 +466,12 @@ fn main() -> anyhow::Result<()> {
         .collect();
     let (w, h) = match rdp::monitors_bounding_size(&monitors) {
         Some((bw, bh)) => {
-            info!(count = monitors.len(), width = bw, height = bh, "advertising multi-monitor layout");
+            info!(
+                count = monitors.len(),
+                width = bw,
+                height = bh,
+                "advertising multi-monitor layout"
+            );
             (bw, bh)
         }
         None => (cli.width, cli.height),
@@ -477,6 +516,8 @@ fn main() -> anyhow::Result<()> {
         host: target.clone(),
         fullscreen: false,
         view_only: false,
+        view: MonitorView::All,
+        switch_flash: 0,
         fps: 0,
         fps_base: 0,
         fps_t: std::time::Instant::now(),
@@ -537,7 +578,20 @@ fn spawn_session(
             // the window, reconnect and resume — the status overlay shows progress.
             let mut input_rx = input_rx;
             while running_thread.load(Ordering::Relaxed) {
-                match run_session(&target, w, h, shared.clone(), cursor.clone(), proxy.clone(), &mut input_rx, curtain.clone(), file_offer.clone(), &monitors).await {
+                match run_session(
+                    &target,
+                    w,
+                    h,
+                    shared.clone(),
+                    cursor.clone(),
+                    proxy.clone(),
+                    &mut input_rx,
+                    curtain.clone(),
+                    file_offer.clone(),
+                    &monitors,
+                )
+                .await
+                {
                     Ok(()) => info!("session ended"),
                     Err(e) => warn!(error = %e, "session error"),
                 }
@@ -625,7 +679,8 @@ async fn run_session(
     // every exit path (including a failed RDP negotiation) — otherwise the host is
     // left occupied and the next connect trips "existing session".
     let res = async {
-        let (result, initial_buf, share_id) = rdp::connect_rdp(&mut session, w, h, monitors).await?;
+        let (result, initial_buf, share_id) =
+            rdp::connect_rdp(&mut session, w, h, monitors).await?;
         info!("RDP active — streaming");
         let mut sink = FrameSink {
             shared,
@@ -633,14 +688,40 @@ async fn run_session(
             proxy,
             last_full: std::time::Instant::now(),
         };
-        rdp::run_active_session(&mut session, result, initial_buf, share_id, &mut sink, input_rx, curtain, file_offer).await
+        rdp::run_active_session(
+            &mut session,
+            result,
+            initial_buf,
+            share_id,
+            &mut sink,
+            input_rx,
+            curtain,
+            file_offer,
+        )
+        .await
     }
     .await;
     // Graceful teardown so the server releases the shadow/host before we reconnect.
     session.disconnect().await;
-    audit::log_event(target, &grant, "disconnect", Some(started.elapsed().as_secs()));
+    audit::log_event(
+        target,
+        &grant,
+        "disconnect",
+        Some(started.elapsed().as_secs()),
+    );
     res?;
     Ok(())
+}
+
+/// Which monitor of a multi-monitor (All-Screens) target the viewer shows.
+/// `All` = the whole combined framebuffer; `Screen(k)` = crop to monitor `k`
+/// (0-based). This is a purely client-side crop of the already-received combined
+/// desktop — switching is instant and needs no reconnect (RRCV-20), unlike the
+/// original CmRcViewer which can only ever show the full stitched image.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MonitorView {
+    All,
+    Screen(u32),
 }
 
 struct App {
@@ -676,6 +757,11 @@ struct App {
     fullscreen: bool,
     /// Local view-only lock: when true, suppress all input to the remote.
     view_only: bool,
+    /// Which monitor of an All-Screens target is shown (client-side crop).
+    view: MonitorView,
+    /// Frames left to show the transient "Switching…" indicator in the toolbar
+    /// state line after a monitor-view change (RRCV-20 feedback).
+    switch_flash: u32,
     fps: u32,
     fps_base: u64,
     fps_t: std::time::Instant,
@@ -722,12 +808,12 @@ impl App {
         let up = KeyboardFlags::RELEASE;
         let ext = KeyboardFlags::EXTENDED;
         let seq = vec![
-            FastPathInputEvent::KeyboardEvent(down, 0x1D),     // Ctrl down
-            FastPathInputEvent::KeyboardEvent(down, 0x38),     // Alt down
-            FastPathInputEvent::KeyboardEvent(ext, 0x53),      // Del down (extended)
+            FastPathInputEvent::KeyboardEvent(down, 0x1D), // Ctrl down
+            FastPathInputEvent::KeyboardEvent(down, 0x38), // Alt down
+            FastPathInputEvent::KeyboardEvent(ext, 0x53),  // Del down (extended)
             FastPathInputEvent::KeyboardEvent(ext | up, 0x53), // Del up
-            FastPathInputEvent::KeyboardEvent(up, 0x38),       // Alt up
-            FastPathInputEvent::KeyboardEvent(up, 0x1D),       // Ctrl up
+            FastPathInputEvent::KeyboardEvent(up, 0x38),   // Alt up
+            FastPathInputEvent::KeyboardEvent(up, 0x1D),   // Ctrl up
         ];
         if let Some(tx) = &self.input_tx {
             let _ = tx.try_send(seq);
@@ -794,12 +880,99 @@ impl App {
         }
     }
 
-    /// Map a window-space cursor position to desktop coordinates.
+    /// Number of equal-width monitors in a combined All-Screens framebuffer,
+    /// inferred from the aspect ratio assuming standard ~16:9 monitors side by
+    /// side (e.g. 3840×1080 → 2). This is a heuristic for the common case; a
+    /// future refinement could use real per-monitor rects from the protocol.
+    /// Returns 1 (no split) for a single-monitor framebuffer.
+    fn monitor_count(fb_w: u32, fb_h: u32) -> u32 {
+        if fb_h == 0 {
+            return 1;
+        }
+        let n = ((fb_w as f32 / fb_h as f32) / (16.0 / 9.0)).round() as i32;
+        n.max(1) as u32
+    }
+
+    /// Source crop rect (in framebuffer pixels) for the current view: `All` =
+    /// the whole framebuffer; `Screen(k)` = the k-th equal-width column. A stale
+    /// `Screen(k)` (k ≥ count, e.g. after reconnecting to a single monitor)
+    /// falls back to the full framebuffer.
+    fn crop_rect(view: MonitorView, fb_w: u32, fb_h: u32) -> (u32, u32, u32, u32) {
+        match view {
+            MonitorView::Screen(k) => {
+                let n = Self::monitor_count(fb_w, fb_h);
+                if n > 1 && k < n {
+                    let colw = fb_w / n;
+                    (k * colw, 0, colw, fb_h)
+                } else {
+                    (0, 0, fb_w, fb_h)
+                }
+            }
+            MonitorView::All => (0, 0, fb_w, fb_h),
+        }
+    }
+
+    /// Toolbar label for the monitor switcher, or `None` when the target is
+    /// single-monitor (button hidden). E.g. "Screen: All" / "Screen: 1".
+    fn monitor_label(&self) -> Option<String> {
+        let (fb_w, fb_h) = {
+            let f = self.shared.lock().unwrap();
+            (f.width, f.height)
+        };
+        Self::monitor_label_for(self.view, fb_w, fb_h)
+    }
+
+    /// As [`monitor_label`], but takes `view`/dims directly so callers that hold
+    /// the frame lock or the surface `&mut` don't re-borrow `*self`.
+    fn monitor_label_for(view: MonitorView, fb_w: u32, fb_h: u32) -> Option<String> {
+        let n = Self::monitor_count(fb_w, fb_h);
+        if n <= 1 {
+            return None;
+        }
+        let which = match view {
+            MonitorView::All => t!("monitor.all").to_string(),
+            MonitorView::Screen(k) if k < n => (k + 1).to_string(),
+            MonitorView::Screen(_) => t!("monitor.all").to_string(),
+        };
+        Some(t!("monitor.label", which => which).to_string())
+    }
+
+    /// Cycle the monitor view: All → Screen(0) → … → Screen(n-1) → All. No-op
+    /// when the target is single-monitor.
+    fn cycle_view(&mut self) {
+        let (fb_w, fb_h) = {
+            let f = self.shared.lock().unwrap();
+            (f.width, f.height)
+        };
+        let n = Self::monitor_count(fb_w, fb_h);
+        if n <= 1 {
+            return;
+        }
+        self.view = match self.view {
+            MonitorView::All => MonitorView::Screen(0),
+            MonitorView::Screen(k) if k + 1 < n => MonitorView::Screen(k + 1),
+            MonitorView::Screen(_) => MonitorView::All,
+        };
+        // Show a brief "Switching…" flash in the toolbar state line (~12 frames);
+        // the new view's pixels are already in the framebuffer so the crop itself
+        // is instant — this is purely visible feedback that the view changed.
+        self.switch_flash = 12;
+        info!(view = ?self.monitor_label(), "switched monitor view");
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Map a window-space cursor position to desktop coordinates, honouring the
+    /// active monitor crop (so a click while viewing Screen 2 lands on the
+    /// right-hand monitor's true desktop coordinate).
     fn map_cursor(&self, x: f64, y: f64) -> (u16, u16) {
         let (fb_w, fb_h) = {
             let f = self.shared.lock().unwrap();
             (f.width.max(1), f.height.max(1))
         };
+        let (cx, cy, cw, ch) = Self::crop_rect(self.view, fb_w, fb_h);
+        let (cw, ch) = (cw.max(1), ch.max(1));
         let (win_w, win_h) = self
             .window
             .as_ref()
@@ -808,12 +981,13 @@ impl App {
                 (s.width.max(1), s.height.max(1))
             })
             .unwrap_or((1, 1));
-        // The desktop occupies the window below the toolbar strip.
+        // The desktop occupies the window below the toolbar strip and shows only
+        // the crop sub-rect, so window space maps into [cx, cx+cw) × [cy, cy+ch).
         let bar = toolbar::TOOLBAR_H as f64;
         let usable_h = (win_h as f64 - bar).max(1.0);
         let yy = (y - bar).max(0.0);
-        let dx = (x * fb_w as f64 / win_w as f64).clamp(0.0, (fb_w - 1) as f64);
-        let dy = (yy * fb_h as f64 / usable_h).clamp(0.0, (fb_h - 1) as f64);
+        let dx = (cx as f64 + x * cw as f64 / win_w as f64).clamp(0.0, (fb_w - 1) as f64);
+        let dy = (cy as f64 + yy * ch as f64 / usable_h).clamp(0.0, (fb_h - 1) as f64);
         (dx as u16, dy as u16)
     }
 
@@ -836,6 +1010,7 @@ impl App {
                 self.view_only = !self.view_only;
                 info!(view_only = self.view_only, "toggled view-only");
             }
+            ToolbarAction::MonitorCycle => self.cycle_view(),
             ToolbarAction::ToggleRecord => {
                 if self.recorder.is_some() {
                     let frames = self.recorder.as_ref().map(|r| r.frame_count()).unwrap_or(0);
@@ -877,7 +1052,8 @@ impl ApplicationHandler<UserEvent> for App {
             .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
-        let surface = softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
+        let surface =
+            softbuffer::Surface::new(&context, window.clone()).expect("softbuffer surface");
         self.surface = Some(surface);
         // GPU renderer (wgpu) by default; the softbuffer CPU path stays as the
         // fallback. Force CPU with SCCM_RC_GPU=0 (jump-boxes / nested RDP / weak GPU);
@@ -1017,9 +1193,14 @@ impl ApplicationHandler<UserEvent> for App {
                             .as_ref()
                             .map(|w| w.inner_size().width.max(1))
                             .unwrap_or(1);
-                        if let Some(action) =
-                            toolbar::hit_test(self.mouse_win.0, self.mouse_win.1, win_w, self.font.as_ref())
-                        {
+                        let monitor = self.monitor_label();
+                        if let Some(action) = toolbar::hit_test(
+                            self.mouse_win.0,
+                            self.mouse_win.1,
+                            win_w,
+                            self.font.as_ref(),
+                            monitor.as_deref(),
+                        ) {
                             self.run_toolbar_action(action, event_loop);
                         }
                     }
@@ -1068,6 +1249,16 @@ impl ApplicationHandler<UserEvent> for App {
                     self.send_ctrl_alt_del();
                     return;
                 }
+                // Ctrl+Tab → cycle the monitor view (All / Screen N) of a
+                // multi-monitor target. Handled locally, never forwarded.
+                if self.modifiers.control_key()
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Tab))
+                {
+                    if event.state == ElementState::Pressed {
+                        self.cycle_view();
+                    }
+                    return;
+                }
                 // winit gives us the OS hardware scancode, which on Windows is
                 // the PS/2 set-1 scancode RDP expects (0xE000 prefix = extended).
                 if let Some(sc) = event.physical_key.to_scancode() {
@@ -1114,6 +1305,20 @@ impl App {
         let mut frame = self.shared.lock().unwrap();
         let connected = frame.width != 0 && frame.height != 0 && !frame.rgba.is_empty();
         let (fb_w, fb_h) = (frame.width, frame.height);
+        // Active monitor crop (RRCV-20): source UV sub-rect + toolbar label. The
+        // `_for` variants take the dims we already hold so they don't re-lock.
+        let monitor_label = Self::monitor_label_for(self.view, fb_w, fb_h);
+        let desktop_uv = if connected && fb_w > 0 && fb_h > 0 {
+            let (cx, cy, cw, ch) = Self::crop_rect(self.view, fb_w, fb_h);
+            [
+                cx as f32 / fb_w as f32,
+                cy as f32 / fb_h as f32,
+                (cx + cw) as f32 / fb_w as f32,
+                (cy + ch) as f32 / fb_h as f32,
+            ]
+        } else {
+            [0.0, 0.0, 1.0, 1.0]
+        };
         // Dirty-region upload: full on resync/size-change, else just the changed
         // row band, else nothing (the GPU texture persists across frames).
         let desktop_upload = if frame.full_resync {
@@ -1143,8 +1348,20 @@ impl App {
         };
         let mut ov = vec![0u32; (ov_w * ov_h) as usize];
         if connected {
-            let mode = if self.view_only { t!("mode.view_only") } else { t!("mode.control") }.to_string();
-            let state = t!("status.connected").to_string();
+            let mode = if self.view_only {
+                t!("mode.view_only")
+            } else {
+                t!("mode.control")
+            }
+            .to_string();
+            let state = if self.switch_flash > 0 {
+                self.switch_flash -= 1;
+                // Keep animating the flash down even if no server frames arrive.
+                window.request_redraw();
+                t!("monitor.switching").to_string()
+            } else {
+                t!("status.connected").to_string()
+            };
             let status = toolbar::Status {
                 host: &self.host,
                 mode: &mode,
@@ -1158,10 +1375,15 @@ impl App {
                 secure,
                 view_only: self.view_only,
                 encrypted,
+                monitor: monitor_label.as_deref(),
             };
             toolbar::draw(&mut ov, ov_w, ov_h, &status, self.font.as_ref());
         } else {
-            let fill = if self.closed.is_some() { 0x0040_0000 } else { 0x0020_2020 };
+            let fill = if self.closed.is_some() {
+                0x0040_0000
+            } else {
+                0x0020_2020
+            };
             for px in ov.iter_mut() {
                 *px = fill;
             }
@@ -1174,13 +1396,44 @@ impl App {
             };
             let (cx, cy) = (ov_w / 2, ov_h / 2);
             if self.closed.is_none() {
-                draw_spinner(&mut ov, ov_w, ov_h, cx, cy.saturating_sub(72), self.connect_start.elapsed());
+                draw_spinner(
+                    &mut ov,
+                    ov_w,
+                    ov_h,
+                    cx,
+                    cy.saturating_sub(72),
+                    self.connect_start.elapsed(),
+                );
             }
             if let Some(f) = self.font.as_ref() {
-                f.draw_centered(&mut ov, ov_w, ov_h, cy as f32 + 4.0, &self.host, 0x00FF_FFFF, 34.0);
-                f.draw_centered(&mut ov, ov_w, ov_h, cy as f32 + 38.0, &msg, 0x00B0_C0D0, 19.0);
+                f.draw_centered(
+                    &mut ov,
+                    ov_w,
+                    ov_h,
+                    cy as f32 + 4.0,
+                    &self.host,
+                    0x00FF_FFFF,
+                    34.0,
+                );
+                f.draw_centered(
+                    &mut ov,
+                    ov_w,
+                    ov_h,
+                    cy as f32 + 38.0,
+                    &msg,
+                    0x00B0_C0D0,
+                    19.0,
+                );
             } else {
-                toolbar::draw_text_centered(&mut ov, ov_w, ov_h, cy.saturating_sub(28), &self.host, 0x00FF_FFFF, 3);
+                toolbar::draw_text_centered(
+                    &mut ov,
+                    ov_w,
+                    ov_h,
+                    cy.saturating_sub(28),
+                    &self.host,
+                    0x00FF_FFFF,
+                    3,
+                );
                 toolbar::draw_text_centered(&mut ov, ov_w, ov_h, cy + 8, &msg, 0x00B0_C0D0, 2);
             }
         }
@@ -1207,7 +1460,13 @@ impl App {
             if show {
                 let dx = self.mouse_win.0 as i32 - cur.hotspot_x as i32;
                 let dy = self.mouse_win.1 as i32 - cur.hotspot_y as i32;
-                Some((cur.width as u32, cur.height as u32, cur.rgba.clone(), dx, dy))
+                Some((
+                    cur.width as u32,
+                    cur.height as u32,
+                    cur.rgba.clone(),
+                    dx,
+                    dy,
+                ))
             } else {
                 None
             }
@@ -1218,10 +1477,24 @@ impl App {
         } else {
             None
         };
-        let cursor_ref = cursor.as_ref().map(|(w, h, r, x, y)| (*w, *h, r.as_slice(), *x, *y));
-        let dump = if connected { self.gpu_dump.take() } else { None };
+        let cursor_ref = cursor
+            .as_ref()
+            .map(|(w, h, r, x, y)| (*w, *h, r.as_slice(), *x, *y));
+        let dump = if connected {
+            self.gpu_dump.take()
+        } else {
+            None
+        };
         let gpu = self.gpu.as_mut().unwrap();
-        gpu.render(win_w, win_h, bar_h, desktop, Some((ov_w, ov_h, &ov_rgba, dest)), cursor_ref);
+        gpu.render(
+            win_w,
+            win_h,
+            bar_h,
+            desktop,
+            Some((ov_w, ov_h, &ov_rgba, dest)),
+            cursor_ref,
+            desktop_uv,
+        );
         if let Some(p) = dump {
             match gpu.dump_png(&p) {
                 Ok(()) => info!(path = %p, "GPU frame dumped"),
@@ -1235,6 +1508,9 @@ impl App {
             self.render_gpu();
             return;
         }
+        // Capture the monitor view before borrowing the surface `&mut self.surface`
+        // (which then precludes any `&self` method call for the rest of render).
+        let view = self.view;
         let (Some(window), Some(surface)) = (self.window.as_ref(), self.surface.as_mut()) else {
             return;
         };
@@ -1258,6 +1534,7 @@ impl App {
         let frame_count = frame.frames;
         let bytes_per_sec = frame.bytes_per_sec;
         let connected = frame.width != 0 && frame.height != 0 && !frame.rgba.is_empty();
+        let monitor_label = Self::monitor_label_for(view, frame.width, frame.height);
         let status = frame.status.clone();
         let security = frame.security.clone();
         let secure = frame.secure;
@@ -1267,7 +1544,11 @@ impl App {
             rec.maybe_capture(frame.width, frame.height, &frame.rgba);
         }
         if !connected {
-            let fill = if self.closed.is_some() { 0x0040_0000 } else { 0x0020_2020 };
+            let fill = if self.closed.is_some() {
+                0x0040_0000
+            } else {
+                0x0020_2020
+            };
             for px in buffer.iter_mut() {
                 *px = fill;
             }
@@ -1283,35 +1564,80 @@ impl App {
             let cy = win_h / 2;
             // Animated spinner above the text (only while still connecting).
             if self.closed.is_none() {
-                draw_spinner(&mut buffer[..], win_w, win_h, cx, cy.saturating_sub(72), self.connect_start.elapsed());
+                draw_spinner(
+                    &mut buffer[..],
+                    win_w,
+                    win_h,
+                    cx,
+                    cy.saturating_sub(72),
+                    self.connect_start.elapsed(),
+                );
             }
             if let Some(f) = self.font.as_ref() {
-                f.draw_centered(&mut buffer[..], win_w, win_h, cy as f32 + 4.0, &self.host, 0x00FF_FFFF, 34.0);
-                f.draw_centered(&mut buffer[..], win_w, win_h, cy as f32 + 38.0, &msg, 0x00B0_C0D0, 19.0);
+                f.draw_centered(
+                    &mut buffer[..],
+                    win_w,
+                    win_h,
+                    cy as f32 + 4.0,
+                    &self.host,
+                    0x00FF_FFFF,
+                    34.0,
+                );
+                f.draw_centered(
+                    &mut buffer[..],
+                    win_w,
+                    win_h,
+                    cy as f32 + 38.0,
+                    &msg,
+                    0x00B0_C0D0,
+                    19.0,
+                );
             } else {
-                toolbar::draw_text_centered(&mut buffer[..], win_w, win_h, cy.saturating_sub(28), &self.host, 0x00FF_FFFF, 3);
-                toolbar::draw_text_centered(&mut buffer[..], win_w, win_h, cy + 8, &msg, 0x00B0_C0D0, 2);
+                toolbar::draw_text_centered(
+                    &mut buffer[..],
+                    win_w,
+                    win_h,
+                    cy.saturating_sub(28),
+                    &self.host,
+                    0x00FF_FFFF,
+                    3,
+                );
+                toolbar::draw_text_centered(
+                    &mut buffer[..],
+                    win_w,
+                    win_h,
+                    cy + 8,
+                    &msg,
+                    0x00B0_C0D0,
+                    2,
+                );
             }
         } else {
             let (fb_w, fb_h) = (frame.width, frame.height);
             let src = &frame.rgba;
             let fbw = fb_w as usize;
-            if win_w == fb_w && desk_h == fb_h {
+            // Active monitor crop (RRCV-20): blit only this source sub-rect, scaled
+            // to fill the desktop area. `All` = the whole framebuffer.
+            let (cx, cy, cw, ch) = Self::crop_rect(view, fb_w, fb_h);
+            let (cx, cy) = (cx as usize, cy as usize);
+            if win_w == cw && desk_h == ch {
                 // 1:1 — direct copy, sharpest (no interpolation).
                 for wy in bar_h..win_h {
-                    let row = (wy - bar_h) as usize * fbw;
+                    let row = (cy + (wy - bar_h) as usize) * fbw + cx;
                     let out_row = (wy * win_w) as usize;
                     for wx in 0..win_w as usize {
                         let si = (row + wx) * 4;
                         buffer[out_row + wx] = if si + 2 < src.len() {
-                            ((src[si] as u32) << 16) | ((src[si + 1] as u32) << 8) | (src[si + 2] as u32)
+                            ((src[si] as u32) << 16)
+                                | ((src[si + 1] as u32) << 8)
+                                | (src[si + 2] as u32)
                         } else {
                             0
                         };
                     }
                 }
             } else {
-                // Bilinear scale of the whole desktop. (A dirty-region variant was
+                // Bilinear scale of the cropped sub-rect. (A dirty-region variant was
                 // tried but needs a full per-frame copy to erase the client cursor,
                 // costing ~the same; the 60 fps paint cap is the real client win.)
                 let map = |dst: u32, dst_n: u32, src_n: u32| -> (usize, usize, u32) {
@@ -1324,16 +1650,22 @@ impl App {
                     let i1 = (i0 + 1).min(max_i);
                     (i0, i1, ((s - i0 as f64) * 256.0) as u32)
                 };
-                let cols: Vec<(usize, usize, u32)> =
-                    (0..win_w).map(|wx| map(wx, win_w, fb_w)).collect();
+                // Column/row sample indices are taken within the crop, then shifted
+                // by the crop origin (cx, cy) into the full framebuffer.
+                let cols: Vec<(usize, usize, u32)> = (0..win_w)
+                    .map(|wx| {
+                        let (i0, i1, f) = map(wx, win_w, cw);
+                        (cx + i0, cx + i1, f)
+                    })
+                    .collect();
                 #[inline(always)]
                 fn lerp(a: u32, b: u32, f: u32) -> u32 {
                     (a * (256 - f) + b * f) >> 8
                 }
                 for wy in bar_h..win_h {
-                    let (y0, y1, fy) = map(wy - bar_h, desk_h, fb_h);
-                    let r0 = y0 * fbw;
-                    let r1 = y1 * fbw;
+                    let (y0, y1, fy) = map(wy - bar_h, desk_h, ch);
+                    let r0 = (cy + y0) * fbw;
+                    let r1 = (cy + y1) * fbw;
                     let out_row = (wy * win_w) as usize;
                     for (wx, &(x0, x1, fx)) in cols.iter().enumerate() {
                         let p00 = (r0 + x0) * 4;
@@ -1403,7 +1735,11 @@ impl App {
                     if a == 0 {
                         continue;
                     }
-                    let (r, g, b) = (cur.rgba[si] as u32, cur.rgba[si + 1] as u32, cur.rgba[si + 2] as u32);
+                    let (r, g, b) = (
+                        cur.rgba[si] as u32,
+                        cur.rgba[si + 1] as u32,
+                        cur.rgba[si + 2] as u32,
+                    );
                     let di = (py as u32 * win_w + px as u32) as usize;
                     buffer[di] = if a == 255 {
                         (r << 16) | (g << 8) | b
@@ -1420,15 +1756,25 @@ impl App {
         drop(cur);
 
         // Overlay toolbar/status bar on top.
-        let state = if connected {
-            t!("status.connected")
+        let state = if connected && self.switch_flash > 0 {
+            self.switch_flash -= 1;
+            if let Some(w) = &self.window {
+                w.request_redraw(); // keep the flash animating without server frames
+            }
+            t!("monitor.switching").to_string()
+        } else if connected {
+            t!("status.connected").to_string()
         } else if self.closed.is_some() {
-            t!("status.disconnected")
+            t!("status.disconnected").to_string()
         } else {
-            t!("status.connecting")
+            t!("status.connecting").to_string()
+        };
+        let mode = if self.view_only {
+            t!("mode.view_only")
+        } else {
+            t!("mode.control")
         }
         .to_string();
-        let mode = if self.view_only { t!("mode.view_only") } else { t!("mode.control") }.to_string();
         let status = toolbar::Status {
             host: &self.host,
             mode: &mode,
@@ -1442,6 +1788,7 @@ impl App {
             secure,
             view_only: self.view_only,
             encrypted,
+            monitor: monitor_label.as_deref(),
         };
         toolbar::draw(&mut buffer[..], win_w, win_h, &status, self.font.as_ref());
 

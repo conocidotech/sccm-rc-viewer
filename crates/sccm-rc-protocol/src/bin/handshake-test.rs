@@ -52,7 +52,10 @@ async fn main() -> anyhow::Result<()> {
                 warn!("unexpected greeting (continuing anyway)");
             }
         }
-        Some(frame) => anyhow::bail!("expected control greeting, got type 0x{:02x}", frame.msg_type),
+        Some(frame) => anyhow::bail!(
+            "expected control greeting, got type 0x{:02x}",
+            frame.msg_type
+        ),
         None => anyhow::bail!("server closed before greeting"),
     }
 
@@ -65,7 +68,12 @@ async fn main() -> anyhow::Result<()> {
     loop {
         round += 1;
         let step = sspi.step(&peer_token)?;
-        info!(round, our_token = step.output.len(), done = step.done, "ISC step");
+        info!(
+            round,
+            our_token = step.output.len(),
+            done = step.done,
+            "ISC step"
+        );
 
         if !step.output.is_empty() {
             conn.send_handshake_token(&step.output).await?;

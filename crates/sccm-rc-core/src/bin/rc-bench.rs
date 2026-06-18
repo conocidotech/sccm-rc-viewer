@@ -85,7 +85,10 @@ impl SessionSink for BenchSink {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sccm_rc_core=info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,sccm_rc_core=info")),
+        )
         .init();
     let cli = Cli::parse();
     let png_path = format!("{}\\rc-bench.png", std::env::temp_dir().display());
@@ -93,12 +96,20 @@ async fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let mut session = SccmSession::connect(&cli.target).await?;
     let t_connect = t0.elapsed();
-    let (result, initial_buf, share_id) = rdp::connect_rdp(&mut session, cli.width, cli.height, &[]).await?;
+    let (result, initial_buf, share_id) =
+        rdp::connect_rdp(&mut session, cli.width, cli.height, &[]).await?;
     let t_active = t0.elapsed();
     info!(grant = ?session.grant(), connect_ms = t_connect.as_millis(), active_ms = t_active.as_millis(), "connected + RDP active");
 
-    let stats = Arc::new(Mutex::new(Stats { png_path: png_path.clone(), ..Default::default() }));
-    let mut sink = BenchSink { start: t0, last_png: Instant::now(), stats: stats.clone() };
+    let stats = Arc::new(Mutex::new(Stats {
+        png_path: png_path.clone(),
+        ..Default::default()
+    }));
+    let mut sink = BenchSink {
+        start: t0,
+        last_png: Instant::now(),
+        stats: stats.clone(),
+    };
     let (tx, mut input_rx) = tokio::sync::mpsc::channel(64);
 
     if cli.input {
@@ -137,7 +148,16 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     let file_offer = std::sync::Arc::new(std::sync::Mutex::new(None));
-    let run = rdp::run_active_session(&mut session, result, initial_buf, share_id, &mut sink, &mut input_rx, curtain, file_offer);
+    let run = rdp::run_active_session(
+        &mut session,
+        result,
+        initial_buf,
+        share_id,
+        &mut sink,
+        &mut input_rx,
+        curtain,
+        file_offer,
+    );
     let outcome = tokio::time::timeout(Duration::from_secs(cli.seconds), run).await;
 
     // Graceful teardown so the server releases the host (avoids lingering HostInUse).
@@ -154,14 +174,30 @@ async fn main() -> anyhow::Result<()> {
     };
 
     println!("\n===== rc-bench result =====");
-    println!("target            : {} ({}x{})", cli.target, cli.width, cli.height);
+    println!(
+        "target            : {} ({}x{})",
+        cli.target, cli.width, cli.height
+    );
     println!("input enabled     : {}", cli.input);
     println!("time to RDP active: {} ms", t_active.as_millis());
-    println!("first paint       : {}", s.first_paint_ms.map(|m| format!("{m} ms")).unwrap_or("NEVER".into()));
+    println!(
+        "first paint       : {}",
+        s.first_paint_ms
+            .map(|m| format!("{m} ms"))
+            .unwrap_or("NEVER".into())
+    );
     println!("graphics updates  : {}", s.updates);
-    println!("update rate       : {:.1}/s", s.updates as f64 / elapsed.max(0.001));
+    println!(
+        "update rate       : {:.1}/s",
+        s.updates as f64 / elapsed.max(0.001)
+    );
     println!("last update at    : {} ms", s.last_update_ms);
-    println!("non-black px       : {}/{} ({:.1}%)", s.nonblack, s.total_px, 100.0 * s.nonblack as f64 / (s.total_px.max(1)) as f64);
+    println!(
+        "non-black px       : {}/{} ({:.1}%)",
+        s.nonblack,
+        s.total_px,
+        100.0 * s.nonblack as f64 / (s.total_px.max(1)) as f64
+    );
     println!("sealed sent/recvd : {sent} / {recvd}");
     println!("total recvd       : {recvd_mb:.2} MB");
     println!("ran for           : {elapsed:.1} s");

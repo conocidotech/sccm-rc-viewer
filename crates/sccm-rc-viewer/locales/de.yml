@@ -1,5 +1,3 @@
-_version: 2
-
 status:
   connecting_to: "Verbinde mit %{target}…"
   connecting: "Verbinde…"
@@ -26,6 +24,11 @@ toolbar:
   curtain: "Sichtschutz"
   send_file: "Datei senden"
   ctrl_alt_del: "Strg+Alt+Entf"
+
+monitor:
+  label: "Bildschirm: %{which}"
+  all: "Alle"
+  switching: "Wechsel…"
 
 prompt:
   label: "Computername oder IP-Adresse:"

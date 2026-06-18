@@ -94,9 +94,9 @@ impl SccmSession {
                 .to_vec();
         }
         sspi.message_sizes()?; // establishes + caches the sealing sizes
-        // Fail closed: we requested confidentiality and every RDP frame is sealed.
-        // If the peer did not grant an encrypting context, refuse rather than
-        // silently send "sealed" frames that may not actually be encrypted.
+                               // Fail closed: we requested confidentiality and every RDP frame is sealed.
+                               // If the peer did not grant an encrypting context, refuse rather than
+                               // silently send "sealed" frames that may not actually be encrypted.
         if !sspi.confidentiality() {
             return Err(Error::Protocol(
                 "server did not negotiate an encrypted (confidential) channel".into(),
@@ -209,7 +209,10 @@ impl SccmSession {
             );
             if frame.msg_type != MSG_TYPE_DATA {
                 // Unencrypted control frame — unusual mid-session; skip.
-                debug!(msg_type = format_args!("{:#04x}", frame.msg_type), "skipped non-data frame");
+                debug!(
+                    msg_type = format_args!("{:#04x}", frame.msg_type),
+                    "skipped non-data frame"
+                );
                 continue;
             }
             let plain = match self.sspi.unseal(&frame.body) {
@@ -219,8 +222,12 @@ impl SccmSession {
                     p
                 }
                 Err(e) => {
-                    let head: Vec<String> =
-                        frame.body.iter().take(24).map(|b| format!("{b:02x}")).collect();
+                    let head: Vec<String> = frame
+                        .body
+                        .iter()
+                        .take(24)
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
                     warn!(
                         error = %e,
                         body_len = frame.body.len(),
@@ -229,7 +236,7 @@ impl SccmSession {
                         head = %head.join(" "),
                         "unseal FAILED — sealed-stream desync"
                     );
-                    return Err(e.into());
+                    return Err(e);
                 }
             };
             // Skip only KNOWN SCCM data-phase control strings (status updates).
@@ -257,7 +264,7 @@ fn is_sccm_control_keyword(s: &str) -> bool {
 
 /// Decode a decrypted SCCM control payload (raw UTF-16LE, no length prefix).
 fn decode_control_utf16(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 2 || bytes.len() % 2 != 0 {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
         return None;
     }
     let u: Vec<u16> = bytes

@@ -11,7 +11,9 @@ use crate::header::{
     ORD_MEMBLT, ORD_OPAQUE_RECT, ORD_PATBLT, ORD_SCRBLT, TS_BOUNDS, TS_DELTA_COORDINATES,
     TS_SECONDARY, TS_STANDARD, TS_TYPE_CHANGE, TS_ZERO_BOUNDS_DELTAS,
 };
-use crate::primary::{DstBlt, FastGlyph, FastIndex, GlyphIndex, LineTo, MemBlt, OpaqueRect, PatBlt, ScrBlt};
+use crate::primary::{
+    DstBlt, FastGlyph, FastIndex, GlyphIndex, LineTo, MemBlt, OpaqueRect, PatBlt, ScrBlt,
+};
 use crate::{secondary, OrderError};
 
 // Alternate-secondary order types we can size (to keep the stream in sync).
@@ -124,7 +126,8 @@ impl OrderProcessor {
                 if self.current_order_type == Some(ORD_MEMBLT) {
                     let m = &self.memblt;
                     tracing::info!(
-                        cache_id = m.cache_id, cache_index = m.cache_index,
+                        cache_id = m.cache_id,
+                        cache_index = m.cache_index,
                         dst = format!("{},{} {}x{}", m.x, m.y, m.w, m.h),
                         src = format!("{},{}", m.x_src, m.y_src),
                         empty = r.is_empty(),
@@ -162,7 +165,13 @@ impl OrderProcessor {
         let payload_len = order_length.saturating_add(7).min(c.remaining());
         if self.trace_budget > 0 {
             self.trace_budget -= 1;
-            tracing::info!(order_type, extra_flags, order_length, payload_len, "secondary (cache) order");
+            tracing::info!(
+                order_type,
+                extra_flags,
+                order_length,
+                payload_len,
+                "secondary (cache) order"
+            );
         }
         let payload = c.bytes(payload_len)?;
 
@@ -231,15 +240,24 @@ impl OrderProcessor {
             }
             ORD_GLYPH_INDEX => {
                 self.glyph_index.decode(c, field_flags, delta)?;
-                Some(self.glyph_index.draw(&mut self.canvas, clip, &mut self.glyphs))
+                Some(
+                    self.glyph_index
+                        .draw(&mut self.canvas, clip, &mut self.glyphs),
+                )
             }
             ORD_FAST_INDEX => {
                 self.fast_index.decode(c, field_flags, delta)?;
-                Some(self.fast_index.draw(&mut self.canvas, clip, &mut self.glyphs))
+                Some(
+                    self.fast_index
+                        .draw(&mut self.canvas, clip, &mut self.glyphs),
+                )
             }
             ORD_FAST_GLYPH => {
                 self.fast_glyph.decode(c, field_flags, delta)?;
-                Some(self.fast_glyph.draw(&mut self.canvas, clip, &mut self.glyphs))
+                Some(
+                    self.fast_glyph
+                        .draw(&mut self.canvas, clip, &mut self.glyphs),
+                )
             }
             other => return Err(OrderError::UnsupportedOrderType(other)),
         };
@@ -261,7 +279,10 @@ impl OrderProcessor {
                 Ok(true)
             }
             other => {
-                tracing::debug!(altsec = other, "unknown alternate-secondary order; stopping");
+                tracing::debug!(
+                    altsec = other,
+                    "unknown alternate-secondary order; stopping"
+                );
                 Ok(false)
             }
         }

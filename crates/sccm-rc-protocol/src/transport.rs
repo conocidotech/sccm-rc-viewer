@@ -73,7 +73,10 @@ impl RawConnection {
             .with_time(std::time::Duration::from_secs(10))
             .with_interval(std::time::Duration::from_secs(3));
         let _ = socket2::SockRef::from(&stream).set_tcp_keepalive(&keepalive);
-        Ok(Self { stream, rxbuf: Vec::new() })
+        Ok(Self {
+            stream,
+            rxbuf: Vec::new(),
+        })
     }
 
     /// Write a length-prefixed blob. Used during SSPI handshake to send each
@@ -113,7 +116,11 @@ impl RawConnection {
     /// Diagnostic: read up to `max` bytes with a deadline, ignoring all
     /// framing assumptions. Used during protocol discovery to hex-dump
     /// whatever the server sends without imposing structure.
-    pub async fn recv_raw_until_idle(&mut self, max: usize, idle: std::time::Duration) -> Result<Vec<u8>> {
+    pub async fn recv_raw_until_idle(
+        &mut self,
+        max: usize,
+        idle: std::time::Duration,
+    ) -> Result<Vec<u8>> {
         let mut buf = vec![0u8; max];
         let mut filled = 0;
         loop {
@@ -123,10 +130,10 @@ impl RawConnection {
             }
             let read = tokio::time::timeout(idle, self.stream.read(remaining)).await;
             match read {
-                Ok(Ok(0)) => break,                       // EOF
+                Ok(Ok(0)) => break, // EOF
                 Ok(Ok(n)) => filled += n,
                 Ok(Err(e)) => return Err(Error::Io(e)),
-                Err(_) => break,                          // idle timeout — peer paused
+                Err(_) => break, // idle timeout — peer paused
             }
         }
         buf.truncate(filled);
@@ -148,7 +155,11 @@ impl RawConnection {
         let wire = framing::encode_handshake_token(token);
         self.stream.write_all(&wire).await?;
         self.stream.flush().await?;
-        debug!(token_bytes = token.len(), wire_bytes = wire.len(), "sent handshake token");
+        debug!(
+            token_bytes = token.len(),
+            wire_bytes = wire.len(),
+            "sent handshake token"
+        );
         Ok(())
     }
 
@@ -172,7 +183,10 @@ impl RawConnection {
                 if self.rxbuf.len() >= total {
                     let body = self.rxbuf[4..total].to_vec();
                     self.rxbuf.drain(..total);
-                    debug!(msg_type = format!("0x{msg_type:02x}"), body_len, "recv frame");
+                    debug!(
+                        msg_type = format!("0x{msg_type:02x}"),
+                        body_len, "recv frame"
+                    );
                     return Ok(Some(Frame { msg_type, body }));
                 }
             }

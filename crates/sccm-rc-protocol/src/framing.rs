@@ -72,7 +72,11 @@ pub fn decode_control_string(body: &[u8]) -> Option<String> {
         .chunks(2)
         .map(|c| u16::from_le_bytes([c[0], *c.get(1).unwrap_or(&0)]))
         .collect();
-    Some(String::from_utf16_lossy(&utf16).trim_end_matches('\u{0}').to_string())
+    Some(
+        String::from_utf16_lossy(&utf16)
+            .trim_end_matches('\u{0}')
+            .to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -109,6 +113,9 @@ mod tests {
             body.extend_from_slice(&ch.to_le_bytes());
         }
         body.extend_from_slice(&[0, 0]);
-        assert_eq!(decode_control_string(&body).as_deref(), Some("START_HANDSHAKE"));
+        assert_eq!(
+            decode_control_string(&body).as_deref(),
+            Some("START_HANDSHAKE")
+        );
     }
 }

@@ -34,9 +34,7 @@ pub fn apply(
         CACHE_BITMAP_UNCOMPRESSED => cache_bitmap_rev1(extra_flags, payload, false, bitmaps),
         CACHE_BITMAP_COMPRESSED => cache_bitmap_rev1(extra_flags, payload, true, bitmaps),
         CACHE_COLOR_TABLE => cache_color_table(payload, palettes),
-        CACHE_BITMAP_UNCOMPRESSED_REV2 => {
-            cache_bitmap_rev2(extra_flags, payload, false, bitmaps)
-        }
+        CACHE_BITMAP_UNCOMPRESSED_REV2 => cache_bitmap_rev2(extra_flags, payload, false, bitmaps),
         CACHE_BITMAP_COMPRESSED_REV2 => cache_bitmap_rev2(extra_flags, payload, true, bitmaps),
         // CACHE_GLYPH carries Rev1 (extraFlags bit 8, CG_GLYPH_UNICODE_PRESENT aside)
         // or Rev2; we parse the common Rev1 TS_CACHE_GLYPH_DATA layout.
@@ -64,9 +62,9 @@ fn cache_glyph_rev1(payload: &[u8], glyphs: &mut GlyphCache) -> Result<(), Order
         let y = c.i16()?;
         let cx = c.u16()?;
         let cy = c.u16()?;
-        let row_bytes = (cx as usize + 7) / 8;
+        let row_bytes = (cx as usize).div_ceil(8);
         let mut cb = row_bytes * cy as usize;
-        if cb % 4 != 0 {
+        if !cb.is_multiple_of(4) {
             cb += 4 - (cb % 4);
         }
         let aj = c.bytes(cb.min(c.remaining()))?.to_vec();

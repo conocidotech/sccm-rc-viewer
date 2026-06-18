@@ -13,10 +13,11 @@ use windows::core::{HRESULT, PCWSTR};
 use windows::Win32::Security::Authentication::Identity::{
     AcquireCredentialsHandleW, CompleteAuthToken, DecryptMessage, DeleteSecurityContext,
     EncryptMessage, FreeContextBuffer, FreeCredentialsHandle, InitializeSecurityContextW,
-    QueryContextAttributesW, SecBuffer, SecBufferDesc, SecPkgContext_Sizes, ISC_REQ_ALLOCATE_MEMORY,
-    ISC_REQ_CONFIDENTIALITY, ISC_REQ_CONNECTION, ISC_REQ_INTEGRITY, ISC_REQ_MUTUAL_AUTH,
-    ISC_REQ_REPLAY_DETECT, ISC_REQ_SEQUENCE_DETECT, SECBUFFER_DATA, SECBUFFER_TOKEN,
-    SECBUFFER_VERSION, SECPKG_ATTR_SIZES, SECPKG_CRED_OUTBOUND, SECURITY_NATIVE_DREP,
+    QueryContextAttributesW, SecBuffer, SecBufferDesc, SecPkgContext_Sizes,
+    ISC_REQ_ALLOCATE_MEMORY, ISC_REQ_CONFIDENTIALITY, ISC_REQ_CONNECTION, ISC_REQ_INTEGRITY,
+    ISC_REQ_MUTUAL_AUTH, ISC_REQ_REPLAY_DETECT, ISC_REQ_SEQUENCE_DETECT, SECBUFFER_DATA,
+    SECBUFFER_TOKEN, SECBUFFER_VERSION, SECPKG_ATTR_SIZES, SECPKG_CRED_OUTBOUND,
+    SECURITY_NATIVE_DREP,
 };
 use windows::Win32::Security::Credentials::SecHandle;
 
@@ -102,7 +103,10 @@ impl SspiSession {
     pub fn new_for_target(target_host: &str) -> crate::Result<Self> {
         let package = wide_nul("Negotiate");
         let spn = wide_nul(&build_spn(target_host));
-        let mut cred = Box::new(SecHandle { dwLower: 0, dwUpper: 0 });
+        let mut cred = Box::new(SecHandle {
+            dwLower: 0,
+            dwUpper: 0,
+        });
         let mut expiry: i64 = 0;
 
         // SAFETY: package buffer lives until end of call; NULLs explicitly
@@ -131,7 +135,10 @@ impl SspiSession {
 
         Ok(Self {
             cred,
-            ctxt: Box::new(SecHandle { dwLower: 0, dwUpper: 0 }),
+            ctxt: Box::new(SecHandle {
+                dwLower: 0,
+                dwUpper: 0,
+            }),
             ctxt_initialized: false,
             spn_wide: spn,
             sizes: None,
@@ -159,7 +166,7 @@ impl SspiSession {
                 pvBuffer: ptr::null_mut(),
             },
         ];
-        let mut in_desc = SecBufferDesc {
+        let in_desc = SecBufferDesc {
             ulVersion: SECBUFFER_VERSION,
             cBuffers: 2,
             pBuffers: in_bufs.as_mut_ptr(),
@@ -221,7 +228,11 @@ impl SspiSession {
         self.ctxt_initialized = true;
         self.context_attr = context_attr; // granted ISC_RET_* flags
 
-        trace!(status = format!("0x{status:08X}"), output_bytes = out_buf.cbBuffer, "ISC returned");
+        trace!(
+            status = format!("0x{status:08X}"),
+            output_bytes = out_buf.cbBuffer,
+            "ISC returned"
+        );
 
         let mut output_bytes = Vec::new();
         if !out_buf.pvBuffer.is_null() && out_buf.cbBuffer > 0 {
@@ -235,9 +246,8 @@ impl SspiSession {
         }
 
         if status == SEC_I_COMPLETE_AND_CONTINUE_RAW || status == SEC_I_COMPLETE_NEEDED_RAW {
-            let cas = status_code(unsafe {
-                CompleteAuthToken(self.ctxt.as_mut() as *mut _, &out_desc)
-            });
+            let cas =
+                status_code(unsafe { CompleteAuthToken(self.ctxt.as_mut() as *mut _, &out_desc) });
             if cas != SEC_E_OK_RAW {
                 return Err(Error::Sspi(format!(
                     "CompleteAuthToken failed: 0x{cas:08X}"
@@ -345,7 +355,9 @@ impl SspiSession {
                 while *np.add(len) != 0 {
                     len += 1;
                 }
-                Some(String::from_utf16_lossy(std::slice::from_raw_parts(np, len)))
+                Some(String::from_utf16_lossy(std::slice::from_raw_parts(
+                    np, len,
+                )))
             }
         };
         unsafe {
@@ -378,7 +390,7 @@ impl SspiSession {
                 pvBuffer: data.as_mut_ptr() as *mut _,
             },
         ];
-        let mut desc = SecBufferDesc {
+        let desc = SecBufferDesc {
             ulVersion: SECBUFFER_VERSION,
             cBuffers: 2,
             pBuffers: bufs.as_mut_ptr(),
@@ -386,10 +398,12 @@ impl SspiSession {
 
         // SAFETY: ctxt established; buffers live across the call. fQOP=0 => seal.
         let status = hr_to_status(unsafe {
-            EncryptMessage(self.ctxt.as_mut() as *const _, 0, &mut desc, 0)
+            EncryptMessage(self.ctxt.as_mut() as *const _, 0, &desc, 0)
         });
         if status != SEC_E_OK_RAW {
-            return Err(Error::Sspi(format!("EncryptMessage failed: 0x{status:08X}")));
+            return Err(Error::Sspi(format!(
+                "EncryptMessage failed: 0x{status:08X}"
+            )));
         }
 
         // Token length may shrink from cb_security_trailer to the actual size.
@@ -447,7 +461,7 @@ impl SspiSession {
                 pvBuffer: data.as_mut_ptr() as *mut _,
             },
         ];
-        let mut desc = SecBufferDesc {
+        let desc = SecBufferDesc {
             ulVersion: SECBUFFER_VERSION,
             cBuffers: 2,
             pBuffers: bufs.as_mut_ptr(),
@@ -456,17 +470,21 @@ impl SspiSession {
         let mut qop: u32 = 0;
         // SAFETY: ctxt established; buffers live across the call.
         let status = hr_to_status(unsafe {
-            DecryptMessage(self.ctxt.as_mut() as *const _, &mut desc, 0, Some(&mut qop))
+            DecryptMessage(self.ctxt.as_mut() as *const _, &desc, 0, Some(&mut qop))
         });
         if status != SEC_E_OK_RAW {
-            return Err(Error::Sspi(format!("DecryptMessage failed: 0x{status:08X}")));
+            return Err(Error::Sspi(format!(
+                "DecryptMessage failed: 0x{status:08X}"
+            )));
         }
         // Reject a frame that was only signed, not encrypted: we treat this channel
         // as confidential, so an on-path attacker must not be able to feed us
         // unencrypted-but-authenticated data. A properly sealed frame returns qop=0.
         const SECQOP_WRAP_NO_ENCRYPT: u32 = 0x8000_0001;
         if qop == SECQOP_WRAP_NO_ENCRYPT {
-            return Err(Error::Sspi("unsealed frame was not encrypted (QOP no-encrypt)".into()));
+            return Err(Error::Sspi(
+                "unsealed frame was not encrypted (QOP no-encrypt)".into(),
+            ));
         }
 
         // Plaintext is in the DATA buffer (decrypted in place).

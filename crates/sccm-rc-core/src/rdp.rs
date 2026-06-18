@@ -6,23 +6,26 @@
 //! them, and feed the RDP bytes back into IronRDP until it reaches the
 //! `Connected` state.
 
-use crate::{SccmSession, Grant};
-use ironrdp_connector::connection_activation::{ConnectionActivationSequence, ConnectionActivationState};
+use crate::{Grant, SccmSession};
+use ironrdp_connector::connection_activation::{
+    ConnectionActivationSequence, ConnectionActivationState,
+};
+use ironrdp_connector::State;
 use ironrdp_connector::{
     ClientConnector, ClientConnectorState, Config, ConnectionResult, ConnectorError, Credentials,
     DesktopSize, Sequence,
 };
-use ironrdp_connector::State;
 use ironrdp_core::{decode_cursor, ReadCursor, WriteBuf};
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_pdu::fast_path::{FastPathHeader, FastPathUpdatePdu, Fragmentation, UpdateCode};
 use ironrdp_pdu::gcc::KeyboardType;
 use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
+use ironrdp_pdu::rdp::client_info::PerformanceFlags;
 pub use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageOutput};
 use sccm_rc_orders::{ColorDepth, OrderCanvas, OrderProcessor};
-use sccm_rc_protocol::mppc::MppcDecompressor;
 use sccm_rc_protocol::cliprdr::{self, ClipPdu};
+use sccm_rc_protocol::mppc::MppcDecompressor;
 use sccm_rc_protocol::{Error, Result};
 use std::net::{Ipv4Addr, SocketAddr};
 use tracing::{debug, info, warn};
@@ -38,7 +41,11 @@ pub type InputSender = tokio::sync::mpsc::Sender<Vec<FastPathInputEvent>>;
 
 /// Build a Config for an SCCM RC session: standard RDP security (no TLS,
 /// no CredSSP) since the outer SecurityFilter already encrypts everything.
-pub fn sccm_rdp_config(width: u16, height: u16, monitors: Vec<ironrdp_pdu::gcc::Monitor>) -> Config {
+pub fn sccm_rdp_config(
+    width: u16,
+    height: u16,
+    monitors: Vec<ironrdp_pdu::gcc::Monitor>,
+) -> Config {
     Config {
         desktop_size: DesktopSize { width, height },
         monitors,
@@ -65,7 +72,19 @@ pub fn sccm_rdp_config(width: u16, height: u16, monitors: Vec<ironrdp_pdu::gcc::
         request_data: None,
         autologon: false,
         enable_audio_playback: false,
-        performance_flags: Default::default(),
+        // RRCV-20 "All Screens": RdpCoreSccm on the TARGET reads bit 0x1000 of the
+        // client's performanceFlags (CRDPWLC FUN_1007c22c) and, when set, writes
+        // HKLM ...\SMS\Client\...\Remote Control\UseAllMonitors=1 so the desktop
+        // encoder (CRDPWDUMXStack::SetDesktopParams) captures the FULL multi-monitor
+        // geometry instead of only the primary. 0x1000 is unused by standard RDP
+        // perf flags (max standard bit = 0x100), so this is the SCCM extension.
+        // Gated behind SCCM_RC_ALLMON=1 (note: it persistently sets UseAllMonitors
+        // in the target's HKLM, affecting future RC sessions too).
+        performance_flags: if std::env::var("SCCM_RC_ALLMON").as_deref() == Ok("1") {
+            PerformanceFlags::from_bits_retain(PerformanceFlags::default().bits() | 0x1000)
+        } else {
+            PerformanceFlags::default()
+        },
         license_cache: None,
         timezone_info: Default::default(),
         enable_server_pointer: true,
@@ -118,7 +137,11 @@ pub fn parse_monitor(s: &str, primary: bool) -> Option<Monitor> {
         top,
         right: left + w - 1,
         bottom: top + h - 1,
-        flags: if primary { MonitorFlags::PRIMARY } else { MonitorFlags::empty() },
+        flags: if primary {
+            MonitorFlags::PRIMARY
+        } else {
+            MonitorFlags::empty()
+        },
     })
 }
 
@@ -178,7 +201,11 @@ fn fix_short_bitmap_cache_rev2(frame: &[u8]) -> Option<Vec<u8>> {
         return None; // not a SendDataIndication
     }
     // per-length of the MCS user data at offset 13.
-    let (mcs_len_off, mcs_user_off) = if frame[13] & 0x80 != 0 { (13usize, 15usize) } else { (13, 14) };
+    let (mcs_len_off, mcs_user_off) = if frame[13] & 0x80 != 0 {
+        (13usize, 15usize)
+    } else {
+        (13, 14)
+    };
     // Share Control Header at mcs_user_off: totalLength(2), pduType(2), src(2).
     let sc = mcs_user_off;
     let pdu_type = u16::from_le_bytes([frame[sc + 2], frame[sc + 3]]);
@@ -203,9 +230,9 @@ fn fix_short_bitmap_cache_rev2(frame: &[u8]) -> Option<Vec<u8>> {
             let pad = (REV2_FULL_BODY + 4) - clen; // bytes to add
             let mut out = Vec::with_capacity(frame.len() + pad);
             out.extend_from_slice(&frame[..p + clen]); // up to end of short cap body
-            out.extend(std::iter::repeat(0u8).take(pad)); // pad the cap body
+            out.extend(std::iter::repeat_n(0u8, pad)); // pad the cap body
             out.extend_from_slice(&frame[p + clen..]); // rest of frame
-            // Patch lengths (+pad).
+                                                       // Patch lengths (+pad).
             let new_cap_len = (clen + pad) as u16;
             out[p + 2..p + 4].copy_from_slice(&new_cap_len.to_le_bytes());
             let lcc = u16::from_le_bytes([out[lcc_off], out[lcc_off + 1]]) + pad as u16;
@@ -214,7 +241,9 @@ fn fix_short_bitmap_cache_rev2(frame: &[u8]) -> Option<Vec<u8>> {
             out[sc..sc + 2].copy_from_slice(&tot.to_le_bytes());
             // MCS per-length (2-byte form, high bit set).
             if frame[13] & 0x80 != 0 {
-                let mcs = (((frame[mcs_len_off] as usize & 0x7f) << 8) | frame[mcs_len_off + 1] as usize) + pad;
+                let mcs = (((frame[mcs_len_off] as usize & 0x7f) << 8)
+                    | frame[mcs_len_off + 1] as usize)
+                    + pad;
                 out[mcs_len_off] = 0x80 | ((mcs >> 8) as u8);
                 out[mcs_len_off + 1] = (mcs & 0xff) as u8;
             }
@@ -269,7 +298,8 @@ struct PassiveChannel {
 impl PassiveChannel {
     fn new(name: &str) -> Self {
         Self {
-            name: ironrdp_pdu::gcc::ChannelName::from_utf8(name).expect("valid 8-char channel name"),
+            name: ironrdp_pdu::gcc::ChannelName::from_utf8(name)
+                .expect("valid 8-char channel name"),
         }
     }
 }
@@ -303,8 +333,28 @@ impl ironrdp_svc::SvcProcessor for PassiveChannel {
             let head = &payload[..payload.len().min(16)];
             tracing::warn!(
                 "DVC dbg: channel={:?} len={} cmd=0x{:x}({}) head={:02x?}",
-                name, payload.len(), cmd, cmd_str, head
+                name,
+                payload.len(),
+                cmd,
+                cmd_str,
+                head
             );
+        }
+        // RRCV-20 capture: dump the FULL inbound payload of a control channel
+        // (e.g. dskcfg = monitor config) as hex, so the on-wire monitor-list /
+        // monitor-select message can be reverse-engineered. SCCM_RC_DBG_DSKCFG=1
+        // (or a comma-list of channel names) selects which channels to dump.
+        if !payload.is_empty() {
+            if let Ok(want) = std::env::var("SCCM_RC_DBG_DSKCFG") {
+                let name = String::from_utf8_lossy(self.name.as_bytes())
+                    .trim_end_matches('\0')
+                    .to_string();
+                let dump = want == "1" || want.split(',').any(|w| w.trim() == name);
+                if dump {
+                    let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+                    tracing::warn!(channel = %name, len = payload.len(), "passive-channel inbound hex: {hex}");
+                }
+            }
         }
         Ok(Vec::new())
     }
@@ -363,7 +413,11 @@ impl ironrdp_svc::SvcProcessor for ArbitrationChannel {
         ironrdp_pdu::gcc::ChannelName::from_utf8("sessarb").expect("valid name")
     }
     fn process(&mut self, payload: &[u8]) -> ironrdp_pdu::PduResult<Vec<ironrdp_svc::SvcMessage>> {
-        let hex: Vec<String> = payload.iter().take(32).map(|b| format!("{b:02x}")).collect();
+        let hex: Vec<String> = payload
+            .iter()
+            .take(32)
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let server_event = if payload.len() >= 12 {
             u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]])
         } else {
@@ -382,7 +436,9 @@ impl ironrdp_svc::SvcProcessor for ArbitrationChannel {
             self.takeover_sent = true;
             let name = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "RUSTCLIENT".to_string());
             info!(client = %name, "sessarb: HostInUse — sending take-over request (type 5)");
-            return Ok(vec![ironrdp_svc::SvcMessage::from(ArbitrationChannel::takeover(&name))]);
+            return Ok(vec![ironrdp_svc::SvcMessage::from(
+                ArbitrationChannel::takeover(&name),
+            )]);
         }
 
         // Optionally send a follow-up event in response (SCCM_RC_ARB_REPLY=<type>),
@@ -392,9 +448,9 @@ impl ironrdp_svc::SvcProcessor for ArbitrationChannel {
                 if self.replies_sent == 0 {
                     self.replies_sent += 1;
                     info!(reply_type, "sessarb: sending follow-up arbitration event");
-                    return Ok(vec![ironrdp_svc::SvcMessage::from(ArbitrationChannel::event(
-                        reply_type, 0,
-                    ))]);
+                    return Ok(vec![ironrdp_svc::SvcMessage::from(
+                        ArbitrationChannel::event(reply_type, 0),
+                    )]);
                 }
             }
         }
@@ -514,7 +570,10 @@ impl ironrdp_svc::SvcProcessor for CliprdrChannel {
                 // format_list below already announces the current clipboard.
                 self.ready = true;
                 self.known = Self::read_local();
-                info!(has_text = self.known.is_some(), "cliprdr: monitor ready — sending caps + format list");
+                info!(
+                    has_text = self.known.is_some(),
+                    "cliprdr: monitor ready — sending caps + format list"
+                );
                 Ok(vec![
                     Self::msg(cliprdr::capabilities_files()),
                     Self::msg(self.format_list()),
@@ -525,7 +584,9 @@ impl ironrdp_svc::SvcProcessor for CliprdrChannel {
                 // Acknowledge, then pull the text so it lands on our clipboard.
                 let mut out = vec![Self::msg(cliprdr::format_list_response_ok())];
                 if has_text {
-                    out.push(Self::msg(cliprdr::format_data_request(cliprdr::CF_UNICODETEXT)));
+                    out.push(Self::msg(cliprdr::format_data_request(
+                        cliprdr::CF_UNICODETEXT,
+                    )));
                 }
                 Ok(out)
             }
@@ -554,12 +615,18 @@ impl ironrdp_svc::SvcProcessor for CliprdrChannel {
             } => {
                 if size_only {
                     if let Some((_, size)) = self.file_name_size() {
-                        return Ok(vec![Self::msg(cliprdr::file_contents_response_size(stream_id, size))]);
+                        return Ok(vec![Self::msg(cliprdr::file_contents_response_size(
+                            stream_id, size,
+                        ))]);
                     }
                 } else if let Some(bytes) = self.read_range(position, requested as usize) {
-                    return Ok(vec![Self::msg(cliprdr::file_contents_response_range(stream_id, &bytes))]);
+                    return Ok(vec![Self::msg(cliprdr::file_contents_response_range(
+                        stream_id, &bytes,
+                    ))]);
                 }
-                Ok(vec![Self::msg(cliprdr::file_contents_response_fail(stream_id))])
+                Ok(vec![Self::msg(cliprdr::file_contents_response_fail(
+                    stream_id,
+                ))])
             }
             ClipPdu::FormatDataResponse { ok, text } => {
                 if ok {
@@ -605,7 +672,10 @@ impl CurtainChannel {
         v
     }
     fn env_type(var: &str, default: u32) -> u32 {
-        std::env::var(var).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
+        std::env::var(var)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
     }
     pub fn enable() -> Vec<u8> {
         Self::event(Self::env_type("SCCM_RC_CURTAIN_ON", 5))
@@ -623,7 +693,10 @@ impl ironrdp_svc::SvcProcessor for CurtainChannel {
     }
     fn process(&mut self, payload: &[u8]) -> ironrdp_pdu::PduResult<Vec<ironrdp_svc::SvcMessage>> {
         if !payload.is_empty() && std::env::var("SCCM_RC_DBG_DVC").is_ok() {
-            tracing::warn!("curtain: server payload {:02x?}", &payload[..payload.len().min(24)]);
+            tracing::warn!(
+                "curtain: server payload {:02x?}",
+                &payload[..payload.len().min(24)]
+            );
         }
         Ok(Vec::new())
     }
@@ -671,7 +744,7 @@ pub async fn connect_rdp(
         // Curtain (privacy screen-blank) — real distinct-type channel when
         // SCCM_RC_CURTAIN=1, else a passive placeholder.
         if std::env::var("SCCM_RC_CURTAIN").as_deref() == Ok("1") {
-            connector = connector.with_static_channel(CurtainChannel::default());
+            connector = connector.with_static_channel(CurtainChannel);
         } else {
             connector = connector.with_static_channel(PassiveChannel::new("curtain"));
         }
@@ -703,19 +776,24 @@ pub async fn connect_rdp(
         let written = if let Some(hint) = connector.next_pdu_hint() {
             // Accumulate sealed RDP bytes until a full PDU is available.
             let pdu_len = loop {
-                match hint.find_size(&input_buf).map_err(|e| Error::Protocol(format!("pdu hint: {e}")))? {
+                match hint
+                    .find_size(&input_buf)
+                    .map_err(|e| Error::Protocol(format!("pdu hint: {e}")))?
+                {
                     Some((_matches, size)) => break size,
                     None => {
-                        let more = session
-                            .recv_rdp()
-                            .await?
-                            .ok_or_else(|| Error::Protocol("server closed during RDP connect".into()))?;
+                        let more = session.recv_rdp().await?.ok_or_else(|| {
+                            Error::Protocol("server closed during RDP connect".into())
+                        })?;
                         input_buf.extend_from_slice(&more);
                     }
                 }
             };
             let pdu: Vec<u8> = input_buf.drain(..pdu_len).collect();
-            debug!(state = connector.state.name(), pdu_len, "RDP step (with input)");
+            debug!(
+                state = connector.state.name(),
+                pdu_len, "RDP step (with input)"
+            );
             if share_id == 0 {
                 if let Some(sid) = ironrdp_connector::legacy::frame_share_id(&pdu) {
                     share_id = sid;
@@ -907,6 +985,7 @@ pub trait SessionSink: Send {
 /// them to IronRDP's `ActiveStage`, send response frames back, surface
 /// graphics updates to the sink, and forward UI input. Returns when the
 /// session ends.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_active_session(
     session: &mut SccmSession,
     connection_result: ConnectionResult,
@@ -961,10 +1040,10 @@ pub async fn run_active_session(
     let mut cursor_trail: Option<(u16, u16, u16, u16)> = None;
     let mut last_cursor_refresh = std::time::Instant::now();
     const CURSOR_PAD: u16 = 48; // half-extent of the area to refresh around a point
-    // Coalesce graphics updates: every order/bitmap update blits into `composite`
-    // immediately (cheap region copy) but accumulates one union dirty rect that is
-    // pushed to the sink at most ~60x/s — collapsing a burst of small updates into
-    // a single sink copy + redraw instead of dozens.
+                                // Coalesce graphics updates: every order/bitmap update blits into `composite`
+                                // immediately (cheap region copy) but accumulates one union dirty rect that is
+                                // pushed to the sink at most ~60x/s — collapsing a burst of small updates into
+                                // a single sink copy + redraw instead of dozens.
     let mut pending: Option<UpdateRegion> = None;
     let mut last_flush = std::time::Instant::now();
     // Profiling (SCCM_RC_PROFILE=1): where does the time go — waiting on the
@@ -979,10 +1058,13 @@ pub async fn run_active_session(
     // of cache-bitmap encoding / compression-header assumptions.
     let mut order_dump_count = 0u32;
     // Diagnostic env flags, read ONCE here (not per-PDU in the hot loop).
+    // OFF by default: order streams contain remote-desktop drawing data, so we
+    // never write them to %TEMP% unless explicitly enabled. SCCM_RC_DUMP_ORDERS=N
+    // dumps the first N streams (offline replay/debug only).
     let order_dump_cap: u32 = std::env::var("SCCM_RC_DUMP_ORDERS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+        .unwrap_or(0);
     let force_paint = std::env::var("SCCM_RC_FORCE_PAINT").as_deref() == Ok("1");
     // Order-stream decode-failure tracking. A handful of genuinely unsupported
     // orders is fine, but a sustained run of failures means the order stream has
@@ -1038,7 +1120,11 @@ pub async fn run_active_session(
         match stage.process_svc_processor_messages(msgs) {
             Ok(bytes) => {
                 session.send_rdp(&bytes).await?;
-                info!(event_type, sent = bytes.len(), "sent sessarb arbitration event");
+                info!(
+                    event_type,
+                    sent = bytes.len(),
+                    "sent sessarb arbitration event"
+                );
             }
             Err(e) => warn!(error = %e, "failed to encode sessarb arbitration event"),
         }
@@ -1057,7 +1143,15 @@ pub async fn run_active_session(
     // (SCCM_RC_NO_REFRESH=1 skips it, to test whether the server auto-paints.)
     if std::env::var("SCCM_RC_NO_REFRESH").as_deref() != Ok("1") {
         info!(share_id, "initial repaint request");
-        send_refresh_rect(session, user_channel_id, io_channel_id, share_id, width, height).await?;
+        send_refresh_rect(
+            session,
+            user_channel_id,
+            io_channel_id,
+            share_id,
+            width,
+            height,
+        )
+        .await?;
     } else {
         info!("skipping initial refresh (SCCM_RC_NO_REFRESH=1)");
     }
@@ -1167,7 +1261,7 @@ pub async fn run_active_session(
             (frame, pdu_info.action)
         };
         pdus += 1;
-        if pdus % 200 == 0 {
+        if pdus.is_multiple_of(200) {
             debug!(pdus, graphics_updates = frames, "session heartbeat");
         }
         // Emit live bandwidth stats to the sink ~once per second.
@@ -1337,19 +1431,28 @@ pub async fn run_active_session(
                                 let region = order_region(orders.canvas(), r);
                                 composite.blit(orders.canvas(), region);
                                 pending = union_region(pending, region);
-                            } else if force_paint && pdus % 40 == 0
-                            {
+                            } else if force_paint && pdus.is_multiple_of(40) {
                                 // Diagnostic: flush the whole composite even with no
                                 // dirty region, to see whether pixels are landing.
                                 frames += 1;
                                 let (w, h) = (composite.width(), composite.height());
                                 composite.blit(
                                     orders.canvas(),
-                                    UpdateRegion { left: 0, top: 0, right: w.saturating_sub(1), bottom: h.saturating_sub(1) },
+                                    UpdateRegion {
+                                        left: 0,
+                                        top: 0,
+                                        right: w.saturating_sub(1),
+                                        bottom: h.saturating_sub(1),
+                                    },
                                 );
                                 sink.on_graphics_update(
                                     &composite,
-                                    UpdateRegion { left: 0, top: 0, right: w.saturating_sub(1), bottom: h.saturating_sub(1) },
+                                    UpdateRegion {
+                                        left: 0,
+                                        top: 0,
+                                        right: w.saturating_sub(1),
+                                        bottom: h.saturating_sub(1),
+                                    },
                                 );
                             }
                         }
@@ -1364,7 +1467,8 @@ pub async fn run_active_session(
                                 );
                                 sink.on_status("Beeld hersteld — opnieuw verbinden...");
                                 return Err(Error::Protocol(
-                                    "order stream desync — reconnecting to reset MPPC/order state".into(),
+                                    "order stream desync — reconnecting to reset MPPC/order state"
+                                        .into(),
                                 ));
                             }
                         }
@@ -1441,7 +1545,10 @@ pub async fn run_active_session(
                     if let Some(sid) = ironrdp_connector::legacy::frame_share_id(&frame) {
                         share_id = sid;
                     }
-                    info!(refeed, share_id, "server reactivation — re-running capability exchange");
+                    info!(
+                        refeed,
+                        share_id, "server reactivation — re-running capability exchange"
+                    );
                     if refeed {
                         buf.splice(0..0, frame.iter().copied());
                     }
@@ -1454,12 +1561,12 @@ pub async fn run_active_session(
                     orders.resize(width, height);
                     composite.resize(width, height);
                     pending = None; // stale region from the old desktop size
-                    // Drop queued (pre-reactivation) decompressed updates — they
-                    // belong to the old desktop. Do NOT reset the MPPC decompressor
-                    // history here: the server's bulk compressor does not
-                    // necessarily restart across the reactivation, so clearing our
-                    // history would desync us from its (retained) history. We honor
-                    // the on-wire PACKET_FLUSHED / PACKET_AT_FRONT flags instead.
+                                    // Drop queued (pre-reactivation) decompressed updates — they
+                                    // belong to the old desktop. Do NOT reset the MPPC decompressor
+                                    // history here: the server's bulk compressor does not
+                                    // necessarily restart across the reactivation, so clearing our
+                                    // history would desync us from its (retained) history. We honor
+                                    // the on-wire PACKET_FLUSHED / PACKET_AT_FRONT flags instead.
                     decompressed_extra.clear();
                     // Drop any half-assembled order fragment from the old desktop:
                     // if reactivation lands mid FIRST..LAST, the leftover bytes would
@@ -1473,7 +1580,10 @@ pub async fn run_active_session(
                     order_ok_streak = 0;
                     stage = ActiveStage::new(new_result);
                     sink.on_status("Bureaublad laden...");
-                    info!(width, height, share_id, "reactivation complete — active session resumed");
+                    info!(
+                        width,
+                        height, share_id, "reactivation complete — active session resumed"
+                    );
                     // Re-send the WLC desktop handshake after the shadow-attach
                     // reactivation — this is what triggers the server to start the
                     // desktop capture/stream. (SCCM_RC_WLC_ONCE=1 sends it only on the
@@ -1484,7 +1594,15 @@ pub async fn run_active_session(
                         send_wlc_desktop_caps(session, user_channel_id, io_channel_id).await?;
                     }
                     // Repaint after reactivation too (with the server's share_id).
-                    send_refresh_rect(session, user_channel_id, io_channel_id, share_id, width, height).await?;
+                    send_refresh_rect(
+                        session,
+                        user_channel_id,
+                        io_channel_id,
+                        share_id,
+                        width,
+                        height,
+                    )
+                    .await?;
                     break; // restart the outer read loop with the new stage
                 }
                 // Cursor updates → the sink renders them client-side at the local
@@ -1922,7 +2040,7 @@ impl ironrdp_core::Encode for PersistentKeyListPdu {
         dst.write_u8(0x2b); // pduType2 = PDUTYPE2_BITMAPCACHE_PERSISTENT_LIST
         dst.write_u8(0); // compressionFlags
         dst.write_u16(0); // compressedLength
-        // Body.
+                          // Body.
         let mut body = [0u8; BODY_LEN];
         body[20] = 0x03; // bBitMask = PERSIST_FIRST_PDU | PERSIST_LAST_PDU
         dst.write_slice(&body);
@@ -1968,8 +2086,14 @@ async fn send_refresh_rect(
         desktop_rect: Some(full.clone()),
     });
     let mut out = WriteBuf::new();
-    ironrdp_connector::legacy::encode_share_data(user_channel_id, io_channel_id, share_id, allow, &mut out)
-        .map_err(|e| Error::Protocol(format!("encode suppress-output: {e}")))?;
+    ironrdp_connector::legacy::encode_share_data(
+        user_channel_id,
+        io_channel_id,
+        share_id,
+        allow,
+        &mut out,
+    )
+    .map_err(|e| Error::Protocol(format!("encode suppress-output: {e}")))?;
     session.send_rdp(out.filled()).await?;
 
     // 2. Refresh the whole desktop.
@@ -1977,8 +2101,14 @@ async fn send_refresh_rect(
         areas_to_refresh: vec![full],
     });
     let mut out2 = WriteBuf::new();
-    ironrdp_connector::legacy::encode_share_data(user_channel_id, io_channel_id, share_id, refresh, &mut out2)
-        .map_err(|e| Error::Protocol(format!("encode refresh rect: {e}")))?;
+    ironrdp_connector::legacy::encode_share_data(
+        user_channel_id,
+        io_channel_id,
+        share_id,
+        refresh,
+        &mut out2,
+    )
+    .map_err(|e| Error::Protocol(format!("encode refresh rect: {e}")))?;
     session.send_rdp(out2.filled()).await?;
 
     debug!(width, height, share_id, "sent allow-output + refresh-rect");
@@ -2005,8 +2135,14 @@ async fn send_refresh_area(
         areas_to_refresh: vec![rect],
     });
     let mut out = WriteBuf::new();
-    ironrdp_connector::legacy::encode_share_data(user_channel_id, io_channel_id, share_id, refresh, &mut out)
-        .map_err(|e| Error::Protocol(format!("encode refresh area: {e}")))?;
+    ironrdp_connector::legacy::encode_share_data(
+        user_channel_id,
+        io_channel_id,
+        share_id,
+        refresh,
+        &mut out,
+    )
+    .map_err(|e| Error::Protocol(format!("encode refresh area: {e}")))?;
     session.send_rdp(out.filled()).await?;
     Ok(())
 }
@@ -2025,7 +2161,12 @@ async fn flush_cursor_trail(
         // can make `left > right` (the min corner isn't clamped to the max), which
         // would be a malformed RefreshRectangle on the wire.
         if left <= right && top <= bottom {
-            let rect = ironrdp_pdu::geometry::InclusiveRectangle { left, top, right, bottom };
+            let rect = ironrdp_pdu::geometry::InclusiveRectangle {
+                left,
+                top,
+                right,
+                bottom,
+            };
             send_refresh_area(session, user_channel_id, io_channel_id, share_id, rect).await?;
             *last = std::time::Instant::now();
         }
@@ -2050,7 +2191,10 @@ async fn drive_reactivation(
         out.clear();
         if let Some(hint) = seq.next_pdu_hint() {
             let pdu_len = loop {
-                match hint.find_size(buf).map_err(|e| Error::Protocol(format!("reactivation hint: {e}")))? {
+                match hint
+                    .find_size(buf)
+                    .map_err(|e| Error::Protocol(format!("reactivation hint: {e}")))?
+                {
                     Some((_m, size)) => break size,
                     None => {
                         let more = session
@@ -2065,7 +2209,11 @@ async fn drive_reactivation(
             // The SCCM reactivation DemandActive has a short Bitmap Cache Rev2
             // cap that IronRDP can't decode; pad it before processing.
             if let Some(fixed) = fix_short_bitmap_cache_rev2(&pdu) {
-                debug!(old = pdu.len(), new = fixed.len(), "padded short BitmapCacheRev2 in reactivation DemandActive");
+                debug!(
+                    old = pdu.len(),
+                    new = fixed.len(),
+                    "padded short BitmapCacheRev2 in reactivation DemandActive"
+                );
                 pdu = fixed;
             }
             let state_name = seq.state.name();
@@ -2077,7 +2225,8 @@ async fn drive_reactivation(
                 return Err(Error::Protocol(format!("reactivation: {e}")));
             }
         } else {
-            seq.step_no_input(&mut out).map_err(|e| Error::Protocol(format!("reactivation: {e}")))?;
+            seq.step_no_input(&mut out)
+                .map_err(|e| Error::Protocol(format!("reactivation: {e}")))?;
         }
         if out.filled_len() > 0 {
             session.send_rdp(out.filled()).await?;
@@ -2107,16 +2256,12 @@ async fn drive_reactivation(
 }
 
 /// A simple headless sink that just counts + logs updates (for validation).
+#[derive(Default)]
 pub struct LoggingSink {
     pub updates: u64,
     pub total_pixels: u64,
 }
 
-impl Default for LoggingSink {
-    fn default() -> Self {
-        Self { updates: 0, total_pixels: 0 }
-    }
-}
 
 impl SessionSink for LoggingSink {
     fn on_graphics_update(&mut self, image: &dyn FrameView, region: UpdateRegion) {
@@ -2124,7 +2269,7 @@ impl SessionSink for LoggingSink {
         let w = region.right.saturating_sub(region.left) as u64 + 1;
         let h = region.bottom.saturating_sub(region.top) as u64 + 1;
         self.total_pixels += w * h;
-        if self.updates <= 20 || self.updates % 50 == 0 {
+        if self.updates <= 20 || self.updates.is_multiple_of(50) {
             info!(
                 update = self.updates,
                 region = format!("{}x{} @ ({},{})", w, h, region.left, region.top),
@@ -2147,7 +2292,11 @@ pub struct PngDumpSink {
 
 impl PngDumpSink {
     pub fn new(path: impl Into<String>) -> Self {
-        Self { path: path.into(), updates: 0, nonblack_pixels: 0 }
+        Self {
+            path: path.into(),
+            updates: 0,
+            nonblack_pixels: 0,
+        }
     }
 }
 
@@ -2157,7 +2306,7 @@ impl SessionSink for PngDumpSink {
         let w = image.width() as u32;
         let h = image.height() as u32;
         let data = image.data(); // RGBA32
-        // Count non-black pixels so we know if there's actual content.
+                                 // Count non-black pixels so we know if there's actual content.
         let mut nonblack = 0u64;
         for px in data.chunks_exact(4) {
             if px[0] != 0 || px[1] != 0 || px[2] != 0 {
@@ -2173,7 +2322,7 @@ impl SessionSink for PngDumpSink {
                 Ok(()) => {
                     if let Err(e) = std::fs::rename(&tmp, &self.path) {
                         warn!(error = %e, "png rename failed");
-                    } else if self.updates <= 3 || self.updates % 25 == 0 {
+                    } else if self.updates <= 3 || self.updates.is_multiple_of(25) {
                         info!(update = self.updates, fb = format!("{w}x{h}"), nonblack, path = %self.path, "saved frame PNG");
                     }
                 }
@@ -2338,8 +2487,14 @@ mod tests {
             recs.push((uh, cflags, raw[i + 4..i + 4 + size].to_vec()));
             i += 4 + size;
         }
-        let w: u16 = std::env::var("SCCM_RC_REPLAY_W").ok().and_then(|s| s.parse().ok()).unwrap_or(1920);
-        let h: u16 = std::env::var("SCCM_RC_REPLAY_H").ok().and_then(|s| s.parse().ok()).unwrap_or(1080);
+        let w: u16 = std::env::var("SCCM_RC_REPLAY_W")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1920);
+        let h: u16 = std::env::var("SCCM_RC_REPLAY_H")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1080);
         eprintln!("replay: {} compressed records, desktop {w}x{h}", recs.len());
 
         let mut dec = MppcDecompressor::new();
@@ -2378,8 +2533,11 @@ mod tests {
                             total_orders += o.orders as u64;
                         }
                         Err(e) => {
-                            let head: Vec<String> =
-                                complete.iter().take(32).map(|b| format!("{b:02x}")).collect();
+                            let head: Vec<String> = complete
+                                .iter()
+                                .take(32)
+                                .map(|b| format!("{b:02x}"))
+                                .collect();
                             panic!(
                                 "DESYNC at record {n} (uh={uh:#04x} cflags={cflags:#04x} insz={}): \
                                  order stream decode failed: {e}\n  decompressed {} bytes, head: {}",

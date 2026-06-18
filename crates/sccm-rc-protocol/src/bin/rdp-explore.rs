@@ -17,7 +17,11 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "rdp-explore", about = "Drive SCCM data phase to the RDP X.224 exchange", version)]
+#[command(
+    name = "rdp-explore",
+    about = "Drive SCCM data phase to the RDP X.224 exchange",
+    version
+)]
 struct Cli {
     target: String,
     /// How many post-grant frames to read while exploring.
@@ -28,7 +32,9 @@ struct Cli {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
     let cli = Cli::parse();
 
@@ -36,7 +42,10 @@ async fn main() -> anyhow::Result<()> {
     info!("TCP connected");
 
     // greeting
-    let g = conn.recv_frame().await?.ok_or_else(|| anyhow::anyhow!("no greeting"))?;
+    let g = conn
+        .recv_frame()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no greeting"))?;
     info!(greeting = %framing::decode_control_string(&g.body).unwrap_or_default(), "greeting");
 
     // handshake
@@ -50,11 +59,19 @@ async fn main() -> anyhow::Result<()> {
         if step.done {
             break;
         }
-        let f = conn.recv_frame().await?.ok_or_else(|| anyhow::anyhow!("closed mid-handshake"))?;
+        let f = conn
+            .recv_frame()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("closed mid-handshake"))?;
         if f.msg_type == MSG_TYPE_CONTROL {
-            anyhow::bail!("rejected: {}", framing::decode_control_string(&f.body).unwrap_or_default());
+            anyhow::bail!(
+                "rejected: {}",
+                framing::decode_control_string(&f.body).unwrap_or_default()
+            );
         }
-        peer = framing::decode_handshake_body(&f.body).ok_or_else(|| anyhow::anyhow!("bad token"))?.to_vec();
+        peer = framing::decode_handshake_body(&f.body)
+            .ok_or_else(|| anyhow::anyhow!("bad token"))?
+            .to_vec();
     }
     sspi.message_sizes()?;
     info!("handshake complete — entering data phase");
@@ -69,7 +86,11 @@ async fn main() -> anyhow::Result<()> {
             }
         };
         if frame.msg_type != MSG_TYPE_DATA {
-            info!(round, msg_type = format!("0x{:02x}", frame.msg_type), "non-data frame");
+            info!(
+                round,
+                msg_type = format!("0x{:02x}", frame.msg_type),
+                "non-data frame"
+            );
             continue;
         }
         let plain = match sspi.unseal(&frame.body) {
@@ -89,7 +110,10 @@ async fn main() -> anyhow::Result<()> {
                 let sealed = sspi.seal(&cr)?;
                 conn.send_raw(&data_frame(&sealed)).await?;
                 sent_x224 = true;
-                info!("→ sent sealed X.224 Connection Request ({} bytes plain)", cr.len());
+                info!(
+                    "→ sent sealed X.224 Connection Request ({} bytes plain)",
+                    cr.len()
+                );
             } else if s.starts_with("ERROR_") {
                 warn!("server denied: {s}");
                 break;
@@ -104,10 +128,20 @@ async fn main() -> anyhow::Result<()> {
                 0xf0 => "X.224 Data (RDP PDU)",
                 _ => "X.224 ?",
             };
-            info!(round, tpkt_len, x224 = kind, "← ✓✓ RDP TPKT PDU — RDP stream is live!");
+            info!(
+                round,
+                tpkt_len,
+                x224 = kind,
+                "← ✓✓ RDP TPKT PDU — RDP stream is live!"
+            );
             hexdump(&plain);
         } else {
-            info!(round, plain_len = plain.len(), head = format!("{:02x?}", &plain[..plain.len().min(16)]), "← binary (non-TPKT)");
+            info!(
+                round,
+                plain_len = plain.len(),
+                head = format!("{:02x?}", &plain[..plain.len().min(16)]),
+                "← binary (non-TPKT)"
+            );
         }
     }
 
@@ -115,10 +149,13 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn as_utf16_string(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 2 || bytes.len() % 2 != 0 {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
         return None;
     }
-    let u: Vec<u16> = bytes.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let u: Vec<u16> = bytes
+        .chunks(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
     let s = String::from_utf16_lossy(&u);
     let s = s.trim_end_matches('\u{0}');
     if !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c == '_') {
@@ -132,11 +169,11 @@ fn as_utf16_string(bytes: &[u8]) -> Option<String> {
 fn x224_connection_request() -> Vec<u8> {
     vec![
         0x03, 0x00, 0x00, 0x13, // TPKT, total 19
-        0x0e,                   // X.224 LI=14
-        0xe0,                   // CR
-        0x00, 0x00,             // dst-ref
-        0x00, 0x00,             // src-ref
-        0x00,                   // class 0
+        0x0e, // X.224 LI=14
+        0xe0, // CR
+        0x00, 0x00, // dst-ref
+        0x00, 0x00, // src-ref
+        0x00, // class 0
         0x01, 0x00, 0x08, 0x00, // RDP_NEG_REQ type=1 flags=0 len=8
         0x00, 0x00, 0x00, 0x00, // requestedProtocols = PROTOCOL_RDP
     ]
@@ -153,7 +190,16 @@ fn data_frame(sealed: &[u8]) -> Vec<u8> {
 fn hexdump(bytes: &[u8]) {
     for (i, chunk) in bytes.chunks(16).take(8).enumerate() {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
-        let ascii: String = chunk.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
+        let ascii: String = chunk
+            .iter()
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
         println!("   {:04x}  {:<48}  {ascii}", i * 16, hex.join(" "));
     }
 }

@@ -1,5 +1,3 @@
-_version: 2
-
 status:
   connecting_to: "Connecting to %{target}…"
   connecting: "Connecting…"
@@ -26,6 +24,11 @@ toolbar:
   curtain: "Curtain"
   send_file: "Send File"
   ctrl_alt_del: "Ctrl+Alt+Del"
+
+monitor:
+  label: "Screen: %{which}"
+  all: "All"
+  switching: "Switching…"
 
 prompt:
   label: "Computer name or IP address:"

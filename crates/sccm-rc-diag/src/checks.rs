@@ -14,14 +14,14 @@ use windows::Win32::NetworkManagement::NetManagement::{
 };
 use windows::Win32::Security::Authentication::Identity::{
     LsaClose, LsaEnumerateAccountsWithUserRight, LsaFreeMemory, LsaNtStatusToWinError,
-    LsaOpenPolicy, LSA_HANDLE, LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING,
-    POLICY_LOOKUP_NAMES, POLICY_VIEW_LOCAL_INFORMATION,
+    LsaOpenPolicy, LSA_HANDLE, LSA_OBJECT_ATTRIBUTES, LSA_UNICODE_STRING, POLICY_LOOKUP_NAMES,
+    POLICY_VIEW_LOCAL_INFORMATION,
 };
 use windows::Win32::Security::{LookupAccountSidW, PSID, SID_NAME_USE};
 use windows::Win32::System::Services::{
-    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx,
-    SC_MANAGER_CONNECT, SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING,
-    SERVICE_START_PENDING, SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
+    CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_MANAGER_CONNECT,
+    SC_STATUS_PROCESS_INFO, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START_PENDING,
+    SERVICE_STATUS_PROCESS, SERVICE_STOPPED,
 };
 
 const SCCM_SERVICE_NAME: &str = "CmRcService";
@@ -117,7 +117,9 @@ pub async fn cmrcservice_state(target: &str) -> CheckResult {
         Ok(Err(e)) => match e.code() {
             c if c.0 as u32 == ERROR_ACCESS_DENIED.0 => CheckResult::warning(
                 "cmrcservice",
-                format!("Access denied querying SCM on {target} — you may lack admin on the target"),
+                format!(
+                    "Access denied querying SCM on {target} — you may lack admin on the target"
+                ),
                 "This is informational — the SCCM RC connection itself may still work\n\
                  if the user has Remote Control rights via a different mechanism.\n\
                  To enable the check, run as a target admin or via a delegated SCM ACL.",
@@ -125,7 +127,10 @@ pub async fn cmrcservice_state(target: &str) -> CheckResult {
             ),
             _ => CheckResult::warning(
                 "cmrcservice",
-                format!("Could not query SCM on {target}: {e} (HRESULT {:?})", e.code()),
+                format!(
+                    "Could not query SCM on {target}: {e} (HRESULT {:?})",
+                    e.code()
+                ),
                 "Remote SCM/RPC may be blocked by firewall (ports 135 + dynamic RPC).\n\
                  This check is best-effort and does not block the actual viewer connection.",
                 elapsed,
@@ -212,13 +217,21 @@ pub async fn network_logon_right(target: &str, viewer_user: &str) -> CheckResult
 
     match result {
         Ok(Ok(accounts)) => {
-            let me_listed = accounts
-                .iter()
-                .any(|n| n.eq_ignore_ascii_case(&u) || n.split('\\').last().map(|p| p.eq_ignore_ascii_case(&u)).unwrap_or(false));
+            let me_listed = accounts.iter().any(|n| {
+                n.eq_ignore_ascii_case(&u)
+                    || n.split('\\')
+                        .next_back()
+                        .map(|p| p.eq_ignore_ascii_case(&u))
+                        .unwrap_or(false)
+            });
             let list = if accounts.is_empty() {
                 "  (no accounts have this right — RC will fail for everyone)".to_string()
             } else {
-                accounts.iter().map(|a| format!("  - {a}")).collect::<Vec<_>>().join("\n")
+                accounts
+                    .iter()
+                    .map(|a| format!("  - {a}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             };
             let msg = format!(
                 "Accounts on {target} with 'Access this computer from the network' right:\n{list}\n\n\
@@ -281,7 +294,7 @@ fn enumerate_network_logon(target: &str) -> windows::core::Result<Vec<String>> {
     let mut policy = LSA_HANDLE::default();
 
     let right = winutil::to_wide("SeNetworkLogonRight");
-    let mut right_str = LSA_UNICODE_STRING {
+    let right_str = LSA_UNICODE_STRING {
         Length: ((right.len() - 1) * 2) as u16,
         MaximumLength: (right.len() * 2) as u16,
         Buffer: PWSTR(right.as_ptr() as *mut u16),
@@ -291,7 +304,11 @@ fn enumerate_network_logon(target: &str) -> windows::core::Result<Vec<String>> {
     // the policy handle and free LSA-allocated buffers in every exit path.
     unsafe {
         let want_local = target_w.len() <= 1;
-        let sys_ptr = if want_local { std::ptr::null_mut() } else { &mut system_name };
+        let sys_ptr = if want_local {
+            std::ptr::null_mut()
+        } else {
+            &mut system_name
+        };
         let status = LsaOpenPolicy(
             Some(sys_ptr),
             &oa,
@@ -307,12 +324,8 @@ fn enumerate_network_logon(target: &str) -> windows::core::Result<Vec<String>> {
 
         let mut buf: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut count: u32 = 0;
-        let enum_status = LsaEnumerateAccountsWithUserRight(
-            policy,
-            Some(&mut right_str),
-            &mut buf,
-            &mut count,
-        );
+        let enum_status =
+            LsaEnumerateAccountsWithUserRight(policy, Some(&right_str), &mut buf, &mut count);
         if enum_status.0 != 0 {
             let _ = LsaClose(policy);
             // NTSTATUS 0xC0000034 = STATUS_OBJECT_NAME_NOT_FOUND, meaning
@@ -333,7 +346,10 @@ fn enumerate_network_logon(target: &str) -> windows::core::Result<Vec<String>> {
 
         let mut names = Vec::new();
         for info in infos {
-            names.push(resolve_sid(target, info.Sid.0 as *mut _).unwrap_or_else(|| "<unresolvable SID>".to_string()));
+            names.push(
+                resolve_sid(target, info.Sid.0 as *mut _)
+                    .unwrap_or_else(|| "<unresolvable SID>".to_string()),
+            );
         }
 
         let _ = LsaFreeMemory(Some(buf));
@@ -357,7 +373,11 @@ fn resolve_sid(target: &str, sid: *mut std::ffi::c_void) -> Option<String> {
     let ok = unsafe {
         let _ = PSTR::null(); // silence import-only warning
         LookupAccountSidW(
-            if want_local { windows::core::PCWSTR::null() } else { winutil::pcwstr(&target_w) },
+            if want_local {
+                windows::core::PCWSTR::null()
+            } else {
+                winutil::pcwstr(&target_w)
+            },
             PSID(sid),
             Some(PWSTR(name_buf.as_mut_ptr())),
             &mut name_len,
@@ -371,7 +391,11 @@ fn resolve_sid(target: &str, sid: *mut std::ffi::c_void) -> Option<String> {
     }
     let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
     let domain = String::from_utf16_lossy(&domain_buf[..domain_len as usize]);
-    Some(if domain.is_empty() { name } else { format!("{domain}\\{name}") })
+    Some(if domain.is_empty() {
+        name
+    } else {
+        format!("{domain}\\{name}")
+    })
 }
 
 // ---------------------------------------------------------------- check 4
@@ -388,17 +412,28 @@ pub async fn permitted_viewers(target: &str, viewer_user: &str) -> CheckResult {
         Ok(Ok((group_name, members))) => {
             let me_listed = members.iter().any(|m| {
                 m.eq_ignore_ascii_case(&u)
-                    || m.split('\\').last().map(|p| p.eq_ignore_ascii_case(&u)).unwrap_or(false)
+                    || m.split('\\')
+                        .next_back()
+                        .map(|p| p.eq_ignore_ascii_case(&u))
+                        .unwrap_or(false)
             });
             let list = if members.is_empty() {
                 "  (group is empty — no one can use SCCM RC)".to_string()
             } else {
-                members.iter().map(|m| format!("  - {m}")).collect::<Vec<_>>().join("\n")
+                members
+                    .iter()
+                    .map(|m| format!("  - {m}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             };
             let msg = format!(
                 "Members of '{group_name}' on {target}:\n{list}\n\n\
                  Viewer user '{viewer_user}' directly listed: {}",
-                if me_listed { "YES" } else { "NO (but may be via nested group)" }
+                if me_listed {
+                    "YES"
+                } else {
+                    "NO (but may be via nested group)"
+                }
             );
             CheckResult::warning(
                 "permitted_viewers",
@@ -522,7 +557,15 @@ fn find_sccm_rc_group(target: &str) -> Result<String, GroupErr> {
         let mut total: u32 = 0;
         // SAFETY: NetApi will allocate `buf`; we free in every exit.
         let rc = unsafe {
-            NetLocalGroupEnum(server, 0, &mut buf, 8192, &mut entries, &mut total, Some(&mut resume_handle))
+            NetLocalGroupEnum(
+                server,
+                0,
+                &mut buf,
+                8192,
+                &mut entries,
+                &mut total,
+                Some(&mut resume_handle),
+            )
         };
         // ERROR_MORE_DATA (234) is fine and means "call me again"
         if rc != 0 && rc != 234 {
