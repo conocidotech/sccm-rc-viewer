@@ -117,6 +117,39 @@ fn load_window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
+/// Draw the in-app About screen into a full-window overlay buffer (0x00RRGGBB),
+/// in the same centred style as the connect/closed splash. Version comes from the
+/// `VERSION` const (package version + git hash); the rest is localized.
+fn draw_about(buf: &mut [u32], w: u32, h: u32, font: Option<&text::TextRenderer>) {
+    for px in buf.iter_mut() {
+        *px = 0x0020_2020;
+    }
+    let cy = (h / 2) as f32;
+    // (y, text, colour, font-px, bitmap-scale fallback)
+    let lines: [(f32, String, u32, f32, u32); 7] = [
+        (cy - 96.0, "sccm-rc".to_string(), 0x00FF_FFFF, 40.0, 3),
+        (cy - 50.0, format!("v{VERSION}"), 0x00C8_D2DC, 20.0, 2),
+        (cy - 16.0, t!("about.tagline").to_string(), 0x00B0_C0D0, 19.0, 2),
+        (cy + 16.0, "MIT OR Apache-2.0".to_string(), 0x0090_9CA8, 17.0, 2),
+        (
+            cy + 44.0,
+            "github.com/conocidotech/sccm-rc-viewer".to_string(),
+            0x0090_9CA8,
+            17.0,
+            2,
+        ),
+        (cy + 76.0, t!("about.security").to_string(), 0x0070_C070, 17.0, 2),
+        (cy + 118.0, t!("about.dismiss").to_string(), 0x0070_7880, 15.0, 1),
+    ];
+    for (y, text, color, size_px, scale) in lines {
+        if let Some(f) = font {
+            f.draw_centered(buf, w, h, y, &text, color, size_px);
+        } else {
+            toolbar::draw_text_centered(buf, w, h, (y as u32).saturating_sub(4), &text, color, scale);
+        }
+    }
+}
+
 /// Ask for the target hostname via a native Windows input box (used when no
 /// target is given on the command line — e.g. when launched by double-click).
 #[cfg(windows)]
@@ -544,6 +577,7 @@ fn main() -> anyhow::Result<()> {
         view_only: false,
         view: MonitorView::All,
         switch_flash: 0,
+        about_open: false,
         fps: 0,
         fps_base: 0,
         fps_t: std::time::Instant::now(),
@@ -828,6 +862,9 @@ struct App {
     /// Frames left to show the transient "Switching…" indicator in the toolbar
     /// state line after a monitor-view change (RRCV-20 feedback).
     switch_flash: u32,
+    /// True while the in-app About overlay is shown (toggled by the toolbar
+    /// button; dismissed by a click anywhere or Esc).
+    about_open: bool,
     fps: u32,
     fps_base: u64,
     fps_t: std::time::Instant,
@@ -1104,6 +1141,12 @@ impl App {
                 // app open). Closing the window (X) still exits entirely.
                 self.switch_host(event_loop);
             }
+            ToolbarAction::About => {
+                self.about_open = !self.about_open;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
         }
     }
 }
@@ -1252,6 +1295,17 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                // While the About overlay is open, a left click anywhere closes it
+                // and is neither hit-tested against the toolbar nor forwarded.
+                if self.about_open {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        self.about_open = false;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 // Clicks on the toolbar strip are handled locally, not forwarded.
                 if self.mouse_win.1 < toolbar::TOOLBAR_H as f64 {
                     if state == ElementState::Pressed && button == MouseButton::Left {
@@ -1306,6 +1360,19 @@ impl ApplicationHandler<UserEvent> for App {
                 self.modifiers = m.state();
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // While the About overlay is open, swallow all keyboard input; Esc
+                // closes it. Nothing reaches the remote session.
+                if self.about_open {
+                    if event.state == ElementState::Pressed
+                        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
+                    {
+                        self.about_open = false;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 // Ctrl+Alt+End → send Ctrl+Alt+Del (SAS) to the remote, like
                 // CmRcViewer (Ctrl+Alt+Del itself is swallowed by the local OS).
                 if event.state == ElementState::Pressed
@@ -1408,13 +1475,15 @@ impl App {
 
         // Rasterise the overlay into a CPU u32 buffer with the existing drawing
         // code: the toolbar strip when connected, else the full-window splash.
-        let (ov_w, ov_h, dest) = if connected {
-            (win_w, bar_h, gpu::OverlayDest::TopStrip(bar_h))
-        } else {
+        let (ov_w, ov_h, dest) = if self.about_open || !connected {
             (win_w, win_h, gpu::OverlayDest::Full)
+        } else {
+            (win_w, bar_h, gpu::OverlayDest::TopStrip(bar_h))
         };
         let mut ov = vec![0u32; (ov_w * ov_h) as usize];
-        if connected {
+        if self.about_open {
+            draw_about(&mut ov, ov_w, ov_h, self.font.as_ref());
+        } else if connected {
             let mode = if self.view_only {
                 t!("mode.view_only")
             } else {
@@ -1593,6 +1662,14 @@ impl App {
             return;
         };
         let rstart = std::time::Instant::now();
+
+        // About overlay takes over the whole window (no desktop/toolbar), matching
+        // the GPU path. Drawn and presented directly, then we're done for this paint.
+        if self.about_open {
+            draw_about(&mut buffer[..], win_w, win_h, self.font.as_ref());
+            let _ = buffer.present();
+            return;
+        }
 
         // The remote desktop renders BELOW the toolbar strip (reserved at top).
         let bar_h = toolbar::TOOLBAR_H.min(win_h);

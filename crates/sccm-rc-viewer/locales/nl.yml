@@ -24,11 +24,17 @@ toolbar:
   curtain: "Gordijn"
   send_file: "Bestand sturen"
   ctrl_alt_del: "Ctrl+Alt+Del"
+  about: "Over"
 
 monitor:
   label: "Scherm: %{which}"
   all: "Alle"
   switching: "Wisselen…"
+
+about:
+  tagline: "Open-source SCCM Remote Control viewer — pure Rust"
+  security: "Kerberos-geverifieerd · SSPI-versleuteld kanaal"
+  dismiss: "Klik ergens of druk op Esc om te sluiten"
 
 prompt:
   label: "Computernaam of IP-adres:"

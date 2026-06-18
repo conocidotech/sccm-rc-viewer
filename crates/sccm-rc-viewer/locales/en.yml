@@ -24,11 +24,17 @@ toolbar:
   curtain: "Curtain"
   send_file: "Send File"
   ctrl_alt_del: "Ctrl+Alt+Del"
+  about: "About"
 
 monitor:
   label: "Screen: %{which}"
   all: "All"
   switching: "Switching…"
+
+about:
+  tagline: "Open-source SCCM Remote Control viewer — pure Rust"
+  security: "Kerberos-authenticated · SSPI-sealed channel"
+  dismiss: "Click anywhere or press Esc to close"
 
 prompt:
   label: "Computer name or IP address:"

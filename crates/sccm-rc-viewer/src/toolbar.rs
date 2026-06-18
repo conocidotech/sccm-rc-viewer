@@ -69,6 +69,8 @@ pub enum ToolbarAction {
     /// Cycle the shown monitor of an All-Screens target (All → 1 → 2 → …). Only
     /// present when the target is multi-monitor; its label is dynamic.
     MonitorCycle,
+    /// Toggle the in-app About overlay (version, license, repo, security model).
+    About,
 }
 
 /// Dynamic status shown on the left of the bar.
@@ -116,6 +118,7 @@ const BUTTONS: &[ToolbarAction] = &[
     ToolbarAction::ToggleCurtain,
     ToolbarAction::SendFile,
     ToolbarAction::CtrlAltDel,
+    ToolbarAction::About,
 ];
 
 /// Localized label for a toolbar button.
@@ -128,6 +131,7 @@ fn button_label(action: ToolbarAction) -> String {
         ToolbarAction::ToggleCurtain => t!("toolbar.curtain"),
         ToolbarAction::SendFile => t!("toolbar.send_file"),
         ToolbarAction::CtrlAltDel => t!("toolbar.ctrl_alt_del"),
+        ToolbarAction::About => t!("toolbar.about"),
         // Dynamic label supplied via Status.monitor / buttons_with; never resolved
         // here, but the match must be exhaustive.
         ToolbarAction::MonitorCycle => t!("monitor.all"),
