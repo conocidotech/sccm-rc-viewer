@@ -18,6 +18,11 @@
   <a href="https://github.com/conocidotech/sccm-rc-viewer/releases/latest"><img src="https://img.shields.io/badge/Download-Windows%20x64-2ea44f?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows"></a>
 </p>
 
+<p align="center">
+  <img src="docs/assets/screenshot.png" width="900"
+       alt="sccm-rc viewer showing a multi-monitor session: the toolbar with the Kerberos security lock and the per-monitor 'Screen' switcher, over a two-screen desktop">
+</p>
+
 ---
 
 `sccm-rc` re-implements the **operator-side viewer** of Microsoft's ConfigMgr

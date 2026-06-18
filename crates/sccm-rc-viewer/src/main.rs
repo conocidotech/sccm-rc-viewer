@@ -99,6 +99,11 @@ struct Cli {
     /// also affects later remote-control sessions to that machine.
     #[arg(long = "all-screens")]
     all_screens: bool,
+    /// Demo/screenshot mode: don't connect to anything — paint a synthetic
+    /// multi-monitor desktop so the full UI (toolbar + monitor switcher) renders
+    /// for a privacy-safe screenshot. No real machine is contacted.
+    #[arg(long)]
+    demo: bool,
 }
 
 /// Ask for the target hostname via a native Windows input box (used when no
@@ -410,9 +415,11 @@ fn main() -> anyhow::Result<()> {
         std::env::set_var("SCCM_RC_ALLMON", "1");
     }
 
-    // Target: CLI arg (like CmRcViewer) or, if absent, a prompt.
-    let target = match cli.target {
+    // Target: CLI arg (like CmRcViewer) or, if absent, a prompt. In --demo mode we
+    // never connect, so default to a placeholder name instead of prompting.
+    let target = match cli.target.clone() {
         Some(t) => t,
+        None if cli.demo => "DEMO-PC".to_string(),
         None => match prompt_hostname() {
             Some(h) => h,
             None => {
@@ -479,18 +486,26 @@ fn main() -> anyhow::Result<()> {
 
     // Start the first session. `spawn_session` owns the per-host reconnect loop
     // and returns the `running` flag + input sender; the Disconnect button stops
-    // it and spawns a fresh one for another host.
-    let (running, input_tx, done_rx) = spawn_session(
-        target.clone(),
-        w,
-        h,
-        shared.clone(),
-        cursor.clone(),
-        proxy.clone(),
-        curtain.clone(),
-        file_offer.clone(),
-        monitors.clone(),
-    );
+    // it and spawns a fresh one for another host. In --demo mode we skip the
+    // network entirely and paint a synthetic multi-monitor desktop instead.
+    let (running, input_tx, done_rx) = if cli.demo {
+        demo_frame(&shared);
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<FastPathInputEvent>>(1);
+        let (_done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        (Arc::new(AtomicBool::new(false)), tx, done_rx)
+    } else {
+        spawn_session(
+            target.clone(),
+            w,
+            h,
+            shared.clone(),
+            cursor.clone(),
+            proxy.clone(),
+            curtain.clone(),
+            file_offer.clone(),
+            monitors.clone(),
+        )
+    };
 
     let mut app = App {
         shared,
@@ -542,6 +557,46 @@ fn main() -> anyhow::Result<()> {
     app.input_tx = None;
     let _ = app.done_rx.recv_timeout(std::time::Duration::from_secs(3));
     Ok(())
+}
+
+/// Paint a synthetic multi-monitor desktop into the shared frame for `--demo`
+/// mode: two side-by-side 1920×1080 "screens" with distinct tinted gradients and a
+/// divider, plus a connected/secure status. The frame is two monitors wide, so the
+/// full UI renders — toolbar, security lock, and the monitor switcher — for a
+/// privacy-safe screenshot without contacting any real machine.
+fn demo_frame(shared: &Arc<Mutex<SharedFrame>>) {
+    let (w, h) = (3840u32, 1080u32);
+    let half = w / 2;
+    let mut rgba = vec![0u8; (w as usize) * (h as usize) * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            let on_right = x >= half;
+            let gx = (if on_right { x - half } else { x }) as f32 / half as f32;
+            let gy = y as f32 / h as f32;
+            let (r, g, b) = if x >= half.saturating_sub(1) && x <= half {
+                (16.0, 16.0, 18.0) // 2px divider between the two screens
+            } else if on_right {
+                (40.0 + gx * 90.0, 70.0 + gy * 70.0, 130.0 + gx * 90.0) // screen 2
+            } else {
+                (30.0 + gx * 70.0, 90.0 + gy * 90.0, 110.0 + gx * 60.0) // screen 1
+            };
+            rgba[i] = r as u8;
+            rgba[i + 1] = g as u8;
+            rgba[i + 2] = b as u8;
+            rgba[i + 3] = 255;
+        }
+    }
+    let mut f = shared.lock().unwrap();
+    f.rgba = rgba;
+    f.width = w;
+    f.height = h;
+    f.frames = 1;
+    f.full_resync = true;
+    f.status = t!("status.connected").to_string();
+    f.secure = true;
+    f.encrypted = true;
+    f.security = format!("Kerberos \u{00b7} {}", t!("security.encrypted"));
 }
 
 /// Spawn the dedicated tokio-runtime thread that drives one host's session, with
