@@ -18,6 +18,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 clap.workspace = true
+# Rolling-file log appender so bug reports can attach the viewer's own
+# tracing output (the most diagnostic-rich part of a report).
+tracing-appender = "0.2"
 winit = "0.30"
 softbuffer = "0.4"
 # Tiny embedded 8x8 bitmap font — fallback when no system TTF is found.
@@ -35,3 +38,10 @@ pollster = "0.3"
 rust-i18n = "3"
 # Detect the Windows UI language at startup (reads the user locale).
 sys-locale = "0.3"
+
+# Low-level keyboard hook (WH_KEYBOARD_LL) for Win-key passthrough in windowed
+# mode + MessageBox for the bug-report confirmation dialog. Workspace `windows`
+# dep adds the WindowsAndMessaging / KeyboardAndMouse features (see root
+# Cargo.toml) so all crates share one compiled instance.
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

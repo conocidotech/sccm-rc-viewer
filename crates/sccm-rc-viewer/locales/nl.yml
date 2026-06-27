@@ -7,6 +7,7 @@ status:
   connected: "Verbonden"
   disconnected: "Verbinding verbroken"
   disconnected_reason: "Verbinding verbroken — %{reason}"
+  report_saved: "Bug-rapport opgeslagen in"
 
 security:
   encrypted: "versleuteld"
@@ -24,7 +25,13 @@ toolbar:
   curtain: "Gordijn"
   send_file: "Bestand sturen"
   ctrl_alt_del: "Ctrl+Alt+Del"
+  send_win: "Win"
+  bug_report: "Bug-rapport"
   about: "Over"
+
+report:
+  dialog_title: "Bug-rapport gegenereerd"
+  dialog_body: "Een bug-rapport (audit-log, systeeminfo, screenshot) is hieronder opgeslagen. Map openen?"
 
 monitor:
   label: "Scherm: %{which}"

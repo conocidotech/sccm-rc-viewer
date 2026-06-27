@@ -60,6 +60,10 @@ const BTN_ACTIVE: u32 = 0x00305A8C;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolbarAction {
     CtrlAltDel,
+    /// Send the Windows key to the remote (windowed-mode equivalent of pressing
+    /// Win, which the local OS otherwise eats to open the local Start menu).
+    /// Also bound to the Ctrl+Esc hotkey.
+    SendWin,
     SendFile,
     ToggleCurtain,
     ToggleViewOnly,
@@ -69,6 +73,10 @@ pub enum ToolbarAction {
     /// Cycle the shown monitor of an All-Screens target (All → 1 → 2 → …). Only
     /// present when the target is multi-monitor; its label is dynamic.
     MonitorCycle,
+    /// Bundle audit log + sysinfo + a screenshot of the current desktop into
+    /// a folder under %TEMP% and open Explorer at it, for the operator to
+    /// attach to an email or GitHub issue.
+    BugReport,
     /// Toggle the in-app About overlay (version, license, repo, security model).
     About,
 }
@@ -118,6 +126,8 @@ const BUTTONS: &[ToolbarAction] = &[
     ToolbarAction::ToggleCurtain,
     ToolbarAction::SendFile,
     ToolbarAction::CtrlAltDel,
+    ToolbarAction::SendWin,
+    ToolbarAction::BugReport,
     ToolbarAction::About,
 ];
 
@@ -131,6 +141,8 @@ fn button_label(action: ToolbarAction) -> String {
         ToolbarAction::ToggleCurtain => t!("toolbar.curtain"),
         ToolbarAction::SendFile => t!("toolbar.send_file"),
         ToolbarAction::CtrlAltDel => t!("toolbar.ctrl_alt_del"),
+        ToolbarAction::SendWin => t!("toolbar.send_win"),
+        ToolbarAction::BugReport => t!("toolbar.bug_report"),
         ToolbarAction::About => t!("toolbar.about"),
         // Dynamic label supplied via Status.monitor / buttons_with; never resolved
         // here, but the match must be exhaustive.

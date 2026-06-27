@@ -7,6 +7,7 @@ status:
   connected: "Connected"
   disconnected: "Disconnected"
   disconnected_reason: "Disconnected — %{reason}"
+  report_saved: "Bug report saved at"
 
 security:
   encrypted: "encrypted"
@@ -24,7 +25,13 @@ toolbar:
   curtain: "Curtain"
   send_file: "Send File"
   ctrl_alt_del: "Ctrl+Alt+Del"
+  send_win: "Win"
+  bug_report: "Bug Report"
   about: "About"
+
+report:
+  dialog_title: "Bug report generated"
+  dialog_body: "A bug report (audit log tail, system info, desktop screenshot) was saved here. Open the folder?"
 
 monitor:
   label: "Screen: %{which}"

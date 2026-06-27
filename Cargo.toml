@@ -66,6 +66,9 @@ windows = { version = "0.61", features = [
     "Win32_NetworkManagement_NetManagement",
     "Win32_System_Services",
     "Win32_System_Registry",
+    # Viewer: WH_KEYBOARD_LL keyboard hook + MessageBox dialog
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 # Cross-crate internal deps

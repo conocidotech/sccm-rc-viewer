@@ -7,6 +7,7 @@ status:
   connected: "Verbunden"
   disconnected: "Verbindung getrennt"
   disconnected_reason: "Verbindung getrennt — %{reason}"
+  report_saved: "Fehlerbericht gespeichert in"
 
 security:
   encrypted: "verschlüsselt"
@@ -24,7 +25,13 @@ toolbar:
   curtain: "Sichtschutz"
   send_file: "Datei senden"
   ctrl_alt_del: "Strg+Alt+Entf"
+  send_win: "Win"
+  bug_report: "Fehlerbericht"
   about: "Über"
+
+report:
+  dialog_title: "Fehlerbericht erstellt"
+  dialog_body: "Ein Fehlerbericht (Audit-Log, Systeminfo, Screenshot) wurde hier gespeichert. Ordner öffnen?"
 
 monitor:
   label: "Bildschirm: %{which}"

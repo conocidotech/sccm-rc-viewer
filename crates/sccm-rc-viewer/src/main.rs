@@ -28,8 +28,11 @@ mod audit;
 mod gpu;
 mod recent;
 mod record;
+mod report;
 mod text;
 mod toolbar;
+#[cfg(windows)]
+mod winhook;
 mod wol;
 use toolbar::ToolbarAction;
 
@@ -415,14 +418,64 @@ impl SessionSink for FrameSink {
     }
 }
 
+/// Wire up tracing to BOTH the console AND a daily-rotating file at
+/// `%LOCALAPPDATA%\sccm-rc\viewer.log` (falls back to `%TEMP%` if LOCALAPPDATA
+/// isn't set). The file is what makes a bug-report bundle actually
+/// diagnostic — without it, the most useful WARN/ERROR lines (channel-routing
+/// failures, reactivation desyncs, …) vanish into stdout that nothing
+/// captures. Returns the appender's `WorkerGuard` — its `Drop` flushes the
+/// queue, so `main` must keep it alive for the whole program.
+fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // wgpu/naga log Device::maintain etc. at INFO every frame — quiet them
+        // by default so the GPU path doesn't flood the log. RUST_LOG overrides.
+        EnvFilter::new("info,sccm_rc_core=info,wgpu_core=warn,wgpu_hal=warn,naga=warn")
+    });
+    let console = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+
+    let log_dir = std::env::var_os("LOCALAPPDATA")
+        .map(|p| std::path::PathBuf::from(p).join("sccm-rc"))
+        .unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    let appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("viewer")
+        .filename_suffix("log")
+        .max_log_files(7) // keep a week of history; bug-report grabs the current + previous
+        .build(&log_dir);
+    match appender {
+        Ok(app) => {
+            let (writer, guard) = tracing_appender::non_blocking(app);
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false);
+            tracing_subscriber::registry()
+                .with(filter)
+                .with(console)
+                .with(file_layer)
+                .init();
+            Some(guard)
+        }
+        Err(e) => {
+            tracing_subscriber::registry().with(filter).with(console).init();
+            tracing::warn!(error = %e, "could not open viewer.log; console-only logging");
+            None
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            // wgpu/naga log Device::maintain etc. at INFO every frame — quiet them
-            // by default so the GPU path doesn't flood the log. RUST_LOG overrides.
-            EnvFilter::new("info,sccm_rc_core=info,wgpu_core=warn,wgpu_hal=warn,naga=warn")
-        }))
-        .init();
+    // Console + rolling file appender. The file lives at
+    // %LOCALAPPDATA%\sccm-rc\viewer.log and rotates daily (so a single
+    // file holds today's session, and yesterday's stays available for
+    // bug-report bundling). The non-blocking writer needs its WorkerGuard
+    // alive for the lifetime of the program — hence the `_log_guard` binding
+    // kept in `main`.
+    let _log_guard = init_tracing();
     let cli = Cli::parse();
     init_locale(cli.lang.as_deref());
 
@@ -550,6 +603,16 @@ fn main() -> anyhow::Result<()> {
             monitors.clone(),
         )
     };
+
+    // Install the low-level keyboard hook ONCE — it's a process-global
+    // resource, so we wire it to the initial input channel. Reconnects swap
+    // in a new sender via `App.input_tx`, but the hook keeps using this
+    // original handle: the channel only changes when run_active_session
+    // restarts, and that path goes through App.input_tx for forwarding too.
+    // (A future refactor could expose `winhook::update_tx(...)`; not needed
+    // until the hook's stale channel actually causes a dropped Win-key.)
+    #[cfg(windows)]
+    winhook::install(input_tx.clone());
 
     let mut app = App {
         shared,
@@ -924,6 +987,26 @@ impl App {
         info!("sent Ctrl+Alt+Del (SAS) to remote");
     }
 
+    /// Inject a Windows-key tap (press+release) to the remote — the windowed-mode
+    /// equivalent of the Win key, which the local OS otherwise steals to open the
+    /// local Start menu. Set-1 scancode for the Left-Win key is 0xE05B (extended).
+    /// Triggered by the toolbar button or by Ctrl+Esc.
+    fn send_win_key(&self) {
+        if self.view_only {
+            return;
+        }
+        let ext = KeyboardFlags::EXTENDED;
+        let up = KeyboardFlags::RELEASE;
+        let seq = vec![
+            FastPathInputEvent::KeyboardEvent(ext, 0x5B),      // Win down (extended)
+            FastPathInputEvent::KeyboardEvent(ext | up, 0x5B), // Win up
+        ];
+        if let Some(tx) = &self.input_tx {
+            let _ = tx.try_send(seq);
+        }
+        info!("sent Windows-key tap to remote");
+    }
+
     /// Signal the session thread to stop and disconnect gracefully: clear
     /// `running` and drop the input sender (unblocks run_active_session).
     fn begin_shutdown(&mut self) {
@@ -976,6 +1059,11 @@ impl App {
             self.monitors.clone(),
         );
         self.running = running;
+        // Keep the LL keyboard hook bound to the active session's input sender
+        // — otherwise Win-key forwarding silently breaks after the first
+        // reconnect (the hook would hold a closed channel).
+        #[cfg(windows)]
+        winhook::set_tx(Some(input_tx.clone()));
         self.input_tx = Some(input_tx);
         self.done_rx = done_rx;
         if let Some(w) = &self.window {
@@ -1098,6 +1186,7 @@ impl App {
     fn run_toolbar_action(&mut self, action: ToolbarAction, event_loop: &ActiveEventLoop) {
         match action {
             ToolbarAction::CtrlAltDel => self.send_ctrl_alt_del(),
+            ToolbarAction::SendWin => self.send_win_key(),
             ToolbarAction::SendFile => {
                 if let Some(path) = pick_file() {
                     info!(file = %path.display(), "queued file to push to remote (paste there)");
@@ -1140,6 +1229,49 @@ impl App {
                 // Disconnect from the current host and pick another one (keeps the
                 // app open). Closing the window (X) still exits entirely.
                 self.switch_host(event_loop);
+            }
+            ToolbarAction::BugReport => {
+                // Snapshot the current framebuffer under the lock, then write
+                // the report dir outside it so PNG-encoding can't stall paint.
+                let (w, h, rgba) = {
+                    let f = self.shared.lock().unwrap();
+                    (f.width, f.height, f.rgba.clone())
+                };
+                match report::generate(report::Snapshot {
+                    target: &self.host,
+                    width: w,
+                    height: h,
+                    rgba: &rgba,
+                }) {
+                    Ok(dir) => {
+                        info!(dir = %dir.display(), "bug report bundle written");
+                        self.shared.lock().unwrap().status =
+                            format!("{} {}", t!("status.report_saved"), dir.display());
+                        // Modal confirmation explains what was saved and asks
+                        // whether to open the folder. MessageBoxW BLOCKS the
+                        // calling thread until dismissed; spawn it off the UI
+                        // thread so paint + remote input keep flowing while
+                        // the dialog is up.
+                        #[cfg(windows)]
+                        {
+                            let title = t!("report.dialog_title").to_string();
+                            let body = t!("report.dialog_body").to_string();
+                            let dir_for_dialog = dir.clone();
+                            std::thread::spawn(move || {
+                                if report::confirm_and_open(
+                                    &dir_for_dialog,
+                                    &title,
+                                    &body,
+                                ) {
+                                    report::open_in_explorer(&dir_for_dialog);
+                                }
+                            });
+                        }
+                        #[cfg(not(windows))]
+                        report::open_in_explorer(&dir);
+                    }
+                    Err(e) => warn!(error = %e, "could not write bug report"),
+                }
             }
             ToolbarAction::About => {
                 self.about_open = !self.about_open;
@@ -1359,6 +1491,13 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
             }
+            WindowEvent::Focused(has_focus) => {
+                // Gate the LL keyboard hook so we only steal Win-key / Ctrl+Esc
+                // while the viewer is the foreground app. Losing focus releases
+                // the OS shortcuts back to whichever window the user switched to.
+                #[cfg(windows)]
+                winhook::set_active(has_focus);
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 // While the About overlay is open, swallow all keyboard input; Esc
                 // closes it. Nothing reaches the remote session.
@@ -1381,6 +1520,19 @@ impl ApplicationHandler<UserEvent> for App {
                     && matches!(event.physical_key, PhysicalKey::Code(KeyCode::End))
                 {
                     self.send_ctrl_alt_del();
+                    return;
+                }
+                // Ctrl+Esc → send the Windows key to the remote. CmRcViewer only
+                // passes Win-key through in fullscreen; the LL OS hook in
+                // windowed mode is heavyweight, so we expose the canonical PS/2
+                // alternative chord instead. Swallow both press AND release so
+                // a stray Esc-up doesn't leak to the remote.
+                if self.modifiers.control_key()
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
+                {
+                    if event.state == ElementState::Pressed {
+                        self.send_win_key();
+                    }
                     return;
                 }
                 // Ctrl+Tab → cycle the monitor view (All / Screen N) of a
