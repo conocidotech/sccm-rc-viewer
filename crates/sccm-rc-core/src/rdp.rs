@@ -284,83 +284,165 @@ fn log_demand_active(frame: &[u8]) {
     }
 }
 
-/// A passive static virtual channel: it is declared in the MCS Connect Initial
-/// and joined, but ignores all traffic. mstscax declares several channels
-/// (rdpdr/rdpsnd/cliprdr/…); the SCCM server appears to withhold its
-/// deactivation-reactivation (and thus all graphics) until the client presents
-/// a mstscax-like channel set. We don't need the channels' functionality —
-/// only their presence in the capability/channel negotiation.
-#[derive(Debug)]
-struct PassiveChannel {
-    name: ironrdp_pdu::gcc::ChannelName,
-}
-
-impl PassiveChannel {
-    fn new(name: &str) -> Self {
-        Self {
-            name: ironrdp_pdu::gcc::ChannelName::from_utf8(name)
-                .expect("valid 8-char channel name"),
-        }
+/// Shared inbound-payload logging for the passive channel types below: EGFX
+/// debug (SCCM_RC_DBG_DVC) and RRCV-20 hex capture (SCCM_RC_DBG_DSKCFG).
+fn passive_channel_log(name: &str, payload: &[u8]) {
+    // EGFX spike: surface anything the server sends on a passive channel. For
+    // "drdynvc", an inbound PDU whose header high-nibble (Cmd) is 0x5 is a
+    // DYNVC CAPABILITY_REQUEST — proof the server supports dynamic channels
+    // (the prerequisite for the RDPEGFX/H.264 graphics pipeline).
+    if !payload.is_empty() && std::env::var("SCCM_RC_DBG_DVC").is_ok() {
+        let cmd = payload[0] >> 4;
+        let cmd_str = match cmd {
+            0x01 => "CREATE",
+            0x02 => "DATA_FIRST",
+            0x03 => "DATA",
+            0x04 => "CLOSE",
+            0x05 => "CAPABILITY_REQUEST",
+            0x06 => "DATA_FIRST_COMPRESSED",
+            0x07 => "DATA_COMPRESSED",
+            0x08 => "SOFT_SYNC_REQUEST",
+            _ => "?",
+        };
+        let head = &payload[..payload.len().min(16)];
+        tracing::warn!(
+            "DVC dbg: channel={} len={} cmd=0x{:x}({}) head={:02x?}",
+            name,
+            payload.len(),
+            cmd,
+            cmd_str,
+            head
+        );
     }
-}
-
-ironrdp_svc::impl_as_any!(PassiveChannel);
-
-impl ironrdp_svc::SvcProcessor for PassiveChannel {
-    fn channel_name(&self) -> ironrdp_pdu::gcc::ChannelName {
-        self.name.clone()
-    }
-    fn process(&mut self, payload: &[u8]) -> ironrdp_pdu::PduResult<Vec<ironrdp_svc::SvcMessage>> {
-        // EGFX spike: surface anything the server sends on a passive channel. For
-        // "drdynvc", an inbound PDU whose header high-nibble (Cmd) is 0x5 is a
-        // DYNVC CAPABILITY_REQUEST — proof the server supports dynamic channels
-        // (the prerequisite for the RDPEGFX/H.264 graphics pipeline).
-        if !payload.is_empty() && std::env::var("SCCM_RC_DBG_DVC").is_ok() {
-            let name = self.name.as_bytes();
-            let name = String::from_utf8_lossy(name);
-            let cmd = payload[0] >> 4;
-            let cmd_str = match cmd {
-                0x01 => "CREATE",
-                0x02 => "DATA_FIRST",
-                0x03 => "DATA",
-                0x04 => "CLOSE",
-                0x05 => "CAPABILITY_REQUEST",
-                0x06 => "DATA_FIRST_COMPRESSED",
-                0x07 => "DATA_COMPRESSED",
-                0x08 => "SOFT_SYNC_REQUEST",
-                _ => "?",
-            };
-            let head = &payload[..payload.len().min(16)];
-            tracing::warn!(
-                "DVC dbg: channel={:?} len={} cmd=0x{:x}({}) head={:02x?}",
-                name,
-                payload.len(),
-                cmd,
-                cmd_str,
-                head
-            );
-        }
-        // RRCV-20 capture: dump the FULL inbound payload of a control channel
-        // (e.g. dskcfg = monitor config) as hex, so the on-wire monitor-list /
-        // monitor-select message can be reverse-engineered. SCCM_RC_DBG_DSKCFG=1
-        // (or a comma-list of channel names) selects which channels to dump.
-        if !payload.is_empty() {
-            if let Ok(want) = std::env::var("SCCM_RC_DBG_DSKCFG") {
-                let name = String::from_utf8_lossy(self.name.as_bytes())
-                    .trim_end_matches('\0')
-                    .to_string();
-                let dump = want == "1" || want.split(',').any(|w| w.trim() == name);
-                if dump {
-                    let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
-                    tracing::warn!(channel = %name, len = payload.len(), "passive-channel inbound hex: {hex}");
-                }
+    // RRCV-20 capture: dump the FULL inbound payload of a control channel
+    // (e.g. dskcfg = monitor config) as hex, so the on-wire monitor-list /
+    // monitor-select message can be reverse-engineered. SCCM_RC_DBG_DSKCFG=1
+    // (or a comma-list of channel names) selects which channels to dump.
+    if !payload.is_empty() {
+        if let Ok(want) = std::env::var("SCCM_RC_DBG_DSKCFG") {
+            let dump = want == "1" || want.split(',').any(|w| w.trim() == name);
+            if dump {
+                let hex: String = payload.iter().map(|b| format!("{b:02x}")).collect();
+                tracing::warn!(channel = %name, len = payload.len(), "passive-channel inbound hex: {hex}");
             }
         }
-        Ok(Vec::new())
     }
 }
 
-impl ironrdp_svc::SvcClientProcessor for PassiveChannel {}
+/// Define one distinct zero-sized type per passive channel name. Each gets its
+/// own `TypeId`, so multiple passive channels can coexist in IronRDP's
+/// `StaticChannelSet` (which is keyed by `TypeId`). Before this, all passive
+/// channels collapsed to the same key and only the last-inserted survived —
+/// which caused "unexpected channel ID" disconnects when the server sent data
+/// on one of the dropped channels (e.g. rdpsnd UI beeps).
+macro_rules! define_passive_channels {
+    ($($name:ident => $chan:literal),* $(,)?) => {
+        $(
+            /// Passive static virtual channel: declared/joined so the SCCM
+            /// server sees a mstscax-like channel set, but ignores all traffic.
+            #[derive(Debug, Default)]
+            pub struct $name;
+            ironrdp_svc::impl_as_any!($name);
+            impl ironrdp_svc::SvcProcessor for $name {
+                fn channel_name(&self) -> ironrdp_pdu::gcc::ChannelName {
+                    ironrdp_pdu::gcc::ChannelName::from_utf8($chan)
+                        .expect("valid 8-char channel name")
+                }
+                fn process(&mut self, payload: &[u8]) -> ironrdp_pdu::PduResult<Vec<ironrdp_svc::SvcMessage>> {
+                    passive_channel_log($chan, payload);
+                    Ok(Vec::new())
+                }
+            }
+            impl ironrdp_svc::SvcClientProcessor for $name {}
+        )*
+    };
+}
+
+define_passive_channels! {
+    PassiveRdpdr   => "rdpdr",
+    PassiveRdpsnd  => "rdpsnd",
+    PassiveCliprdr => "cliprdr",
+    PassiveCurtain => "curtain",
+    PassiveDynres  => "dynres",
+    PassiveDskcfg  => "dskcfg",
+    PassiveDrdynvc => "drdynvc",
+}
+
+/// Snapshot of (channel name, MCS channel id) pairs taken from the initial
+/// `ConnectionResult.static_channels` BEFORE the connection result is consumed
+/// by `ActiveStage::new`. The active loop re-applies these IDs after every
+/// server-driven reactivation, where `drive_reactivation` would otherwise
+/// return an empty `StaticChannelSet` — leaving the new `ActiveStage` unable
+/// to route any SVC data and triggering "unexpected channel ID" disconnects.
+#[derive(Debug, Default, Clone)]
+struct ChannelIdSnapshot {
+    pairs: Vec<(ironrdp_pdu::gcc::ChannelName, ironrdp_svc::StaticChannelId)>,
+}
+
+impl ChannelIdSnapshot {
+    fn from_set(set: &ironrdp_svc::StaticChannelSet) -> Self {
+        let pairs = set
+            .iter()
+            .filter_map(|(tid, ch)| {
+                set.get_channel_id_by_type_id(tid)
+                    .map(|id| (ch.channel_name(), id))
+            })
+            .collect();
+        Self { pairs }
+    }
+
+    fn id_for(&self, name: &ironrdp_pdu::gcc::ChannelName) -> Option<ironrdp_svc::StaticChannelId> {
+        self.pairs
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, id)| *id)
+    }
+}
+
+/// Build a fresh `StaticChannelSet` mirroring the WLC channel selection used
+/// at initial connect. Channel IDs are restored from `snapshot` by matching
+/// channel name. Real channels (Cliprdr/Curtain/Arbitration) get fresh state —
+/// the server re-runs handshakes (MonitorReady, etc.) after reactivation.
+fn build_wlc_channel_set(
+    arb_enabled: bool,
+    clip_enabled: bool,
+    curtain_enabled: bool,
+    snapshot: &ChannelIdSnapshot,
+) -> ironrdp_svc::StaticChannelSet {
+    use core::any::TypeId;
+    let mut set = ironrdp_svc::StaticChannelSet::new();
+    if !arb_enabled {
+        return set;
+    }
+    set.insert(PassiveRdpdr);
+    set.insert(PassiveRdpsnd);
+    if clip_enabled {
+        set.insert(CliprdrChannel::default());
+    } else {
+        set.insert(PassiveCliprdr);
+    }
+    if curtain_enabled {
+        set.insert(CurtainChannel);
+    } else {
+        set.insert(PassiveCurtain);
+    }
+    set.insert(ArbitrationChannel::default());
+    set.insert(PassiveDynres);
+    set.insert(PassiveDskcfg);
+    set.insert(PassiveDrdynvc);
+
+    // Re-attach MCS channel IDs that the server assigned during the original
+    // join — they persist across reactivation (which only re-runs RDP
+    // capability exchange, not MCS Channel Join).
+    let attach: Vec<(TypeId, ironrdp_svc::StaticChannelId)> = set
+        .iter()
+        .filter_map(|(tid, ch)| snapshot.id_for(&ch.channel_name()).map(|id| (tid, id)))
+        .collect();
+    for (tid, id) in attach {
+        set.attach_channel_id(tid, id);
+    }
+    set
+}
 
 /// The SCCM RC session-arbitration static virtual channel ("sessarb"). The
 /// server withholds the shadow-attach (and thus all graphics) until the client
@@ -730,33 +812,30 @@ pub async fn connect_rdp(
     // drdynvc — with sessarb being our active ArbitrationChannel. The server
     // assigns MCS ids 03ec..03f3 to these in this order.
     if std::env::var("SCCM_RC_ARB").as_deref() == Ok("1") {
-        connector = connector.with_static_channel(PassiveChannel::new("rdpdr"));
-        connector = connector.with_static_channel(PassiveChannel::new("rdpsnd"));
-        // Real clipboard channel (SCCM_RC_CLIP=1) — a DISTINCT type so it actually
-        // survives in the StaticChannelSet (which is keyed by TypeId; all the
-        // PassiveChannel siblings collide and only the last is kept). Otherwise a
-        // passive placeholder, matching the proven default path.
+        connector = connector.with_static_channel(PassiveRdpdr);
+        connector = connector.with_static_channel(PassiveRdpsnd);
+        // Real clipboard channel (SCCM_RC_CLIP=1), else a passive placeholder.
         if std::env::var("SCCM_RC_CLIP").as_deref() == Ok("1") {
             connector = connector.with_static_channel(CliprdrChannel::default());
         } else {
-            connector = connector.with_static_channel(PassiveChannel::new("cliprdr"));
+            connector = connector.with_static_channel(PassiveCliprdr);
         }
-        // Curtain (privacy screen-blank) — real distinct-type channel when
-        // SCCM_RC_CURTAIN=1, else a passive placeholder.
+        // Curtain (privacy screen-blank) — real channel when SCCM_RC_CURTAIN=1.
         if std::env::var("SCCM_RC_CURTAIN").as_deref() == Ok("1") {
             connector = connector.with_static_channel(CurtainChannel);
         } else {
-            connector = connector.with_static_channel(PassiveChannel::new("curtain"));
+            connector = connector.with_static_channel(PassiveCurtain);
         }
         connector = connector.with_static_channel(ArbitrationChannel::default());
-        connector = connector.with_static_channel(PassiveChannel::new("dynres"));
-        connector = connector.with_static_channel(PassiveChannel::new("dskcfg"));
-        connector = connector.with_static_channel(PassiveChannel::new("drdynvc"));
+        connector = connector.with_static_channel(PassiveDynres);
+        connector = connector.with_static_channel(PassiveDskcfg);
+        connector = connector.with_static_channel(PassiveDrdynvc);
         info!("declared WLC channels (mstscax order): rdpdr,rdpsnd,cliprdr,curtain,sessarb,dynres,dskcfg,drdynvc");
     } else if std::env::var("SCCM_RC_CHANNELS").as_deref() == Ok("1") {
-        for name in ["cliprdr", "rdpsnd", "rdpdr", "drdynvc"] {
-            connector = connector.with_static_channel(PassiveChannel::new(name));
-        }
+        connector = connector.with_static_channel(PassiveCliprdr);
+        connector = connector.with_static_channel(PassiveRdpsnd);
+        connector = connector.with_static_channel(PassiveRdpdr);
+        connector = connector.with_static_channel(PassiveDrdynvc);
         info!("declared passive static virtual channels: cliprdr, rdpsnd, rdpdr, drdynvc");
     }
 
@@ -1001,6 +1080,11 @@ pub async fn run_active_session(
     let mut io_channel_id = connection_result.io_channel_id;
     let mut user_channel_id = connection_result.user_channel_id;
     let mut image = DecodedImage::new(PixelFormat::RgbA32, width, height);
+    // Snapshot channel name → MCS channel id BEFORE the ActiveStage consumes
+    // the connection_result — we need it to rebuild the StaticChannelSet
+    // after every server-driven reactivation (drive_reactivation hands back
+    // an empty set; without rebuild the active stage rejects all SVC data).
+    let channel_id_snapshot = ChannelIdSnapshot::from_set(&connection_result.static_channels);
     let mut stage = ActiveStage::new(connection_result);
 
     // Drawing-order renderer for Fast-Path "Orders" updates (which IronRDP
@@ -1552,7 +1636,21 @@ pub async fn run_active_session(
                     if refeed {
                         buf.splice(0..0, frame.iter().copied());
                     }
-                    let new_result = drive_reactivation(session, *activation, &mut buf).await?;
+                    let mut new_result = drive_reactivation(session, *activation, &mut buf).await?;
+                    // drive_reactivation returns an empty StaticChannelSet (only
+                    // RDP capability exchange runs during reactivation; MCS-level
+                    // channel state persists server-side). Rebuild the set so the
+                    // new ActiveStage can route SVC traffic — without this, any
+                    // post-reactivation packet on rdpsnd/cliprdr/etc. trips an
+                    // "unexpected channel ID" error and forces a reconnect.
+                    let arb_enabled_now =
+                        std::env::var("SCCM_RC_ARB").as_deref() == Ok("1");
+                    new_result.static_channels = build_wlc_channel_set(
+                        arb_enabled_now,
+                        clip_enabled,
+                        curtain_enabled,
+                        &channel_id_snapshot,
+                    );
                     width = new_result.desktop_size.width;
                     height = new_result.desktop_size.height;
                     io_channel_id = new_result.io_channel_id;
