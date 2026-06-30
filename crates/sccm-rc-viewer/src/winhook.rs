@@ -81,10 +81,19 @@ pub fn set_active(active: bool) {
 }
 
 fn send(events: Vec<FastPathInputEvent>) {
-    if let Some(cell) = INPUT_TX.get() {
-        if let Some(tx) = cell.lock().unwrap().as_ref() {
-            let _ = tx.try_send(events);
-        }
+    // Use try_lock — the hook runs in the OS message-pump thread, and a
+    // blocking acquire here would freeze the entire UI if anything else
+    // is currently holding the mutex (set_tx during a reconnect, etc.).
+    // Dropping a Win-keystroke once in a blue moon is strictly preferable
+    // to deadlocking the whole viewer.
+    let Some(cell) = INPUT_TX.get() else {
+        return;
+    };
+    let Ok(guard) = cell.try_lock() else {
+        return;
+    };
+    if let Some(tx) = guard.as_ref() {
+        let _ = tx.try_send(events);
     }
 }
 

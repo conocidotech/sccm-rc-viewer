@@ -418,6 +418,42 @@ impl SessionSink for FrameSink {
     }
 }
 
+/// Install a panic hook that ALSO writes synchronously to
+/// `%LOCALAPPDATA%\sccm-rc\viewer-panic.log` — the non-blocking tracing
+/// appender's queue is lost if the process is killed (e.g. Watson closes a
+/// hung viewer), so a panic message in tracing alone often never reaches
+/// disk. This separate file uses plain blocking `File::write_all`, so the
+/// line is durable before the panic propagates.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let dir = std::env::var_os("LOCALAPPDATA")
+            .map(|p| std::path::PathBuf::from(p).join("sccm-rc"))
+            .unwrap_or_else(std::env::temp_dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let when = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        let bt = std::backtrace::Backtrace::force_capture();
+        let line = format!("[{when}] PANIC thread={thread}\n  {info}\n{bt}\n\n");
+        let _ = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(dir.join("viewer-panic.log"))
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(line.as_bytes())
+            });
+        tracing::error!(thread, %info, "viewer panic");
+        default(info);
+    }));
+}
+
 /// Wire up tracing to BOTH the console AND a daily-rotating file at
 /// `%LOCALAPPDATA%\sccm-rc\viewer.log` (falls back to `%TEMP%` if LOCALAPPDATA
 /// isn't set). The file is what makes a bug-report bundle actually
@@ -476,6 +512,7 @@ fn main() -> anyhow::Result<()> {
     // alive for the lifetime of the program — hence the `_log_guard` binding
     // kept in `main`.
     let _log_guard = init_tracing();
+    install_panic_hook();
     let cli = Cli::parse();
     init_locale(cli.lang.as_deref());
 
@@ -654,6 +691,7 @@ fn main() -> anyhow::Result<()> {
         rprof_t: std::time::Instant::now(),
         last_paint: std::time::Instant::now(),
         redraw_pending: false,
+        last_heartbeat: std::time::Instant::now(),
     };
     event_loop.run_app(&mut app)?;
     // Window closed: stop the session and close the input channel, which unblocks
@@ -950,6 +988,11 @@ struct App {
     /// extra requests, scheduling a trailing paint so the latest frame still lands.
     last_paint: std::time::Instant,
     redraw_pending: bool,
+    /// Last time the winit (main) thread emitted a heartbeat log line. If the
+    /// app hangs, this is the timestamp BEFORE the freeze — comparing it to
+    /// the panic/Watson timestamp tells you whether the UI thread was the one
+    /// stuck. Bumped from `about_to_wait` every ~5 s.
+    last_heartbeat: std::time::Instant,
 }
 
 impl App {
@@ -1335,6 +1378,18 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // UI-thread heartbeat: write a log line every ~5s. If a hang
+        // happens, the last heartbeat timestamp is the moment the main
+        // thread last responded — the window between it and the Watson
+        // "Application Hang" event is exactly where the freeze started.
+        if self.last_heartbeat.elapsed() >= std::time::Duration::from_secs(5) {
+            self.last_heartbeat = std::time::Instant::now();
+            tracing::info!(
+                fps = self.fps,
+                pending_paint = self.redraw_pending,
+                "ui heartbeat"
+            );
+        }
         // While still connecting (nothing painted yet), keep the spinner animating
         // by redrawing ~16x/s. Once the desktop paints, go back to event-driven.
         let painted = {

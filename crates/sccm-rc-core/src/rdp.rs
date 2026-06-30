@@ -559,20 +559,47 @@ pub struct CliprdrChannel {
     ready: bool,
 }
 
+/// Hard cap on any single Windows-clipboard call. `OpenClipboard` is famously
+/// prone to indefinite blocking when another app holds the clipboard owner
+/// lock (Chrome/Office/RDP/etc.). The cliprdr channel is processed on the
+/// same task as the RDP active session, so a stuck clipboard call would
+/// freeze the entire session — past hangs (~83 s of unresponsiveness before
+/// Windows declared the viewer "Not responding") match this profile. We
+/// give up after this duration and let the next poll retry.
+const CLIPBOARD_OP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 impl CliprdrChannel {
     fn read_local() -> Option<String> {
-        clipboard_win::get_clipboard_string()
-            .ok()
-            .filter(|s| !s.is_empty())
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = clipboard_win::get_clipboard_string()
+                .ok()
+                .filter(|s| !s.is_empty());
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(CLIPBOARD_OP_TIMEOUT) {
+            Ok(r) => r,
+            Err(_) => {
+                warn!("cliprdr: get_clipboard_string timed out — local owner busy?");
+                None
+            }
+        }
     }
 
     fn write_local(&mut self, text: &str) {
-        match clipboard_win::set_clipboard_string(text) {
-            Ok(()) => {
-                self.known = Some(text.to_string());
+        let owned = text.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let payload = owned.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(clipboard_win::set_clipboard_string(&payload));
+        });
+        match rx.recv_timeout(CLIPBOARD_OP_TIMEOUT) {
+            Ok(Ok(())) => {
+                self.known = Some(owned);
                 info!(len = text.len(), "cliprdr: local clipboard set from remote");
             }
-            Err(e) => warn!(error = %e, "cliprdr: failed to set local clipboard"),
+            Ok(Err(e)) => warn!(error = %e, "cliprdr: failed to set local clipboard"),
+            Err(_) => warn!("cliprdr: set_clipboard_string timed out — local owner busy?"),
         }
     }
 
