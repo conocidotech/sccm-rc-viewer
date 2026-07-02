@@ -35,10 +35,16 @@ fn embed_win_resource() {
     use std::io::Write;
     use std::path::Path;
 
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    let ico = format!("{manifest}/assets/app.ico").replace('\\', "/");
+    let ico = format!("{manifest_dir}/assets/app.ico").replace('\\', "/");
+    // Application manifest: enables Common Controls 6.0 so buttons / combobox
+    // / edit controls in our native prompt dialog get the modern Aero look
+    // instead of the Windows-95 classic style.
+    let app_manifest =
+        format!("{manifest_dir}/assets/sccm-rc-viewer.manifest").replace('\\', "/");
     println!("cargo:rerun-if-changed=assets/app.ico");
+    println!("cargo:rerun-if-changed=assets/sccm-rc-viewer.manifest");
     println!("cargo:rerun-if-changed=build.rs");
     if !Path::new(&ico).exists() {
         println!("cargo:warning=app.ico not found at {ico}; skipping icon/version resource");
@@ -56,8 +62,18 @@ fn embed_win_resource() {
         .collect();
     let fileversion = quad.join(",");
 
+    // Resource ID 1, type 24 = RT_MANIFEST for the .exe (assembly manifest).
+    // Only emitted if the manifest file is present, so a stripped-down build
+    // still succeeds with just the icon + version block.
+    let manifest_line = if Path::new(&app_manifest).exists() {
+        format!("1 24 \"{app_manifest}\"\n")
+    } else {
+        String::new()
+    };
+
     let rc = format!(
-        "1 ICON \"{ico}\"\n\
+        "{manifest_line}\
+         1 ICON \"{ico}\"\n\
          1 VERSIONINFO\n\
          FILEVERSION {fv}\n\
          PRODUCTVERSION {fv}\n\

@@ -47,3 +47,5 @@ prompt:
   label: "Computernaam of IP-adres:"
   connect: "Verbinden"
   cancel: "Annuleren"
+  placeholder: "Typ een hostnaam…"
+  hint: "Enter = verbinden · ↑/↓ = kies uit recente · Esc = afsluiten"

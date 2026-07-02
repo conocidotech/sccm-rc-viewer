@@ -47,3 +47,5 @@ prompt:
   label: "Computer name or IP address:"
   connect: "Connect"
   cancel: "Cancel"
+  placeholder: "Type a hostname…"
+  hint: "Enter = connect · ↑/↓ = pick from recents · Esc = quit"

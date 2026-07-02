@@ -47,3 +47,5 @@ prompt:
   label: "Computername oder IP-Adresse:"
   connect: "Verbinden"
   cancel: "Abbrechen"
+  placeholder: "Hostnamen eingeben…"
+  hint: "Enter = verbinden · ↑/↓ = aus Verlauf · Esc = beenden"

@@ -26,6 +26,7 @@ use winit::window::{Window, WindowId};
 
 mod audit;
 mod gpu;
+mod host_prompt;
 mod recent;
 mod record;
 mod report;
@@ -153,56 +154,6 @@ fn draw_about(buf: &mut [u32], w: u32, h: u32, font: Option<&text::TextRenderer>
     }
 }
 
-/// Ask for the target hostname via a native Windows input box (used when no
-/// target is given on the command line — e.g. when launched by double-click).
-#[cfg(windows)]
-fn prompt_hostname() -> Option<String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // Build an editable dropdown pre-filled with recent targets.
-    let items = recent::load()
-        .iter()
-        .map(|h| format!("'{}'", h.replace('\'', "''")))
-        .collect::<Vec<_>>()
-        .join(",");
-    let script = format!(
-        "Add-Type -AssemblyName System.Windows.Forms,System.Drawing; \
-         $f=New-Object Windows.Forms.Form; $f.Text='SCCM Remote Control'; \
-         $f.ClientSize=New-Object Drawing.Size(360,120); $f.StartPosition='CenterScreen'; \
-         $f.FormBorderStyle='FixedDialog'; $f.MaximizeBox=$false; $f.MinimizeBox=$false; \
-         $l=New-Object Windows.Forms.Label; $l.Text='{label}'; \
-         $l.AutoSize=$true; $l.Location=New-Object Drawing.Point(12,14); $f.Controls.Add($l); \
-         $cb=New-Object Windows.Forms.ComboBox; $cb.Location=New-Object Drawing.Point(12,38); \
-         $cb.Size=New-Object Drawing.Size(336,24); $cb.DropDownStyle='DropDown'; \
-         @({items})|ForEach-Object{{[void]$cb.Items.Add($_)}}; \
-         if($cb.Items.Count -gt 0){{$cb.SelectedIndex=0}}; $f.Controls.Add($cb); \
-         $ok=New-Object Windows.Forms.Button; $ok.Text='{connect}'; $ok.DialogResult='OK'; \
-         $ok.Location=New-Object Drawing.Point(192,76); $f.Controls.Add($ok); $f.AcceptButton=$ok; \
-         $cx=New-Object Windows.Forms.Button; $cx.Text='{cancel}'; $cx.DialogResult='Cancel'; \
-         $cx.Location=New-Object Drawing.Point(273,76); $f.Controls.Add($cx); $f.CancelButton=$cx; \
-         $cb.Select(); if($f.ShowDialog() -eq 'OK'){{Write-Output $cb.Text.Trim()}}",
-        items = items,
-        label = t!("prompt.label"),
-        connect = t!("prompt.connect"),
-        cancel = t!("prompt.cancel"),
-    );
-    let out = std::process::Command::new("powershell")
-        .creation_flags(CREATE_NO_WINDOW)
-        .args(["-NoProfile", "-STA", "-Command", &script])
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
-#[cfg(not(windows))]
-fn prompt_hostname() -> Option<String> {
-    None
-}
 
 /// Native file picker (PowerShell OpenFileDialog) → the selected path.
 #[cfg(windows)]
@@ -549,22 +500,20 @@ fn main() -> anyhow::Result<()> {
         std::env::set_var("SCCM_RC_ALLMON", "1");
     }
 
-    // Target: CLI arg (like CmRcViewer) or, if absent, a prompt. In --demo mode we
-    // never connect, so default to a placeholder name instead of prompting.
-    let target = match cli.target.clone() {
-        Some(t) => t,
+    // Target: CLI arg (like CmRcViewer) or, if absent, the in-window host-prompt
+    // overlay collects one after the event loop starts. In --demo mode we never
+    // connect, so default to a placeholder name instead of prompting.
+    let cli_target = cli.target.clone();
+    let target = match cli_target.as_deref() {
+        Some(t) => t.to_string(),
         None if cli.demo => "DEMO-PC".to_string(),
-        None => match prompt_hostname() {
-            Some(h) => h,
-            None => {
-                eprintln!("No target host given.");
-                return Ok(());
-            }
-        },
+        None => String::new(), // App starts with the overlay; no session yet.
     };
 
-    // Remember this target for next time's dropdown.
-    recent::add(&target);
+    // Remember this target for next time's dropdown (only when we actually have one).
+    if !target.is_empty() {
+        recent::add(&target);
+    }
     // Wake-on-LAN: seed the MAC cache from --mac, then wake if asked (or --mac given).
     if let Some(m) = cli.mac.as_deref().and_then(wol::parse_mac) {
         wol::cache_mac(&target, m);
@@ -622,8 +571,14 @@ fn main() -> anyhow::Result<()> {
     // and returns the `running` flag + input sender; the Disconnect button stops
     // it and spawns a fresh one for another host. In --demo mode we skip the
     // network entirely and paint a synthetic multi-monitor desktop instead.
-    let (running, input_tx, done_rx) = if cli.demo {
-        demo_frame(&shared);
+    // In initial-prompt mode (no CLI target) we skip it too — the in-window
+    // overlay collects the target and calls `start_session` once the user
+    // confirms.
+    let no_initial_session = cli.demo || cli_target.is_none();
+    let (running, input_tx, done_rx) = if no_initial_session {
+        if cli.demo {
+            demo_frame(&shared);
+        }
         let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<FastPathInputEvent>>(1);
         let (_done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         (Arc::new(AtomicBool::new(false)), tx, done_rx)
@@ -692,6 +647,11 @@ fn main() -> anyhow::Result<()> {
         last_paint: std::time::Instant::now(),
         redraw_pending: false,
         last_heartbeat: std::time::Instant::now(),
+        host_prompt: if cli_target.is_none() && !cli.demo {
+            Some(host_prompt::HostPromptOverlay::new())
+        } else {
+            None
+        },
     };
     event_loop.run_app(&mut app)?;
     // Window closed: stop the session and close the input channel, which unblocks
@@ -993,6 +953,10 @@ struct App {
     /// the panic/Watson timestamp tells you whether the UI thread was the one
     /// stuck. Bumped from `about_to_wait` every ~5 s.
     last_heartbeat: std::time::Instant,
+    /// In-window host-picker overlay. Some = the overlay is visible and
+    /// consumes keyboard input; no session is running yet. Set at startup
+    /// when no CLI target was given, and by Disconnect to pick another host.
+    host_prompt: Option<host_prompt::HostPromptOverlay>,
 }
 
 impl App {
@@ -1057,32 +1021,38 @@ impl App {
         self.input_tx = None;
     }
 
-    /// Disconnect the current host and prompt for another one. Stops the current
-    /// session, asks which host to connect to next, then spawns a fresh session
-    /// (showing the connect overlay). If the prompt is cancelled, exits the app.
-    fn switch_host(&mut self, event_loop: &ActiveEventLoop) {
-        // Stop the current session and let it disconnect gracefully (the teardown
-        // runs while the operator is picking the next host).
+    /// Disconnect the current host and show the in-window host-prompt overlay
+    /// so the operator can pick another target. If the operator cancels the
+    /// overlay (Esc) the app exits — matches the old prompt-cancelled path.
+    fn switch_host(&mut self, _event_loop: &ActiveEventLoop) {
         self.begin_shutdown();
-        let Some(new_target) = prompt_hostname() else {
-            // No host chosen — close the app (after the teardown completes).
-            let _ = self.done_rx.recv_timeout(std::time::Duration::from_secs(3));
-            self.closed = Some(t!("status.disconnected").to_string());
-            event_loop.exit();
-            return;
-        };
-        // Wait for the old session to release the host on the server before we
-        // reconnect — otherwise reconnecting (especially to the same host) trips
-        // "existing session".
+        // Let the old session confirm teardown before we reconnect — otherwise
+        // reconnecting (especially to the same host) trips "existing session".
         let _ = self.done_rx.recv_timeout(std::time::Duration::from_secs(3));
+        self.input_tx = None;
+        #[cfg(windows)]
+        winhook::set_tx(None);
+        {
+            let mut f = self.shared.lock().unwrap();
+            *f = SharedFrame::default();
+        }
+        self.host_prompt = Some(host_prompt::HostPromptOverlay::new());
+        self.closed = None;
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+
+    /// Spawn a fresh session for `new_target`. Extracted from the old
+    /// `switch_host` so the initial-prompt path (main() with no CLI target)
+    /// can also kick off a session from inside the event loop.
+    fn start_session(&mut self, new_target: String) {
         recent::add(&new_target);
         self.host = new_target.clone();
         self.title = format!("SCCM RC {} — {new_target}", env!("CARGO_PKG_VERSION"));
         if let Some(w) = &self.window {
             w.set_title(&self.title);
         }
-        // Reset the framebuffer so the connect overlay (host + spinner) shows for
-        // the new target instead of the previous desktop.
         {
             let mut f = self.shared.lock().unwrap();
             *f = SharedFrame::default();
@@ -1102,13 +1072,11 @@ impl App {
             self.monitors.clone(),
         );
         self.running = running;
-        // Keep the LL keyboard hook bound to the active session's input sender
-        // — otherwise Win-key forwarding silently breaks after the first
-        // reconnect (the hook would hold a closed channel).
         #[cfg(windows)]
         winhook::set_tx(Some(input_tx.clone()));
         self.input_tx = Some(input_tx);
         self.done_rx = done_rx;
+        self.host_prompt = None;
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -1390,6 +1358,36 @@ impl ApplicationHandler<UserEvent> for App {
                 "ui heartbeat"
             );
         }
+        // Drain any pending host-prompt outcome (Enter → connect, Esc → exit).
+        if let Some(outcome) = self
+            .host_prompt
+            .as_mut()
+            .and_then(|p| p.take_outcome())
+        {
+            match outcome {
+                host_prompt::PromptOutcome::Confirmed(target) => {
+                    self.start_session(target);
+                }
+                host_prompt::PromptOutcome::Cancelled => {
+                    self.closed = Some(t!("status.disconnected").to_string());
+                    event_loop.exit();
+                    return;
+                }
+            }
+        }
+        // While the host-prompt overlay is up, tick the caret blink by
+        // scheduling a repaint every ~500ms. Cheaper than the general
+        // connect-spinner branch below (which runs at 60ms) and gives the
+        // caret a proper on/off cadence.
+        if self.host_prompt.is_some() {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            event_loop.set_control_flow(ControlFlow::WaitUntil(
+                std::time::Instant::now() + std::time::Duration::from_millis(500),
+            ));
+            return;
+        }
         // While still connecting (nothing painted yet), keep the spinner animating
         // by redrawing ~16x/s. Once the desktop paints, go back to event-driven.
         let painted = {
@@ -1567,6 +1565,49 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                     return;
                 }
+                // Host-prompt overlay owns all keyboard input while it's up.
+                if let Some(prompt) = self.host_prompt.as_mut() {
+                    if event.state == ElementState::Pressed {
+                        let handled = match event.physical_key {
+                            PhysicalKey::Code(KeyCode::Escape) => {
+                                prompt.on_esc();
+                                true
+                            }
+                            PhysicalKey::Code(KeyCode::Enter)
+                            | PhysicalKey::Code(KeyCode::NumpadEnter) => {
+                                prompt.on_enter();
+                                true
+                            }
+                            PhysicalKey::Code(KeyCode::Backspace) => {
+                                prompt.on_backspace();
+                                true
+                            }
+                            PhysicalKey::Code(KeyCode::ArrowUp) => {
+                                prompt.on_arrow_up();
+                                true
+                            }
+                            PhysicalKey::Code(KeyCode::ArrowDown) => {
+                                prompt.on_arrow_down();
+                                true
+                            }
+                            _ => {
+                                // Printable text: winit puts the composed
+                                // char(s) in `event.text` for us.
+                                if let Some(text) = event.text.as_deref() {
+                                    if !text.is_empty() {
+                                        prompt.on_text(text);
+                                    }
+                                }
+                                false
+                            }
+                        };
+                        let _ = handled;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
                 // Ctrl+Alt+End → send Ctrl+Alt+Del (SAS) to the remote, like
                 // CmRcViewer (Ctrl+Alt+Del itself is swallowed by the local OS).
                 if event.state == ElementState::Pressed
@@ -1682,13 +1723,16 @@ impl App {
 
         // Rasterise the overlay into a CPU u32 buffer with the existing drawing
         // code: the toolbar strip when connected, else the full-window splash.
-        let (ov_w, ov_h, dest) = if self.about_open || !connected {
+        let show_full_overlay = self.about_open || self.host_prompt.is_some() || !connected;
+        let (ov_w, ov_h, dest) = if show_full_overlay {
             (win_w, win_h, gpu::OverlayDest::Full)
         } else {
             (win_w, bar_h, gpu::OverlayDest::TopStrip(bar_h))
         };
         let mut ov = vec![0u32; (ov_w * ov_h) as usize];
-        if self.about_open {
+        if let Some(prompt) = self.host_prompt.as_ref() {
+            host_prompt::draw(&mut ov, ov_w, ov_h, self.font.as_ref(), prompt);
+        } else if self.about_open {
             draw_about(&mut ov, ov_w, ov_h, self.font.as_ref());
         } else if connected {
             let mode = if self.view_only {
@@ -1870,6 +1914,13 @@ impl App {
         };
         let rstart = std::time::Instant::now();
 
+        // Host-prompt overlay owns the window while the user picks a target
+        // — no desktop, no toolbar. Draw and present directly.
+        if let Some(prompt) = self.host_prompt.as_ref() {
+            host_prompt::draw(&mut buffer[..], win_w, win_h, self.font.as_ref(), prompt);
+            let _ = buffer.present();
+            return;
+        }
         // About overlay takes over the whole window (no desktop/toolbar), matching
         // the GPU path. Drawn and presented directly, then we're done for this paint.
         if self.about_open {
