@@ -182,6 +182,31 @@ fn pick_file() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Read the OS clipboard as text for pasting into the connect field. Runs the
+/// `OpenClipboard` call on a throwaway thread with a hard timeout: the picker
+/// lives on the winit UI thread, and `OpenClipboard` is famously prone to
+/// blocking while another app (Chrome/Office/RDP) holds the clipboard-owner
+/// lock, which would freeze the whole window. Mirrors the guard sccm-rc-core
+/// uses for the cliprdr channel. Returns None on empty/unavailable/timeout.
+#[cfg(windows)]
+fn read_clipboard_text() -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let r = clipboard_win::get_clipboard_string()
+            .ok()
+            .filter(|s| !s.is_empty());
+        let _ = tx.send(r);
+    });
+    rx.recv_timeout(std::time::Duration::from_millis(1500))
+        .ok()
+        .flatten()
+}
+
+#[cfg(not(windows))]
+fn read_clipboard_text() -> Option<String> {
+    None
+}
+
 /// Draw an animated "rotating dots" spinner centered at (cx, cy). A bright head
 /// dot advances around the ring over time with a fading trail.
 fn draw_spinner(
@@ -1568,6 +1593,26 @@ impl ApplicationHandler<UserEvent> for App {
                 // Host-prompt overlay owns all keyboard input while it's up.
                 if let Some(prompt) = self.host_prompt.as_mut() {
                     if event.state == ElementState::Pressed {
+                        // Ctrl+V / Ctrl+Insert → paste the OS clipboard into the
+                        // connect field. The spartan v1 keyboard model only
+                        // appended printable chars, so a paste otherwise leaked
+                        // through as a literal "v". on_text() strips control
+                        // chars, so any CR/LF from a copied line is dropped.
+                        if self.modifiers.control_key()
+                            && matches!(
+                                event.physical_key,
+                                PhysicalKey::Code(KeyCode::KeyV)
+                                    | PhysicalKey::Code(KeyCode::Insert)
+                            )
+                        {
+                            if let Some(clip) = read_clipboard_text() {
+                                prompt.on_text(&clip);
+                            }
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            return;
+                        }
                         let handled = match event.physical_key {
                             PhysicalKey::Code(KeyCode::Escape) => {
                                 prompt.on_esc();

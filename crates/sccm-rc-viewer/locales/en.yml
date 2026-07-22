@@ -48,4 +48,4 @@ prompt:
   connect: "Connect"
   cancel: "Cancel"
   placeholder: "Type a hostname…"
-  hint: "Enter = connect · ↑/↓ = pick from recents · Esc = quit"
+  hint: "Enter = connect · ↑/↓ = recents · Ctrl+V = paste · Esc = quit"

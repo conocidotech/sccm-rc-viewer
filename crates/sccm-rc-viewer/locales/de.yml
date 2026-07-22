@@ -48,4 +48,4 @@ prompt:
   connect: "Verbinden"
   cancel: "Abbrechen"
   placeholder: "Hostnamen eingeben…"
-  hint: "Enter = verbinden · ↑/↓ = aus Verlauf · Esc = beenden"
+  hint: "Enter = verbinden · ↑/↓ = Verlauf · Ctrl+V = einfügen · Esc = beenden"

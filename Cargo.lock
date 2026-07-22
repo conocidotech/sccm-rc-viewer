@@ -3737,6 +3737,7 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "clap",
+ "clipboard-win",
  "font8x8",
  "image",
  "pollster",

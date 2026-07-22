@@ -45,3 +45,6 @@ sys-locale = "0.3"
 # Cargo.toml) so all crates share one compiled instance.
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
+# Read the OS clipboard for paste-into-connect-field (same crate sccm-rc-core
+# uses for cliprdr). Windows-only, like the rest of the viewer's OS glue.
+clipboard-win = "5"
