@@ -26,8 +26,15 @@ toolbar:
   send_file: "Datei senden"
   ctrl_alt_del: "Strg+Alt+Entf"
   send_win: "Win"
+  send_keys: "Text"
   bug_report: "Fehlerbericht"
   about: "Über"
+
+type:
+  label: "Text eingeben (Enter = senden, Esc = abbrechen)"
+  placeholder: "Text an den Remote (maskiert)…"
+  send: "Senden"
+  cancel: "Abbrechen"
 
 report:
   dialog_title: "Fehlerbericht erstellt"
@@ -48,4 +55,4 @@ prompt:
   connect: "Verbinden"
   cancel: "Abbrechen"
   placeholder: "Hostnamen eingeben…"
-  hint: "Enter = verbinden · ↑/↓ = Verlauf · Ctrl+V = einfügen · Esc = beenden"
+  hint: "Enter oder Klick auf Eintrag = verbinden · Ctrl+V = einfügen · Esc = beenden"

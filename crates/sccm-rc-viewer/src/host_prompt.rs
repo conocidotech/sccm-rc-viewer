@@ -117,8 +117,113 @@ impl HostPromptOverlay {
         self.outcome = Some(PromptOutcome::Cancelled);
     }
 
+    /// Left-click at window coordinates `(x, y)`. If the click lands on a
+    /// recent-row we confirm that host straight away (one-click connect,
+    /// matching the CmRcViewer combobox behaviour); a click on the text field
+    /// clears any arrow-selection and returns focus to the edit.
+    pub fn on_click(&mut self, x: f64, y: f64, win_w: u32, win_h: u32) {
+        let l = layout(win_w, win_h);
+        // Inside the text field: re-focus the edit (drop arrow-selection).
+        if l.text_field.contains(x, y) {
+            if self.selected.is_some() {
+                self.selected = None;
+                self.bump_caret();
+            }
+            return;
+        }
+        // Inside one of the recent rows: pick it and confirm.
+        for (idx, rect) in l.recent_rows.iter().enumerate() {
+            if rect.contains(x, y) && idx < self.recents.len() {
+                let host = self.recents[idx].clone();
+                self.input = host.clone();
+                self.selected = Some(idx);
+                self.outcome = Some(PromptOutcome::Confirmed(host));
+                return;
+            }
+        }
+    }
+
+    /// Mouse-move at `(x, y)`. Used only to update the hover-highlight over
+    /// recents so the operator sees a click target before clicking.
+    pub fn on_mouse_move(&mut self, x: f64, y: f64, win_w: u32, win_h: u32) {
+        let l = layout(win_w, win_h);
+        for (idx, rect) in l.recent_rows.iter().enumerate() {
+            if rect.contains(x, y) && idx < self.recents.len() {
+                if self.selected != Some(idx) {
+                    self.selected = Some(idx);
+                    self.input = self.recents[idx].clone();
+                    self.bump_caret();
+                }
+                return;
+            }
+        }
+        // Left the recents area — focus back on the edit if a recent was hovered.
+        if self.selected.is_some() && l.text_field.contains(x, y) {
+            self.selected = None;
+            self.bump_caret();
+        }
+    }
+
     pub fn take_outcome(&mut self) -> Option<PromptOutcome> {
         self.outcome.take()
+    }
+}
+
+/// Rectangle in window coordinates. `contains` uses f64 to match the winit
+/// cursor position type.
+#[derive(Clone, Copy)]
+struct Rect {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+}
+impl Rect {
+    fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x as f64
+            && y >= self.y as f64
+            && x < (self.x as f64 + self.w as f64)
+            && y < (self.y as f64 + self.h as f64)
+    }
+}
+
+struct Layout {
+    text_field: Rect,
+    recent_rows: Vec<Rect>,
+}
+
+/// Compute the geometry once so `draw()`, `on_click()`, and `on_mouse_move()`
+/// all agree on where things live. Kept private so the overlay's layout
+/// constants only need to change here.
+fn layout(win_w: u32, win_h: u32) -> Layout {
+    let cx = (win_w / 2) as i32;
+    let cy = (win_h / 2) as i32;
+    let card_x = cx - (CARD_W as i32) / 2;
+    let card_y = cy - (CARD_H as i32) / 2;
+    let tf_x = card_x + 24;
+    let tf_y = card_y + 68;
+    let tf_w = CARD_W - 48;
+    let tf_h = 36u32;
+    let text_field = Rect {
+        x: tf_x,
+        y: tf_y,
+        w: tf_w,
+        h: tf_h,
+    };
+    let mut recent_rows = Vec::with_capacity(MAX_RECENTS_SHOWN);
+    let mut row_y = tf_y + tf_h as i32 + 18;
+    for _ in 0..MAX_RECENTS_SHOWN {
+        recent_rows.push(Rect {
+            x: tf_x,
+            y: row_y,
+            w: tf_w,
+            h: ROW_H,
+        });
+        row_y += ROW_H as i32;
+    }
+    Layout {
+        text_field,
+        recent_rows,
     }
 }
 
@@ -151,11 +256,10 @@ pub fn draw(
         toolbar::draw_text_centered(buf, w, h, (card_y + 32) as u32, &title, 0x00E4_EAF0, 2);
     }
 
-    // Text field
-    let tf_x = card_x + 24;
-    let tf_y = card_y + 68;
-    let tf_w = CARD_W - 48;
-    let tf_h = 36u32;
+    // Text field + recent rows come from the shared layout() so click
+    // handling and drawing can't drift out of sync.
+    let l = layout(w, h);
+    let (tf_x, tf_y, tf_w, tf_h) = (l.text_field.x, l.text_field.y, l.text_field.w, l.text_field.h);
     fill_rect(buf, w, h, tf_x, tf_y, tf_w, tf_h, 0x001B_1E23);
     let border = if overlay.selected.is_none() {
         0x0060_88B8
@@ -197,17 +301,27 @@ pub fn draw(
         }
     }
 
-    // Recents list
-    let list_x = tf_x;
-    let mut row_y = tf_y as i32 + tf_h as i32 + 18;
+    // Recents list — rows come from the shared layout so they line up with
+    // the click-hit-testing in on_click / on_mouse_move.
     for (idx, host) in overlay.recents.iter().take(MAX_RECENTS_SHOWN).enumerate() {
+        let rect = l.recent_rows[idx];
         let highlighted = overlay.selected == Some(idx);
         if highlighted {
-            fill_rect(buf, w, h, list_x, row_y, tf_w, ROW_H, 0x0038_4454);
+            fill_rect(buf, w, h, rect.x, rect.y, rect.w, rect.h, 0x0038_4454);
         }
         let colour = if highlighted { 0x00FF_FFFF } else { 0x00C0_C8D0 };
-        draw_left(buf, w, h, (list_x + 12) as f32, row_y as f32, ROW_H, host, colour, 17.0, font);
-        row_y += ROW_H as i32;
+        draw_left(
+            buf,
+            w,
+            h,
+            (rect.x + 12) as f32,
+            rect.y as f32,
+            rect.h,
+            host,
+            colour,
+            17.0,
+            font,
+        );
     }
 
     // Hint at the bottom of the card

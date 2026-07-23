@@ -64,6 +64,10 @@ pub enum ToolbarAction {
     /// Win, which the local OS otherwise eats to open the local Start menu).
     /// Also bound to the Ctrl+Esc hotkey.
     SendWin,
+    /// Prompt for a string and replay it as scancodes on the remote — the only
+    /// way to enter text into a UAC prompt / Secure Desktop, where the RDP
+    /// clipboard channel is deliberately blocked.
+    SendKeys,
     SendFile,
     ToggleCurtain,
     ToggleViewOnly,
@@ -126,6 +130,7 @@ const BUTTONS: &[ToolbarAction] = &[
     ToolbarAction::ToggleCurtain,
     ToolbarAction::SendFile,
     ToolbarAction::CtrlAltDel,
+    ToolbarAction::SendKeys,
     ToolbarAction::SendWin,
     ToolbarAction::BugReport,
     ToolbarAction::About,
@@ -142,6 +147,7 @@ fn button_label(action: ToolbarAction) -> String {
         ToolbarAction::SendFile => t!("toolbar.send_file"),
         ToolbarAction::CtrlAltDel => t!("toolbar.ctrl_alt_del"),
         ToolbarAction::SendWin => t!("toolbar.send_win"),
+        ToolbarAction::SendKeys => t!("toolbar.send_keys"),
         ToolbarAction::BugReport => t!("toolbar.bug_report"),
         ToolbarAction::About => t!("toolbar.about"),
         // Dynamic label supplied via Status.monitor / buttons_with; never resolved

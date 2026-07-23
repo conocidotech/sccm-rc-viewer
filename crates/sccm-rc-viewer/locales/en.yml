@@ -26,8 +26,15 @@ toolbar:
   send_file: "Send File"
   ctrl_alt_del: "Ctrl+Alt+Del"
   send_win: "Win"
+  send_keys: "Type Text"
   bug_report: "Bug Report"
   about: "About"
+
+type:
+  label: "Type text (Enter to send, Esc to cancel)"
+  placeholder: "Text to send to the remote (masked)…"
+  send: "Send"
+  cancel: "Cancel"
 
 report:
   dialog_title: "Bug report generated"
@@ -48,4 +55,4 @@ prompt:
   connect: "Connect"
   cancel: "Cancel"
   placeholder: "Type a hostname…"
-  hint: "Enter = connect · ↑/↓ = recents · Ctrl+V = paste · Esc = quit"
+  hint: "Enter or click a recent = connect · Ctrl+V = paste · Esc = quit"

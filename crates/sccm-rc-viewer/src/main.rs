@@ -32,6 +32,7 @@ mod record;
 mod report;
 mod text;
 mod toolbar;
+mod type_text;
 #[cfg(windows)]
 mod winhook;
 mod wol;
@@ -677,6 +678,7 @@ fn main() -> anyhow::Result<()> {
         } else {
             None
         },
+        type_prompt: None,
     };
     event_loop.run_app(&mut app)?;
     // Window closed: stop the session and close the input channel, which unblocks
@@ -982,6 +984,10 @@ struct App {
     /// consumes keyboard input; no session is running yet. Set at startup
     /// when no CLI target was given, and by Disconnect to pick another host.
     host_prompt: Option<host_prompt::HostPromptOverlay>,
+    /// Send-keystrokes overlay. Some = the operator is typing text that
+    /// will be replayed as scancodes on the remote (used to enter
+    /// credentials into a UAC prompt where cliprdr is blocked).
+    type_prompt: Option<type_text::TypeTextOverlay>,
 }
 
 impl App {
@@ -1223,11 +1229,27 @@ impl App {
         match action {
             ToolbarAction::CtrlAltDel => self.send_ctrl_alt_del(),
             ToolbarAction::SendWin => self.send_win_key(),
-            ToolbarAction::SendFile => {
-                if let Some(path) = pick_file() {
-                    info!(file = %path.display(), "queued file to push to remote (paste there)");
-                    *self.file_offer.lock().unwrap() = Some(path);
+            ToolbarAction::SendKeys => {
+                self.type_prompt = Some(type_text::TypeTextOverlay::new());
+                if let Some(w) = &self.window {
+                    w.request_redraw();
                 }
+            }
+            ToolbarAction::SendFile => {
+                // Spawn the picker off the UI thread — powershell startup + the
+                // OpenFileDialog take 5-10 s during which .output() would freeze
+                // winit long enough for Windows Watson to declare the viewer
+                // "Not Responding" and kill it (application-hang 1002). The
+                // file_offer Arc<Mutex<…>> the session polls already lives on
+                // its own thread, so dropping the picked path in from any
+                // background thread is safe.
+                let file_offer = self.file_offer.clone();
+                std::thread::spawn(move || {
+                    if let Some(path) = pick_file() {
+                        info!(file = %path.display(), "queued file to push to remote (paste there)");
+                        *file_offer.lock().unwrap() = Some(path);
+                    }
+                });
             }
             ToolbarAction::ToggleCurtain => {
                 let new = !self.curtain.load(Ordering::Relaxed);
@@ -1383,6 +1405,25 @@ impl ApplicationHandler<UserEvent> for App {
                 "ui heartbeat"
             );
         }
+        // Drain any pending type-text outcome (Enter → send, Esc → cancel).
+        if let Some(outcome) = self
+            .type_prompt
+            .as_mut()
+            .and_then(|p| p.take_outcome())
+        {
+            match outcome {
+                type_text::TypeOutcome::Confirmed(events) => {
+                    if let Some(tx) = &self.input_tx {
+                        let _ = tx.try_send(events);
+                    }
+                }
+                type_text::TypeOutcome::Cancelled => {}
+            }
+            self.type_prompt = None;
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
         // Drain any pending host-prompt outcome (Enter → connect, Esc → exit).
         if let Some(outcome) = self
             .host_prompt
@@ -1400,11 +1441,10 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
         }
-        // While the host-prompt overlay is up, tick the caret blink by
-        // scheduling a repaint every ~500ms. Cheaper than the general
-        // connect-spinner branch below (which runs at 60ms) and gives the
-        // caret a proper on/off cadence.
-        if self.host_prompt.is_some() {
+        // While either overlay is up, tick the caret blink by scheduling a
+        // repaint every ~500ms. Cheaper than the general connect-spinner
+        // branch below (60ms) and gives the caret a proper on/off cadence.
+        if self.host_prompt.is_some() || self.type_prompt.is_some() {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -1462,6 +1502,33 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_win = (position.x, position.y);
+                // Type-text overlay: swallow move events so we don't sneak
+                // pointer moves onto the remote behind the modal.
+                if self.type_prompt.is_some() {
+                    if let Some(w) = &self.window {
+                        w.set_cursor_visible(true);
+                        w.request_redraw();
+                    }
+                    return;
+                }
+                // Host-prompt overlay owns the pointer while it's up: hover
+                // moves the recents-selection, and nothing goes to the remote.
+                if let Some(prompt) = self.host_prompt.as_mut() {
+                    let (w_w, w_h) = self
+                        .window
+                        .as_ref()
+                        .map(|w| {
+                            let s = w.inner_size();
+                            (s.width, s.height)
+                        })
+                        .unwrap_or((1, 1));
+                    prompt.on_mouse_move(position.x, position.y, w_w, w_h);
+                    if let Some(w) = &self.window {
+                        w.set_cursor_visible(true);
+                        w.request_redraw();
+                    }
+                    return;
+                }
                 // Over the toolbar: keep the OS cursor for clicking buttons and
                 // don't forward the move to the remote.
                 if position.y < toolbar::TOOLBAR_H as f64 {
@@ -1510,6 +1577,42 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.about_open {
                     if state == ElementState::Pressed && button == MouseButton::Left {
                         self.about_open = false;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                // Type-text overlay: left-click on Send/Cancel confirms/dismisses.
+                if let Some(prompt) = self.type_prompt.as_mut() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        let (w_w, w_h) = self
+                            .window
+                            .as_ref()
+                            .map(|w| {
+                                let s = w.inner_size();
+                                (s.width, s.height)
+                            })
+                            .unwrap_or((1, 1));
+                        prompt.on_click(self.mouse_win.0, self.mouse_win.1, w_w, w_h);
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                // Host-prompt overlay: left-click on a recent row confirms it.
+                if let Some(prompt) = self.host_prompt.as_mut() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        let (w_w, w_h) = self
+                            .window
+                            .as_ref()
+                            .map(|w| {
+                                let s = w.inner_size();
+                                (s.width, s.height)
+                            })
+                            .unwrap_or((1, 1));
+                        prompt.on_click(self.mouse_win.0, self.mouse_win.1, w_w, w_h);
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -1584,6 +1687,31 @@ impl ApplicationHandler<UserEvent> for App {
                         && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Escape))
                     {
                         self.about_open = false;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                // Type-text overlay owns all keyboard input while up (checked
+                // before host_prompt so the two never fight if both were
+                // somehow open — type_prompt can only appear over a live
+                // session, host_prompt only when disconnected).
+                if let Some(prompt) = self.type_prompt.as_mut() {
+                    if event.state == ElementState::Pressed {
+                        match event.physical_key {
+                            PhysicalKey::Code(KeyCode::Escape) => prompt.on_esc(),
+                            PhysicalKey::Code(KeyCode::Enter)
+                            | PhysicalKey::Code(KeyCode::NumpadEnter) => prompt.on_enter(),
+                            PhysicalKey::Code(KeyCode::Backspace) => prompt.on_backspace(),
+                            _ => {
+                                if let Some(text) = event.text.as_deref() {
+                                    if !text.is_empty() {
+                                        prompt.on_text(text);
+                                    }
+                                }
+                            }
+                        }
                         if let Some(w) = &self.window {
                             w.request_redraw();
                         }
@@ -1768,7 +1896,10 @@ impl App {
 
         // Rasterise the overlay into a CPU u32 buffer with the existing drawing
         // code: the toolbar strip when connected, else the full-window splash.
-        let show_full_overlay = self.about_open || self.host_prompt.is_some() || !connected;
+        let show_full_overlay = self.about_open
+            || self.host_prompt.is_some()
+            || self.type_prompt.is_some()
+            || !connected;
         let (ov_w, ov_h, dest) = if show_full_overlay {
             (win_w, win_h, gpu::OverlayDest::Full)
         } else {
@@ -1777,6 +1908,8 @@ impl App {
         let mut ov = vec![0u32; (ov_w * ov_h) as usize];
         if let Some(prompt) = self.host_prompt.as_ref() {
             host_prompt::draw(&mut ov, ov_w, ov_h, self.font.as_ref(), prompt);
+        } else if let Some(prompt) = self.type_prompt.as_ref() {
+            type_text::draw(&mut ov, ov_w, ov_h, self.font.as_ref(), prompt);
         } else if self.about_open {
             draw_about(&mut ov, ov_w, ov_h, self.font.as_ref());
         } else if connected {
@@ -1963,6 +2096,12 @@ impl App {
         // — no desktop, no toolbar. Draw and present directly.
         if let Some(prompt) = self.host_prompt.as_ref() {
             host_prompt::draw(&mut buffer[..], win_w, win_h, self.font.as_ref(), prompt);
+            let _ = buffer.present();
+            return;
+        }
+        // Type-text overlay: same treatment — drawn on top, no session below.
+        if let Some(prompt) = self.type_prompt.as_ref() {
+            type_text::draw(&mut buffer[..], win_w, win_h, self.font.as_ref(), prompt);
             let _ = buffer.present();
             return;
         }

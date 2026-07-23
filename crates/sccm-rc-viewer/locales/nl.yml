@@ -26,8 +26,15 @@ toolbar:
   send_file: "Bestand sturen"
   ctrl_alt_del: "Ctrl+Alt+Del"
   send_win: "Win"
+  send_keys: "Tekst"
   bug_report: "Bug-rapport"
   about: "Over"
+
+type:
+  label: "Tekst typen (Enter = versturen, Esc = annuleren)"
+  placeholder: "Tekst voor de remote (verborgen)…"
+  send: "Versturen"
+  cancel: "Annuleren"
 
 report:
   dialog_title: "Bug-rapport gegenereerd"
@@ -48,4 +55,4 @@ prompt:
   connect: "Verbinden"
   cancel: "Annuleren"
   placeholder: "Typ een hostnaam…"
-  hint: "Enter = verbinden · ↑/↓ = recente · Ctrl+V = plakken · Esc = afsluiten"
+  hint: "Enter of klik een recente = verbinden · Ctrl+V = plakken · Esc = afsluiten"
