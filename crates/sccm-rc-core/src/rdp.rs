@@ -542,17 +542,26 @@ impl ironrdp_svc::SvcProcessor for ArbitrationChannel {
 
 impl ironrdp_svc::SvcClientProcessor for ArbitrationChannel {}
 
-/// Clipboard sharing over the `cliprdr` static virtual channel (MS-RDPECLIP),
-/// text only. Reactive parts (handshake, remote→local paste, answering the
-/// server's data requests) happen in `process`; the local→remote direction is
-/// driven by the active loop polling `local_changed`. `known` is the last
-/// clipboard text we are aware of — it suppresses echoing a value we just set
-/// from the remote straight back to the server.
+/// Clipboard sharing over the `cliprdr` static virtual channel (MS-RDPECLIP).
+/// Two local→remote paths: text via the OS clipboard (poll every 700 ms), and
+/// files via either (a) the Send File toolbar action or (b) files copied in
+/// Explorer that show up as CF_HDROP on the local clipboard.
+///
+/// `known` = last text we saw, `known_files` = last CF_HDROP list — both are
+/// used to suppress re-announcing values we just observed. `pending_files` is
+/// what we're currently offering to the remote (comes from Send File or from
+/// mirroring CF_HDROP).
 #[derive(Debug, Default)]
 pub struct CliprdrChannel {
     known: Option<String>,
-    /// A local file the operator offered to push to the remote (paste there).
-    pending_file: Option<std::path::PathBuf>,
+    /// The file list currently offered to the remote. Empty = only text may be
+    /// on offer (or nothing). Multi-file supports Explorer copy-select-many;
+    /// Send File just pushes a single-item vec.
+    pending_files: Vec<std::path::PathBuf>,
+    /// Snapshot of the last CF_HDROP list we saw on the local clipboard.
+    /// Compared against a fresh read each poll to detect operator-side changes
+    /// without re-announcing every 700 ms.
+    known_files: Vec<std::path::PathBuf>,
     /// True once the server sent CB_MONITOR_READY. Before that we must not send a
     /// FormatList (the periodic poll would otherwise announce out of sequence,
     /// which a strict server can drop — losing the local→remote path).
@@ -604,36 +613,55 @@ impl CliprdrChannel {
     }
 
     /// Build the Format List advertising what we currently offer (long format
-    /// names): the local clipboard text and/or a pending file.
+    /// names): local clipboard text and/or the currently-offered file set.
     fn format_list(&self) -> Vec<u8> {
         let mut formats: Vec<(u32, &str)> = Vec::new();
         if self.known.is_some() {
             formats.push((cliprdr::CF_UNICODETEXT, ""));
         }
-        if self.pending_file.is_some() {
+        if !self.pending_files.is_empty() {
             formats.push((cliprdr::CF_FILEGROUPDESCRIPTORW, "FileGroupDescriptorW"));
         }
         cliprdr::format_list_long(&formats)
     }
 
     /// Offer a local file to the remote (the operator pastes it there). Returns
-    /// the Format List PDU to send announcing it.
+    /// the Format List PDU to send announcing it. Toolbar-triggered — pushes a
+    /// single file; overrides whatever CF_HDROP tracking currently holds so
+    /// Send File is deterministic even if the local clipboard has other files.
     pub fn offer_file(&mut self, path: std::path::PathBuf) -> Vec<u8> {
         info!(file = %path.display(), "cliprdr: offering file to remote");
-        self.pending_file = Some(path);
+        self.pending_files = vec![path];
+        // Do NOT update known_files here — that mirrors the CF_HDROP state,
+        // and the toolbar path is independent of what's on the OS clipboard.
         self.format_list()
     }
 
-    fn file_name_size(&self) -> Option<(String, u64)> {
-        let p = self.pending_file.as_ref()?;
+    /// Names + on-disk sizes for the currently-offered files, in the same
+    /// order (so `lindex` in a FileContentsRequest can index straight in).
+    /// Missing/unreadable entries are dropped rather than propagating errors,
+    /// so partial reads still land instead of nuking the whole paste.
+    fn all_names_sizes(&self) -> Vec<(String, u64)> {
+        self.pending_files
+            .iter()
+            .filter_map(|p| {
+                let name = p.file_name()?.to_string_lossy().into_owned();
+                let size = std::fs::metadata(p).ok()?.len();
+                Some((name, size))
+            })
+            .collect()
+    }
+
+    fn file_name_size(&self, lindex: u32) -> Option<(String, u64)> {
+        let p = self.pending_files.get(lindex as usize)?;
         let name = p.file_name()?.to_string_lossy().into_owned();
         let size = std::fs::metadata(p).ok()?.len();
         Some((name, size))
     }
 
-    fn read_range(&self, pos: u64, len: usize) -> Option<Vec<u8>> {
+    fn read_range(&self, lindex: u32, pos: u64, len: usize) -> Option<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
-        let p = self.pending_file.as_ref()?;
+        let p = self.pending_files.get(lindex as usize)?;
         let mut f = std::fs::File::open(p).ok()?;
         f.seek(SeekFrom::Start(pos)).ok()?;
         let mut buf = vec![0u8; len.min(8 * 1024 * 1024)];
@@ -642,24 +670,117 @@ impl CliprdrChannel {
         Some(buf)
     }
 
-    /// Called periodically by the active loop. If the local OS clipboard text
-    /// changed (and it isn't a value we just received from the remote), returns
-    /// a Format List PDU announcing it to the server.
+    /// Called periodically by the active loop. Announces a Format List when
+    /// EITHER the local text OR the local CF_HDROP file list changed since the
+    /// last poll. Files take precedence in `pending_files` — if the operator
+    /// copied files in Explorer, we swap them in over whatever Send File had
+    /// staged so paste-latest-thing works naturally.
     pub fn local_changed(&mut self) -> Option<Vec<u8>> {
         if !self.ready {
             return None; // CB_MONITOR_READY not seen yet — don't announce early.
         }
+        let mut announce = false;
+        // File clipboard first — a copy in Explorer usually replaces text too.
+        #[cfg(windows)]
+        {
+            let cur_files = Self::read_local_files();
+            if cur_files != self.known_files {
+                self.known_files = cur_files.clone();
+                self.pending_files = cur_files;
+                announce = true;
+            }
+        }
+        // Text clipboard.
         let cur = Self::read_local();
         if cur != self.known {
-            self.known = cur.clone();
-            return Some(self.format_list());
+            self.known = cur;
+            announce = true;
         }
-        None
+        if announce {
+            Some(self.format_list())
+        } else {
+            None
+        }
+    }
+
+    /// Read the current CF_HDROP list off the local clipboard, if any. Runs
+    /// on a worker thread so a stuck `OpenClipboard` (Office/Chrome holding
+    /// the owner lock) can't wedge the RDP session.
+    #[cfg(windows)]
+    fn read_local_files() -> Vec<std::path::PathBuf> {
+        use std::ffi::c_void;
+        use windows::Win32::Foundation::HGLOBAL;
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, GetClipboardData, OpenClipboard,
+        };
+        use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+
+        const CF_HDROP: u32 = 15;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut paths: Vec<std::path::PathBuf> = Vec::new();
+            unsafe {
+                if OpenClipboard(None).is_ok() {
+                    if let Ok(hdata) = GetClipboardData(CF_HDROP) {
+                        let global = HGLOBAL(hdata.0 as *mut c_void);
+                        let size = GlobalSize(global);
+                        let ptr = GlobalLock(global) as *const u8;
+                        if !ptr.is_null() && size >= 20 {
+                            // DROPFILES: u32 pFiles, POINT(8), BOOL fNC(4), BOOL fWide(4) = 20B
+                            let p_files = *(ptr as *const u32) as usize;
+                            let f_wide = *(ptr.add(16) as *const i32) != 0;
+                            if p_files < size {
+                                let list_ptr = ptr.add(p_files);
+                                let list_len = size - p_files;
+                                paths = parse_dropfiles(list_ptr, list_len, f_wide);
+                            }
+                            let _ = GlobalUnlock(global);
+                        }
+                    }
+                    let _ = CloseClipboard();
+                }
+            }
+            let _ = tx.send(paths);
+        });
+        match rx.recv_timeout(CLIPBOARD_OP_TIMEOUT) {
+            Ok(v) => v,
+            Err(_) => {
+                warn!("cliprdr: read CF_HDROP timed out — local owner busy?");
+                Vec::new()
+            }
+        }
     }
 
     fn msg(bytes: Vec<u8>) -> ironrdp_svc::SvcMessage {
         ironrdp_svc::SvcMessage::from(bytes)
     }
+}
+
+/// Parse the double-null-terminated file-list that follows a DROPFILES
+/// header. `wide` picks UTF-16LE (modern Explorer) vs ANSI (legacy).
+#[cfg(windows)]
+unsafe fn parse_dropfiles(ptr: *const u8, len: usize, wide: bool) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if wide {
+        let slice = unsafe { std::slice::from_raw_parts(ptr as *const u16, len / 2) };
+        for path in slice.split(|&c| c == 0) {
+            if path.is_empty() {
+                continue;
+            }
+            out.push(std::path::PathBuf::from(String::from_utf16_lossy(path)));
+        }
+    } else {
+        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+        for path in slice.split(|&c| c == 0) {
+            if path.is_empty() {
+                continue;
+            }
+            out.push(std::path::PathBuf::from(
+                String::from_utf8_lossy(path).into_owned(),
+            ));
+        }
+    }
+    out
 }
 
 ironrdp_svc::impl_as_any!(CliprdrChannel);
@@ -679,8 +800,20 @@ impl ironrdp_svc::SvcProcessor for CliprdrChannel {
                 // format_list below already announces the current clipboard.
                 self.ready = true;
                 self.known = Self::read_local();
+                #[cfg(windows)]
+                {
+                    // Mirror whatever's on the clipboard NOW into pending_files so
+                    // the initial FormatList already advertises it — matches the
+                    // text path where `known` is read here for the same reason.
+                    let files = Self::read_local_files();
+                    if !files.is_empty() {
+                        self.pending_files = files.clone();
+                    }
+                    self.known_files = files;
+                }
                 info!(
                     has_text = self.known.is_some(),
+                    files = self.pending_files.len(),
                     "cliprdr: monitor ready — sending caps + format list"
                 );
                 Ok(vec![
@@ -701,11 +834,12 @@ impl ironrdp_svc::SvcProcessor for CliprdrChannel {
             }
             ClipPdu::FormatListResponse { .. } => Ok(Vec::new()),
             ClipPdu::FormatDataRequest { format_id } => {
-                // The remote pastes — wants our text or our offered file's descriptor.
+                // The remote pastes — wants our text or our offered file group.
                 if format_id == cliprdr::CF_FILEGROUPDESCRIPTORW {
-                    if let Some((name, size)) = self.file_name_size() {
+                    let files = self.all_names_sizes();
+                    if !files.is_empty() {
                         return Ok(vec![Self::msg(cliprdr::format_data_response_bytes(
-                            &cliprdr::file_group_descriptor(&name, size),
+                            &cliprdr::file_group_descriptor_many(&files),
                         ))]);
                     }
                 } else if format_id == cliprdr::CF_UNICODETEXT || format_id == 1 {
@@ -717,18 +851,18 @@ impl ironrdp_svc::SvcProcessor for CliprdrChannel {
             }
             ClipPdu::FileContentsRequest {
                 stream_id,
-                lindex: _,
+                lindex,
                 size_only,
                 position,
                 requested,
             } => {
                 if size_only {
-                    if let Some((_, size)) = self.file_name_size() {
+                    if let Some((_, size)) = self.file_name_size(lindex) {
                         return Ok(vec![Self::msg(cliprdr::file_contents_response_size(
                             stream_id, size,
                         ))]);
                     }
-                } else if let Some(bytes) = self.read_range(position, requested as usize) {
+                } else if let Some(bytes) = self.read_range(lindex, position, requested as usize) {
                     return Ok(vec![Self::msg(cliprdr::file_contents_response_range(
                         stream_id, &bytes,
                     ))]);

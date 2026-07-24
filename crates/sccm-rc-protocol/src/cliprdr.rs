@@ -183,26 +183,35 @@ pub fn format_list_long(formats: &[(u32, &str)]) -> Vec<u8> {
 }
 
 /// Build a `FILEGROUPDESCRIPTORW` (one file): cItems + a 592-byte CLIPRDR_FILEDESCRIPTOR.
+/// Thin wrapper around `file_group_descriptor_many` — kept because the single-file
+/// case comes up in tests and is more readable at the call site.
 pub fn file_group_descriptor(name: &str, size: u64) -> Vec<u8> {
+    file_group_descriptor_many(&[(name.to_string(), size)])
+}
+
+/// Multi-file variant used for CF_HDROP-clipboard pastes: cItems + N descriptors.
+pub fn file_group_descriptor_many(files: &[(String, u64)]) -> Vec<u8> {
     const FD_ATTRIBUTES: u32 = 0x04;
     const FD_FILESIZE: u32 = 0x40;
     const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
-    let mut v = Vec::with_capacity(4 + 592);
-    v.extend_from_slice(&1u32.to_le_bytes()); // cItems = 1
-                                              // CLIPRDR_FILEDESCRIPTOR
-    v.extend_from_slice(&(FD_ATTRIBUTES | FD_FILESIZE).to_le_bytes()); // flags
-    v.extend_from_slice(&[0u8; 32]); // reserved1
-    v.extend_from_slice(&FILE_ATTRIBUTE_NORMAL.to_le_bytes()); // fileAttributes
-    v.extend_from_slice(&[0u8; 16]); // reserved2
-    v.extend_from_slice(&[0u8; 8]); // lastWriteTime
-    v.extend_from_slice(&((size >> 32) as u32).to_le_bytes()); // fileSizeHigh
-    v.extend_from_slice(&(size as u32).to_le_bytes()); // fileSizeLow
-                                                       // fileName: 260 WCHAR (520 bytes), null-padded.
-    let mut fname = [0u8; 520];
-    for (i, u) in name.encode_utf16().take(259).enumerate() {
-        fname[i * 2..i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+    let mut v = Vec::with_capacity(4 + files.len() * 592);
+    v.extend_from_slice(&(files.len() as u32).to_le_bytes()); // cItems
+    for (name, size) in files {
+        // CLIPRDR_FILEDESCRIPTOR
+        v.extend_from_slice(&(FD_ATTRIBUTES | FD_FILESIZE).to_le_bytes()); // flags
+        v.extend_from_slice(&[0u8; 32]); // reserved1
+        v.extend_from_slice(&FILE_ATTRIBUTE_NORMAL.to_le_bytes()); // fileAttributes
+        v.extend_from_slice(&[0u8; 16]); // reserved2
+        v.extend_from_slice(&[0u8; 8]); // lastWriteTime
+        v.extend_from_slice(&((*size >> 32) as u32).to_le_bytes()); // fileSizeHigh
+        v.extend_from_slice(&(*size as u32).to_le_bytes()); // fileSizeLow
+                                                            // fileName: 260 WCHAR (520 bytes), null-padded.
+        let mut fname = [0u8; 520];
+        for (i, u) in name.encode_utf16().take(259).enumerate() {
+            fname[i * 2..i * 2 + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        v.extend_from_slice(&fname);
     }
-    v.extend_from_slice(&fname);
     v
 }
 

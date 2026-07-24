@@ -69,6 +69,10 @@ windows = { version = "0.61", features = [
     # Viewer: WH_KEYBOARD_LL keyboard hook + MessageBox dialog
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    # Core: read CF_HDROP from the local clipboard so files copied in
+    # Explorer can be pasted on the remote via MS-RDPECLIP.
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
 ] }
 
 # Cross-crate internal deps
