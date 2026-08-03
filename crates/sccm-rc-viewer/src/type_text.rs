@@ -58,6 +58,13 @@ impl TypeTextOverlay {
         self.bump();
     }
 
+    /// Ctrl+A / Ctrl+Del: since we don't render a visual selection, "select
+    /// all + retype" collapses to "clear the field" — same visible outcome.
+    pub fn on_clear(&mut self) {
+        self.input.clear();
+        self.bump();
+    }
+
     pub fn on_enter(&mut self) {
         if self.input.is_empty() {
             return;

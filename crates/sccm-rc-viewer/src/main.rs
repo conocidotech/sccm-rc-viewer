@@ -1658,12 +1658,47 @@ impl ApplicationHandler<UserEvent> for App {
                 }));
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let units: i16 = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (y * 120.0) as i16,
-                    MouseScrollDelta::PixelDelta(p) => p.y as i16,
+                // MS-RDPBCGR: a wheel event needs PTRFLAGS_VERTICAL_WHEEL
+                // (0x0200) or PTRFLAGS_HORIZONTAL_WHEEL (0x0400), otherwise
+                // the server ignores the rotation units field. IronRDP adds
+                // the WHEEL_NEGATIVE bit automatically based on the sign of
+                // number_of_wheel_rotation_units — but it does NOT set the
+                // wheel-direction flag, that's on us. Without this fix
+                // scrolling in the remote is a silent no-op.
+                //
+                // The rotation-units field is 8-bit two's complement on the
+                // wire (see ironrdp-pdu Encode: `as u8`), so anything
+                // outside -127..127 wraps around and points the wheel the
+                // wrong way. Clamp defensively — a single click on a
+                // Windows mouse is 120, a fast trackpad flick can produce
+                // multiples.
+                let (units, horizontal) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => {
+                        if x.abs() > y.abs() {
+                            ((x * 120.0) as i32, true)
+                        } else {
+                            ((y * 120.0) as i32, false)
+                        }
+                    }
+                    MouseScrollDelta::PixelDelta(p) => {
+                        if p.x.abs() > p.y.abs() {
+                            (p.x as i32, true)
+                        } else {
+                            (p.y as i32, false)
+                        }
+                    }
+                };
+                if units == 0 {
+                    return;
+                }
+                let units = units.clamp(-127, 127) as i16;
+                let flags = if horizontal {
+                    PointerFlags::HORIZONTAL_WHEEL
+                } else {
+                    PointerFlags::VERTICAL_WHEEL
                 };
                 self.send_input(FastPathInputEvent::MouseEvent(MousePdu {
-                    flags: PointerFlags::empty(),
+                    flags,
                     number_of_wheel_rotation_units: units,
                     x_position: 0,
                     y_position: 0,
@@ -1699,11 +1734,26 @@ impl ApplicationHandler<UserEvent> for App {
                 // session, host_prompt only when disconnected).
                 if let Some(prompt) = self.type_prompt.as_mut() {
                     if event.state == ElementState::Pressed {
+                        // Ctrl+A / Ctrl+Delete → clear the field (see host_prompt).
+                        if self.modifiers.control_key()
+                            && matches!(
+                                event.physical_key,
+                                PhysicalKey::Code(KeyCode::KeyA)
+                                    | PhysicalKey::Code(KeyCode::Delete)
+                            )
+                        {
+                            prompt.on_clear();
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            return;
+                        }
                         match event.physical_key {
                             PhysicalKey::Code(KeyCode::Escape) => prompt.on_esc(),
                             PhysicalKey::Code(KeyCode::Enter)
                             | PhysicalKey::Code(KeyCode::NumpadEnter) => prompt.on_enter(),
-                            PhysicalKey::Code(KeyCode::Backspace) => prompt.on_backspace(),
+                            PhysicalKey::Code(KeyCode::Backspace)
+                            | PhysicalKey::Code(KeyCode::Delete) => prompt.on_backspace(),
                             _ => {
                                 if let Some(text) = event.text.as_deref() {
                                     if !text.is_empty() {
@@ -1741,6 +1791,22 @@ impl ApplicationHandler<UserEvent> for App {
                             }
                             return;
                         }
+                        // Ctrl+A / Ctrl+Delete → clear the field. We don't
+                        // render a visual selection, so "select all + type"
+                        // and "clear" look the same to the operator.
+                        if self.modifiers.control_key()
+                            && matches!(
+                                event.physical_key,
+                                PhysicalKey::Code(KeyCode::KeyA)
+                                    | PhysicalKey::Code(KeyCode::Delete)
+                            )
+                        {
+                            prompt.on_clear();
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            return;
+                        }
                         let handled = match event.physical_key {
                             PhysicalKey::Code(KeyCode::Escape) => {
                                 prompt.on_esc();
@@ -1751,7 +1817,12 @@ impl ApplicationHandler<UserEvent> for App {
                                 prompt.on_enter();
                                 true
                             }
-                            PhysicalKey::Code(KeyCode::Backspace) => {
+                            // Delete without Ctrl behaves like Backspace here
+                            // (single-line, no cursor position) — matches the
+                            // "delete forward = delete at end" intuition on a
+                            // caret-at-end text field.
+                            PhysicalKey::Code(KeyCode::Backspace)
+                            | PhysicalKey::Code(KeyCode::Delete) => {
                                 prompt.on_backspace();
                                 true
                             }

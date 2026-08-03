@@ -77,6 +77,16 @@ impl HostPromptOverlay {
         self.bump_caret();
     }
 
+    /// Ctrl+A: since this single-line field doesn't render a visual
+    /// selection, "select all + type-replaces" is equivalent to "clear the
+    /// field" — matches what the user sees anyway. Also handles Ctrl+Del
+    /// / Ctrl+Backspace as a synonym for the same reason.
+    pub fn on_clear(&mut self) {
+        self.input.clear();
+        self.selected = None;
+        self.bump_caret();
+    }
+
     pub fn on_arrow_down(&mut self) {
         if self.recents.is_empty() {
             return;
