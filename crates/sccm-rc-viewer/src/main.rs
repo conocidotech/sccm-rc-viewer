@@ -1362,7 +1362,7 @@ impl ApplicationHandler<UserEvent> for App {
             let sz = window.inner_size();
             match gpu::GpuRenderer::new(window.clone(), sz.width.max(1), sz.height.max(1)) {
                 Ok(g) => {
-                    info!("GPU renderer (wgpu) active");
+                    info!(backend = g.backend(), "GPU renderer (wgpu) active");
                     g.set_error_handler();
                     self.gpu = Some(g);
                 }

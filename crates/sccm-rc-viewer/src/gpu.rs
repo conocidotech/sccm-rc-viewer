@@ -72,11 +72,70 @@ pub struct GpuRenderer {
     desktop: Option<Layer>,
     overlay: Option<Layer>,
     cursor: Option<Layer>,
+    /// Human-readable name of the chosen wgpu backend ("dx12"/"vulkan"/"gl"),
+    /// stamped in by `new()` after the winning `new_with_backends` call.
+    /// Exposed via `backend()` for the toolbar/status line.
+    backend_name: &'static str,
 }
 
 impl GpuRenderer {
     pub fn new(window: Arc<Window>, width: u32, height: u32) -> Result<Self, String> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        // Try backends in preference order rather than wgpu's default (which
+        // picks Vulkan first on Windows). Windows Vulkan drivers — Intel iGPU
+        // in particular — have a well-known swapchain-resize bug that leaves
+        // the driver in an unrecoverable state after reactivation, followed
+        // by an SEH crash Rust's panic hook doesn't catch. DX12 is the
+        // stable path on Windows; Vulkan/GL are fallbacks for the odd case
+        // where DX12 is missing (Windows Server core, WSLg, …).
+        //
+        // Override with SCCM_RC_GPU_BACKEND=dx12|vulkan|gl|auto.
+        //   auto = default order (dx12 → vulkan → gl)
+        //   any specific backend = try only that one
+        let order = Self::backend_order();
+        let mut last_err = "no backend attempted".to_string();
+        for be in order {
+            match Self::new_with_backends(window.clone(), width, height, be) {
+                Ok(mut this) => {
+                    // Caller (main.rs) logs the winning backend at INFO — we
+                    // only stamp it in here so it's available via backend().
+                    this.backend_name = Self::backend_label(be);
+                    return Ok(this);
+                }
+                Err(e) => {
+                    tracing::warn!(backend = %Self::backend_label(be), error = %e, "GPU backend init failed, trying next");
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    fn backend_order() -> Vec<wgpu::Backends> {
+        match std::env::var("SCCM_RC_GPU_BACKEND").as_deref().map(str::to_ascii_lowercase) {
+            Ok(s) if s == "dx12" => vec![wgpu::Backends::DX12],
+            Ok(s) if s == "vulkan" => vec![wgpu::Backends::VULKAN],
+            Ok(s) if s == "gl" => vec![wgpu::Backends::GL],
+            _ => vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN, wgpu::Backends::GL],
+        }
+    }
+
+    fn backend_label(be: wgpu::Backends) -> &'static str {
+        if be.contains(wgpu::Backends::DX12) { "dx12" }
+        else if be.contains(wgpu::Backends::VULKAN) { "vulkan" }
+        else if be.contains(wgpu::Backends::GL) { "gl" }
+        else { "unknown" }
+    }
+
+    fn new_with_backends(
+        window: Arc<Window>,
+        width: u32,
+        height: u32,
+        backends: wgpu::Backends,
+    ) -> Result<Self, String> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            ..Default::default()
+        });
         let surface = instance
             .create_surface(window)
             .map_err(|e| format!("create_surface: {e}"))?;
@@ -232,7 +291,16 @@ impl GpuRenderer {
             desktop: None,
             overlay: None,
             cursor: None,
+            // Placeholder — overwritten by `new()` right after this returns
+            // with the actual backend label. Kept as a static str so the
+            // struct stays Copy-friendly in future refactors.
+            backend_name: "?",
         })
+    }
+
+    /// Human-readable name of the active wgpu backend, for status/logs.
+    pub fn backend(&self) -> &'static str {
+        self.backend_name
     }
 
     fn resize(&mut self, width: u32, height: u32) {
