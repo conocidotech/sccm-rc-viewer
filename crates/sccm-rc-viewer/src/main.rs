@@ -1734,6 +1734,27 @@ impl ApplicationHandler<UserEvent> for App {
                 // session, host_prompt only when disconnected).
                 if let Some(prompt) = self.type_prompt.as_mut() {
                     if event.state == ElementState::Pressed {
+                        // Ctrl+V / Ctrl+Insert → paste OS clipboard. Critical
+                        // for the intended flow: copy password from password
+                        // manager → paste here → Enter → scancodes to UAC
+                        // (which Windows blocks direct cliprdr paste into).
+                        // Without this, the Type Text field is unusable for
+                        // the very case it was designed for.
+                        if self.modifiers.control_key()
+                            && matches!(
+                                event.physical_key,
+                                PhysicalKey::Code(KeyCode::KeyV)
+                                    | PhysicalKey::Code(KeyCode::Insert)
+                            )
+                        {
+                            if let Some(clip) = read_clipboard_text() {
+                                prompt.on_text(&clip);
+                            }
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                            return;
+                        }
                         // Ctrl+A / Ctrl+Delete → clear the field (see host_prompt).
                         if self.modifiers.control_key()
                             && matches!(
