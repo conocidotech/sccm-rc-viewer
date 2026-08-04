@@ -600,6 +600,10 @@ fn main() -> anyhow::Result<()> {
     // In initial-prompt mode (no CLI target) we skip it too — the in-window
     // overlay collects the target and calls `start_session` once the user
     // confirms.
+    // Shared counter for the UAC-paste fallback: bumped by CliprdrChannel on
+    // every FormatDataRequest, sampled by the App at Ctrl+V key-down / V-up
+    // to decide whether the paste reached a clipboard-accepting app.
+    let cliprdr_req_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let no_initial_session = cli.demo || cli_target.is_none();
     let (running, input_tx, done_rx) = if no_initial_session {
         if cli.demo {
@@ -619,6 +623,7 @@ fn main() -> anyhow::Result<()> {
             curtain.clone(),
             file_offer.clone(),
             monitors.clone(),
+            cliprdr_req_counter.clone(),
         )
     };
 
@@ -679,6 +684,8 @@ fn main() -> anyhow::Result<()> {
             None
         },
         type_prompt: None,
+        cliprdr_req_counter,
+        paste_pending: None,
     };
     event_loop.run_app(&mut app)?;
     // Window closed: stop the session and close the input channel, which unblocks
@@ -746,6 +753,7 @@ fn spawn_session(
     curtain: Arc<AtomicBool>,
     file_offer: Arc<Mutex<Option<std::path::PathBuf>>>,
     monitors: Vec<rdp::Monitor>,
+    cliprdr_req_counter: Arc<std::sync::atomic::AtomicU64>,
 ) -> (Arc<AtomicBool>, InputSender, std::sync::mpsc::Receiver<()>) {
     let running = Arc::new(AtomicBool::new(true));
     let (input_tx, input_rx) = tokio::sync::mpsc::channel::<Vec<FastPathInputEvent>>(256);
@@ -777,6 +785,7 @@ fn spawn_session(
                     curtain.clone(),
                     file_offer.clone(),
                     &monitors,
+                    cliprdr_req_counter.clone(),
                 )
                 .await
                 {
@@ -807,6 +816,7 @@ async fn run_session(
     curtain: Arc<AtomicBool>,
     file_offer: Arc<Mutex<Option<std::path::PathBuf>>>,
     monitors: &[rdp::Monitor],
+    cliprdr_req_counter: Arc<std::sync::atomic::AtomicU64>,
 ) -> anyhow::Result<()> {
     shared.lock().unwrap().status = t!("status.connecting_to", target => target).to_string();
     let _ = proxy.send_event(UserEvent::Frame);
@@ -868,7 +878,7 @@ async fn run_session(
     // left occupied and the next connect trips "existing session".
     let res = async {
         let (result, initial_buf, share_id) =
-            rdp::connect_rdp(&mut session, w, h, monitors).await?;
+            rdp::connect_rdp(&mut session, w, h, monitors, cliprdr_req_counter.clone()).await?;
         info!("RDP active — streaming");
         let mut sink = FrameSink {
             shared,
@@ -885,6 +895,7 @@ async fn run_session(
             input_rx,
             curtain,
             file_offer,
+            cliprdr_req_counter,
         )
         .await
     }
@@ -988,6 +999,22 @@ struct App {
     /// will be replayed as scancodes on the remote (used to enter
     /// credentials into a UAC prompt where cliprdr is blocked).
     type_prompt: Option<type_text::TypeTextOverlay>,
+    /// Shared with the session thread's CliprdrChannel: bumped on every
+    /// inbound FormatDataRequest. Zero-cost sampling from the UI thread.
+    cliprdr_req_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// State for the Ctrl+V → UAC fallback: on plain Ctrl+V key-down we
+    /// snapshot the local clipboard + the current cliprdr counter. On V
+    /// key-up (with a 100 ms floor so cliprdr has fair chance to fire),
+    /// if the counter didn't tick we type the clipboard as scancodes —
+    /// otherwise a normal cliprdr paste happened and we do nothing.
+    paste_pending: Option<PastePending>,
+}
+
+struct PastePending {
+    started: std::time::Instant,
+    baseline: u64,
+    clip: String,
+    v_released: bool,
 }
 
 impl App {
@@ -1101,6 +1128,7 @@ impl App {
             self.curtain.clone(),
             self.file_offer.clone(),
             self.monitors.clone(),
+            self.cliprdr_req_counter.clone(),
         );
         self.running = running;
         #[cfg(windows)]
@@ -1439,6 +1467,48 @@ impl ApplicationHandler<UserEvent> for App {
                     event_loop.exit();
                     return;
                 }
+            }
+        }
+        // Ctrl+V → UAC fallback: if V has been released AND at least
+        // 100 ms elapsed since key-down (floor so a fast tap still gives
+        // cliprdr fair chance), check the counter. Unchanged = paste
+        // was silently dropped (Secure Desktop / UAC) → type the
+        // snapshotted clipboard as scancodes. Ticked = a normal
+        // cliprdr paste happened → drop the pending, do nothing.
+        // Also age out after 1500 ms in case V-release was missed
+        // (e.g. focus stolen before key-up arrived).
+        if let Some(p) = self.paste_pending.as_ref() {
+            const FLOOR: std::time::Duration = std::time::Duration::from_millis(100);
+            const AGE_OUT: std::time::Duration = std::time::Duration::from_millis(1500);
+            let elapsed = p.started.elapsed();
+            let ready = (p.v_released && elapsed >= FLOOR) || elapsed >= AGE_OUT;
+            if ready {
+                let cur = self
+                    .cliprdr_req_counter
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if cur == p.baseline {
+                    let events = type_text::encode_string(&p.clip);
+                    if !events.is_empty() {
+                        if let Some(tx) = &self.input_tx {
+                            let _ = tx.try_send(events);
+                        }
+                        info!(
+                            len = p.clip.chars().count(),
+                            elapsed_ms = elapsed.as_millis() as u64,
+                            "Ctrl+V fallback — no cliprdr ack, typed clipboard as scancodes"
+                        );
+                    }
+                }
+                self.paste_pending = None;
+            } else {
+                // Pending but not yet ready — wake at the floor to fire
+                // the decision without stalling for user input.
+                let remaining = FLOOR
+                    .checked_sub(elapsed)
+                    .unwrap_or(std::time::Duration::from_millis(10));
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    std::time::Instant::now() + remaining,
+                ));
             }
         }
         // While either overlay is up, tick the caret blink by scheduling a
@@ -1934,6 +2004,54 @@ impl ApplicationHandler<UserEvent> for App {
                         self.cycle_view();
                     }
                     return;
+                }
+                // Plain Ctrl+V (no Shift, no Alt) → start a UAC-fallback
+                // watch: snapshot the local clipboard and the current
+                // cliprdr request counter. The scancode below still forwards
+                // Ctrl+V to the remote so a normal cliprdr paste can happen;
+                // if that paste never triggers a FormatDataRequest, the
+                // about_to_wait handler types the clipboard as scancodes
+                // when V is released (+ a 100 ms floor). Non-fatal if the
+                // clipboard is empty — we just don't stage a fallback.
+                if event.state == ElementState::Pressed
+                    && self.modifiers.control_key()
+                    && !self.modifiers.shift_key()
+                    && !self.modifiers.alt_key()
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyV))
+                    && !self.view_only
+                {
+                    if let Some(clip) = read_clipboard_text() {
+                        if !clip.is_empty() {
+                            self.paste_pending = Some(PastePending {
+                                started: std::time::Instant::now(),
+                                baseline: self
+                                    .cliprdr_req_counter
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                clip,
+                                v_released: false,
+                            });
+                            // Wake about_to_wait quickly so it can arm the
+                            // 100 ms floor without waiting for the next
+                            // natural event.
+                            if let Some(w) = &self.window {
+                                w.request_redraw();
+                            }
+                        }
+                    }
+                    // Fall through — normal scancode forward still happens.
+                }
+                // V released → mark the pending as "released". Actual
+                // fallback firing lives in about_to_wait.
+                if event.state == ElementState::Released
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyV))
+                {
+                    if let Some(p) = self.paste_pending.as_mut() {
+                        p.v_released = true;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    // Fall through — normal scancode forward still happens.
                 }
                 // winit gives us the OS hardware scancode, which on Windows is
                 // the PS/2 set-1 scancode RDP expects (0xE000 prefix = extended).

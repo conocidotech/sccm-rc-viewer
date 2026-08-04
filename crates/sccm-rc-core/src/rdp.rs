@@ -408,6 +408,7 @@ fn build_wlc_channel_set(
     clip_enabled: bool,
     curtain_enabled: bool,
     snapshot: &ChannelIdSnapshot,
+    cliprdr_req_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> ironrdp_svc::StaticChannelSet {
     use core::any::TypeId;
     let mut set = ironrdp_svc::StaticChannelSet::new();
@@ -417,7 +418,7 @@ fn build_wlc_channel_set(
     set.insert(PassiveRdpdr);
     set.insert(PassiveRdpsnd);
     if clip_enabled {
-        set.insert(CliprdrChannel::default());
+        set.insert(CliprdrChannel::with_counter(cliprdr_req_counter));
     } else {
         set.insert(PassiveCliprdr);
     }
@@ -566,6 +567,26 @@ pub struct CliprdrChannel {
     /// FormatList (the periodic poll would otherwise announce out of sequence,
     /// which a strict server can drop — losing the local→remote path).
     ready: bool,
+    /// Bumped on every inbound FormatDataRequest — the App layer polls this
+    /// counter to decide whether a Ctrl+V that just went to the remote
+    /// actually reached a clipboard-accepting app. When the counter doesn't
+    /// tick between key-down and key-up, the paste was silently dropped
+    /// (Secure Desktop / UAC) and the viewer types the clipboard as
+    /// scancodes as a fallback.
+    request_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl CliprdrChannel {
+    /// Wire the channel up to a shared paste-request counter (used by App
+    /// for the Ctrl+V → UAC fallback detection). Default-constructed
+    /// channels get a private counter — fine for tests and paths that
+    /// don't care about the fallback.
+    pub fn with_counter(counter: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            request_counter: counter,
+            ..Default::default()
+        }
+    }
 }
 
 /// Hard cap on any single Windows-clipboard call. `OpenClipboard` is famously
@@ -834,6 +855,11 @@ impl ironrdp_svc::SvcProcessor for CliprdrChannel {
             }
             ClipPdu::FormatListResponse { .. } => Ok(Vec::new()),
             ClipPdu::FormatDataRequest { format_id } => {
+                // Signal to the App that the remote actually asked for
+                // clipboard data — the presence of this request is our
+                // "cliprdr worked" heartbeat for the UAC-fallback logic.
+                self.request_counter
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // The remote pastes — wants our text or our offered file group.
                 if format_id == cliprdr::CF_FILEGROUPDESCRIPTORW {
                     let files = self.all_names_sizes();
@@ -954,6 +980,7 @@ pub async fn connect_rdp(
     width: u16,
     height: u16,
     monitors: &[ironrdp_pdu::gcc::Monitor],
+    cliprdr_req_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<(ConnectionResult, Vec<u8>, u32)> {
     if session.grant() == Grant::ViewOnly {
         debug!("session is view-only — input will be rejected by the server");
@@ -977,7 +1004,9 @@ pub async fn connect_rdp(
         connector = connector.with_static_channel(PassiveRdpsnd);
         // Real clipboard channel (SCCM_RC_CLIP=1), else a passive placeholder.
         if std::env::var("SCCM_RC_CLIP").as_deref() == Ok("1") {
-            connector = connector.with_static_channel(CliprdrChannel::default());
+            connector = connector.with_static_channel(CliprdrChannel::with_counter(
+                cliprdr_req_counter.clone(),
+            ));
         } else {
             connector = connector.with_static_channel(PassiveCliprdr);
         }
@@ -1235,6 +1264,7 @@ pub async fn run_active_session(
     input_rx: &mut InputReceiver,
     curtain_on: std::sync::Arc<std::sync::atomic::AtomicBool>,
     file_offer: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    cliprdr_req_counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     let mut width = connection_result.desktop_size.width;
     let mut height = connection_result.desktop_size.height;
@@ -1811,6 +1841,7 @@ pub async fn run_active_session(
                         clip_enabled,
                         curtain_enabled,
                         &channel_id_snapshot,
+                        cliprdr_req_counter.clone(),
                     );
                     width = new_result.desktop_size.width;
                     height = new_result.desktop_size.height;
