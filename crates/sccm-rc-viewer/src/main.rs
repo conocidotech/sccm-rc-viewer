@@ -1883,6 +1883,35 @@ impl ApplicationHandler<UserEvent> for App {
                     self.send_ctrl_alt_del();
                     return;
                 }
+                // Ctrl+Shift+V → "paste as scancodes": read the local
+                // clipboard and type it into the remote via FastPath keyboard
+                // events. Bypasses the RDP clipboard channel entirely, so it
+                // works in a UAC prompt / Secure Desktop where MS-RDPECLIP is
+                // deliberately blocked by Windows. Convention matches
+                // browser/terminal "paste as plain text". US-layout ASCII
+                // only; non-ASCII chars are silently dropped by
+                // `type_text::encode_string`.
+                if event.state == ElementState::Pressed
+                    && self.modifiers.control_key()
+                    && self.modifiers.shift_key()
+                    && matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyV))
+                {
+                    if !self.view_only {
+                        if let Some(clip) = read_clipboard_text() {
+                            let events = type_text::encode_string(&clip);
+                            if !events.is_empty() {
+                                if let Some(tx) = &self.input_tx {
+                                    let _ = tx.try_send(events);
+                                }
+                                info!(
+                                    len = clip.chars().count(),
+                                    "Ctrl+Shift+V — typed clipboard into remote via scancodes"
+                                );
+                            }
+                        }
+                    }
+                    return;
+                }
                 // Ctrl+Esc → send the Windows key to the remote. CmRcViewer only
                 // passes Win-key through in fullscreen; the LL OS hook in
                 // windowed mode is heavyweight, so we expose the canonical PS/2

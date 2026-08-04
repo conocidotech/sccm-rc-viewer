@@ -96,8 +96,10 @@ impl TypeTextOverlay {
 
 /// Translate `text` to a set-1 keystroke sequence: for every char, press then
 /// release, holding Shift for characters that require it. Unknown chars are
-/// skipped — better a shorter password than a corrupted one.
-fn encode_string(text: &str) -> Vec<FastPathInputEvent> {
+/// skipped — better a shorter password than a corrupted one. Public so the
+/// Ctrl+Shift+V "paste as scancodes" handler in main.rs can call it without
+/// spinning up the overlay.
+pub fn encode_string(text: &str) -> Vec<FastPathInputEvent> {
     let mut out = Vec::with_capacity(text.len() * 4);
     let down = KeyboardFlags::empty();
     let up = KeyboardFlags::RELEASE;
