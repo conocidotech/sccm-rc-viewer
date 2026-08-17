@@ -96,8 +96,13 @@ async fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let mut session = SccmSession::connect(&cli.target).await?;
     let t_connect = t0.elapsed();
+    // Same counter that the viewer and rdp-connect-test pass in: CliprdrChannel needs it to
+    // tag its format-data requests. rc-bench has no UI to show it, but the argument is not
+    // optional — leaving it out is what broke the build in 8b5f3ea.
+    let cliprdr_req_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (result, initial_buf, share_id) =
-        rdp::connect_rdp(&mut session, cli.width, cli.height, &[]).await?;
+        rdp::connect_rdp(&mut session, cli.width, cli.height, &[], cliprdr_req_counter.clone())
+            .await?;
     let t_active = t0.elapsed();
     info!(grant = ?session.grant(), connect_ms = t_connect.as_millis(), active_ms = t_active.as_millis(), "connected + RDP active");
 
@@ -157,6 +162,7 @@ async fn main() -> anyhow::Result<()> {
         &mut input_rx,
         curtain,
         file_offer,
+        cliprdr_req_counter,
     );
     let outcome = tokio::time::timeout(Duration::from_secs(cli.seconds), run).await;
 
